@@ -1,4 +1,3 @@
-"""Regression tests for core_math entropy helpers."""
 
 import networkx as nx
 import numpy as np
@@ -21,7 +20,6 @@ def test_entropy_nonuniform_graph() -> None:
 
 
 def test_entropy_rate_empty() -> None:
-    """Пустой граф не должен вызывать краш."""
     graph = nx.Graph()
     rate = network_entropy_rate(graph)
     assert rate == 0.0
