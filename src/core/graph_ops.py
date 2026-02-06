@@ -201,7 +201,6 @@ def calculate_metrics(
     curvature_sample_edges: int = 150,
     curvature_max_support: int = settings.RICCI_MAX_SUPPORT,
     curvature_cutoff: float = settings.RICCI_CUTOFF,
-    # Skip spectral/modularity for fast intermediate steps on large graphs.
     skip_spectral: bool = False,
     **kwargs,
 ) -> GraphMetrics:
@@ -236,7 +235,6 @@ def calculate_metrics(
 
         Q = compute_modularity_louvain(G, seed=seed)
     else:
-        # Заглушки на быстрых шагах: тяжелая спектральная/модульность пропускается.
         lmax = 0.0
         thresh = 0.0
         l2 = 0.0
@@ -244,7 +242,7 @@ def calculate_metrics(
         Q = float("nan")
 
     # Efficiency — самая дорогая операция (Dijkstra).
-    # Если шаг "легкий", мы вообще её не считаем (либо считаем на микро-выборке для UI).
+    # Если шаг "легкий", мы вообще её не считаем (либо считаем на микро-выборке для UI)
     if is_heavy or N < 300:
         eff_w = approx_weighted_efficiency(G, sources_k=eff_sources_k, seed=seed)
     else:
@@ -354,52 +352,41 @@ def calculate_metrics(
 
 
 def compute_3d_layout(G: nx.Graph, seed: int) -> dict:
-    """
-    Optimized deterministic 3D layout.
-    """
+
     N = G.number_of_nodes()
     if N == 0:
         return {}
 
     seed = int(seed)
 
-    # Снижаем порог. 1800 было слишком много для чистого Python.
-    # 500 узлов — комфортный предел для честного 3D force-directed.
     FAST_N = 500
 
     if N <= FAST_N:
-        # Для малых графов: честный 3D, но меньше итераций (40 достаточно для формы)
         return nx.spring_layout(G, dim=3, weight="weight", seed=seed, iterations=40, threshold=1e-4)
 
     # Fast path: считаем 2D (это намного быстрее сходится),
-    # а Z-координату синтезируем из centrality.
+    # а Z-координату синтезируем из centrality
     # Уменьшаем итерации до 15 — этого хватит, чтобы "расправить" ком.
     pos2 = nx.spring_layout(G, dim=2, weight="weight", seed=seed, iterations=15, threshold=1e-3)
 
-    # Z-axis heuristic:
-    # Центральные узлы (хабы) поднимаем выше, периферию опускаем.
-    # Добавляем "шум", чтобы узлы с одинаковой степенью не слипались в плоскости.
+   
     rng = np.random.default_rng(seed)
 
-    # Используем degree centrality как базу для Z
     d_dict = dict(G.degree())
     d_vals = np.array([d_dict[n] for n in pos2.keys()], dtype=float)
 
     if d_vals.size:
         dmin, dmax = d_vals.min(), d_vals.max()
         denom = (dmax - dmin) if (dmax - dmin) > 1e-9 else 1.0
-        # Нормализуем 0..1 и растягиваем на -1..1
         dz = 2.0 * ((d_vals - dmin) / denom) - 1.0
     else:
         dz = np.zeros(len(pos2), dtype=float)
 
-    # Добавляем jitter, чтобы разбить слои
     dz += rng.normal(0.0, 0.15, size=dz.shape)
 
     out = {}
     nodes = list(pos2.keys())
     for i, n in enumerate(nodes):
         x, y = pos2[n]
-        # Приводим к float для JSON-сериализации Plotly
         out[n] = (float(x), float(y), float(dz[i]))
     return out

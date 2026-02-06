@@ -12,7 +12,7 @@ def coerce_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     - 10-я weight
     Возвращает df_edges со столбцами:
       [SRC_COL, DST_COL, weight, confidence]
-    и meta: {src_col, dst_col}
+    и мету {src_col, dst_col}
     """
     if df_any.shape[1] < 10:
         raise ValueError("Файл должен содержать минимум 10 колонок (фикс. формат).")
@@ -29,12 +29,10 @@ def coerce_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     df[CONF_COL] = pd.to_numeric(df[CONF_COL], errors="coerce")
 
-    # Оптимизация: не приводим весь столбец к str, если он уже числовой.
     if not pd.api.types.is_numeric_dtype(df[WEIGHT_COL]):
         df[WEIGHT_COL] = df[WEIGHT_COL].astype(str).str.replace(",", ".", regex=False)
     df[WEIGHT_COL] = pd.to_numeric(df[WEIGHT_COL], errors="coerce")
 
-    # unify columns
     out = df[[SRC_COL, DST_COL, CONF_COL, WEIGHT_COL]].copy()
     out = out.rename(columns={CONF_COL: "confidence", WEIGHT_COL: "weight"})
     out = out.dropna(subset=[SRC_COL, DST_COL, "confidence", "weight"])
@@ -54,10 +52,6 @@ def filter_edges(
     min_conf: float,
     min_weight: float,
 ) -> pd.DataFrame:
-    """Filter edges by confidence/weight and coerce numeric columns.
-
-    Узлы оставляем как есть, а атрибуты приводим к числам с отбрасыванием NaN.
-    """
     df = df_edges.copy()
 
     if src_col not in df.columns or dst_col not in df.columns:

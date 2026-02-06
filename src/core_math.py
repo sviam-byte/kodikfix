@@ -1,6 +1,5 @@
-"""Core numerical routines (entropy, phase, robust geometry).
-
-Сюда свалена вычислительная математика (без Streamlit/UI).
+"""
+Сюда свалена вычислительная математика.
 """
 
 from __future__ import annotations
@@ -24,29 +23,23 @@ from .profiling import timeit
 # Entropy
 # -----------------------------
 def entropy_histogram(x, bins="fd") -> float:
-    """Estimate entropy from a histogram using SciPy (default: Freedman–Diaconis bins)."""
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size < 2:
         return float("nan")
     hist, _ = np.histogram(x, bins=bins)
-    # SciPy handles normalization internally; we keep the raw counts for clarity.
-    # Guard against tiny negative values due to floating error.
     return abs(float(scipy_entropy(hist)))
 
 
 def entropy_degree(G: nx.Graph) -> float:
-    """Entropy of the degree distribution."""
     degrees = np.fromiter((d for _, d in G.degree()), dtype=float)
     if degrees.size == 0:
         return float("nan")
     _, counts = np.unique(degrees, return_counts=True)
-    # Guard against tiny negative values due to floating error.
     return abs(float(scipy_entropy(counts)))
 
 
 def entropy_weights(G: nx.Graph) -> float:
-    """Entropy of edge weight distribution."""
     vals: list[float] = []
     for _, _, d in G.edges(data=True):
         w = float(d.get("weight", 1.0))
@@ -56,7 +49,6 @@ def entropy_weights(G: nx.Graph) -> float:
 
 
 def entropy_confidence(G: nx.Graph) -> float:
-    """Entropy of edge confidence distribution."""
     vals: list[float] = []
     for _, _, d in G.edges(data=True):
         c = float(d.get("confidence", 1.0))
@@ -66,7 +58,6 @@ def entropy_confidence(G: nx.Graph) -> float:
 
 
 def triangle_support_edge(G: nx.Graph):
-    """Count how many triangles each edge participates in (heavy for large graphs)."""
     tri = nx.triangles(G)
     out = []
     for u, v in G.edges():
@@ -75,7 +66,6 @@ def triangle_support_edge(G: nx.Graph):
 
 
 def entropy_triangle_support(G: nx.Graph) -> float:
-    """Энтропия распределения triangle-support по рёбрам (число треугольников на ребро)."""
     ts = triangle_support_edge(G)
     return entropy_histogram(ts, bins="fd")
 
@@ -92,6 +82,7 @@ def classify_phase_transition(
     - смотрим на дискретные скачки y между соседними точками
     - если самый большой отрицательный скачок занимает большую долю амплитуды
       и происходит в узком окне x -> считаем abrupt
+      и получаем типа критическую точку и фазовый переход
     """
     if df is None or df.empty or x_col not in df.columns or y_col not in df.columns:
         return {
@@ -113,16 +104,13 @@ def classify_phase_transition(
         }
 
     dy = np.diff(y)
-    # largest negative drop
     idx = int(np.argmin(dy))
-    jump = float(-dy[idx])  # positive magnitude of drop
+    jump = float(-dy[idx]) 
     y_span = float(max(1e-12, np.nanmax(y) - np.nanmin(y)))
     jump_fraction = float(jump / y_span)
 
     critical_x = float(x[idx + 1]) if idx + 1 < len(x) else float(x[-1])
 
-    # "first-order like" heuristic thresholds
-    # jump_fraction >= 0.35 means ~ huge discontinuity relative to range
     is_abrupt = bool(jump_fraction >= 0.35)
 
     return {
@@ -136,10 +124,7 @@ def classify_phase_transition(
 # Robust geometry / curvature
 # -----------------------------
 def add_dist_attr(G: nx.Graph) -> nx.Graph:
-    """Копия графа + атрибут dist=1/weight для путей.
 
-    Некорректные веса заменяются малым положительным значением, чтобы не падать.
-    """
     H = G.copy()
     for _, _, d in H.edges(data=True):
         w = float(d.get("weight", 1.0))
@@ -150,7 +135,6 @@ def add_dist_attr(G: nx.Graph) -> nx.Graph:
 
 
 def _normalize_edge_weights(G: nx.Graph) -> nx.Graph:
-    """Нормализовать веса рёбер: finite и >=0 (best-effort)."""
     H = G.copy()
     for _, _, d in H.edges(data=True):
         w_raw = d.get("weight", 1.0)
@@ -167,12 +151,7 @@ def _normalize_edge_weights(G: nx.Graph) -> nx.Graph:
 # 1) Entropy rate of random walk
 # -----------------------------
 def network_entropy_rate(G: nx.Graph, base: float = math.e) -> float:
-    """
-    Entropy rate:
-        H_rw = - Σ_i π_i Σ_j P_ij log P_ij
-    where P_ij = w_ij / strength(i), π_i = strength(i)/Σ strength.
-    """
-    # Assume G is already simplified and weights are numeric (preprocess validates inputs).
+
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         return 0.0
     A = nx.adjacency_matrix(G, weight="weight").astype(float).tocsr()
@@ -183,16 +162,12 @@ def network_entropy_rate(G: nx.Graph, base: float = math.e) -> float:
     if total_s <= 0:
         return 0.0
 
-    # Normalize rows: P_ij = w_ij / d_i (zero-degree rows stay zero).
     inv_d = np.reciprocal(d, out=np.zeros_like(d), where=d > 0)
     P = A.multiply(inv_d[:, None])
 
-    # Считаем энтропию напрямую на разреженных данных, без toarray():
-    # H(row) = -sum(p * log(p)). Учитываем только ненулевые элементы.
     data_log = np.log(P.data + 1e-20) / np.log(base)
     ent_data = -(P.data * data_log)
 
-    # Перекладываем энтропийные веса в копию разреженной матрицы и суммируем по строкам.
     P_ent = P.copy()
     P_ent.data = ent_data
     row_ents = np.asarray(P_ent.sum(axis=1)).flatten()
@@ -201,6 +176,7 @@ def network_entropy_rate(G: nx.Graph, base: float = math.e) -> float:
 
 # -----------------------------
 # 2) Ollivier–Ricci curvature (transport W1)
+# вычислительно тяжёоая штука, запускается только по кнопке
 # -----------------------------
 def _one_step_measure(H: nx.Graph, x) -> Dict:
     neigh = list(H.neighbors(x))
@@ -296,7 +272,6 @@ def ollivier_ricci_edge(
 ) -> Optional[float]:
     """
     κ(x,y) = 1 - W1(µ_x, µ_y)/d(x,y)
-    Distances use dist=1/weight.
     """
     H = _normalize_edge_weights(as_simple_undirected(G))
     if not H.has_edge(x, y):
@@ -349,7 +324,7 @@ def ollivier_ricci_summary(
     force_sequential: bool = False,
     **_ignored,
 ) -> CurvatureSummary:
-    # NOTE: progress_cb нужен только для UI (streamlit). В core он остаётся "немым" колбэком.
+    # ЗАМЕТКА: progress_cb нужен только для UI 
     H = _normalize_edge_weights(as_simple_undirected(G))
     if H.number_of_edges() == 0:
         return CurvatureSummary(0.0, 0.0, 0.0, 0, 0)
@@ -359,7 +334,6 @@ def ollivier_ricci_summary(
     if len(edges) > int(sample_edges):
         edges = rng.sample(edges, int(sample_edges))
 
-    # Если UI попросил прогресс — считаем последовательно (иначе joblib прогресс не отдаёт).
     if (progress_cb is not None) or bool(force_sequential):
         results = []
         total = max(1, len(edges))
@@ -373,7 +347,6 @@ def ollivier_ricci_summary(
                 except TypeError:
                     progress_cb(i, total)
     else:
-        # Parallelize per-edge curvature for a big speedup on multi-core machines.
         num_cores = max(1, min(multiprocessing.cpu_count(), len(edges)))
         results = Parallel(n_jobs=num_cores)(
             delayed(ollivier_ricci_edge)(
@@ -429,7 +402,6 @@ def _pf_eigs_sparse(A):
 
 def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
     """
-    Build PF-Markov chain from adjacency A and compute entropy rate:
       P_ij = a_ij * u_j / (lam * u_i),  π_i ∝ u_i v_i
       H_evo = -Σ_i π_i Σ_j P_ij log P_ij
     """
@@ -437,7 +409,6 @@ def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
     if H.number_of_nodes() < 2 or H.number_of_edges() == 0:
         return float("nan")
 
-    # For undirected: treat as directed both ways for A
     A = nx.adjacency_matrix(H.to_directed(), weight="weight").astype(float).tocsr()
     if A.nnz == 0:
         return float("nan")
@@ -451,10 +422,8 @@ def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
         idx = int(np.argmax(np.real(vals)))
         lam = float(np.real(vals[idx]))
         u = np.real(vecs[:, idx])
-        # Для симметричной матрицы (неориентированный граф) u == v.
         v = u
     else:
-        # Для undirected графа достаточно правого собственного вектора.
         import scipy.sparse.linalg as spla
 
         vals_r, vecs_r = spla.eigs(A, k=1, which="LR")

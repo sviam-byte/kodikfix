@@ -3,17 +3,15 @@ import numpy as np
 
 
 def as_simple_undirected(G: nx.Graph) -> nx.Graph:
-    """Привести граф к простому неориентированному виду.
 
-    Предполагается, что weight/confidence уже числовые (это обязан гарантировать preprocess).
-    """
     H = G
     if hasattr(H, "is_directed") and H.is_directed():
         H = H.to_undirected(as_view=False)
 
     if isinstance(H, (nx.MultiGraph, nx.MultiDiGraph)):
         # Склеиваем мульти-рёбра: суммируем веса и сохраняем первый набор атрибутов.
-        # Это сохраняет поведение "aggregate weight", но избегает has_edge для каждого ребра.
+        # это упрощение, но обычно адекватное. система не поддерживает несколько рёбер между одними и теми же узлами
+        #в будущем, безусловно, будет доделаны мультиграфы + ориентированные
         simple = nx.Graph()
         simple.add_nodes_from(H.nodes(data=True))
         edge_weights = {}
@@ -23,7 +21,6 @@ def as_simple_undirected(G: nx.Graph) -> nx.Graph:
             w = d.get("weight", 1.0)
             key = frozenset((u, v))
             edge_weights[key] = float(edge_weights.get(key, 0.0)) + float(w)
-            # Сохраняем атрибуты первого ребра как базовые.
             if key not in edge_attrs:
                 edge_attrs[key] = dict(d)
                 edge_nodes[key] = (u, v)
@@ -39,7 +36,6 @@ def as_simple_undirected(G: nx.Graph) -> nx.Graph:
 
 
 def get_node_strength(G: nx.Graph, n) -> float:
-    """Сумма весов всех инцидентных рёбер узла."""
     strength = 0.0
     for _, _, d in G.edges(n, data=True):
         w = float(d.get("weight", 1.0))

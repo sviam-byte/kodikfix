@@ -8,13 +8,11 @@ from .config_loader import load_css, load_metrics_info
 
 
 def help_icon(key: str) -> str:
-    """Короткая справка для Streamlit metrics/plots."""
     info = load_metrics_info()
     return info.get("help_text", {}).get(key, "")
 
 
 def inject_custom_css() -> None:
-    """Подключить общий CSS один раз на запуск."""
     css = load_css()
     if not css:
         return
@@ -22,7 +20,6 @@ def inject_custom_css() -> None:
 
 
 def fmt(val, precision=4, is_percent=False):
-    """Safe formatter for metrics: handles NaN/None/Zero nicely."""
     if val is None:
         return "—"
     try:
@@ -44,8 +41,6 @@ def fmt(val, precision=4, is_percent=False):
 
 
 def render_dashboard_metrics(G_view, met: dict) -> None:
-    """Render grouped metric cards on the dashboard."""
-    # Card 1: Basic Stats
     with st.container(border=True):
         st.markdown("#### 📐 Основные параметры")
         k1, k2, k3, k4 = st.columns(4)
@@ -54,7 +49,6 @@ def render_dashboard_metrics(G_view, met: dict) -> None:
         k3.metric("Density", fmt(met.get("density"), 6), help=help_icon("Density"))
         k4.metric("Avg Degree", fmt(met.get("avg_degree"), 2))
 
-    # Card 2: Connectivity
     with st.container(border=True):
         st.markdown("#### 🔗 Связность и пути")
         c1, c2, c3, c4 = st.columns(4)
@@ -68,7 +62,6 @@ def render_dashboard_metrics(G_view, met: dict) -> None:
         c3.metric("Diameter (approx)", fmt(met.get("diameter_approx"), 0))
         c4.metric("Efficiency", fmt(met.get("eff_w")), help=help_icon("Efficiency"))
 
-    # Card 3: Topology
     with st.container(border=True):
         st.markdown("#### 🕸️ Топология и Спектр")
         m1, m2, m3, m4 = st.columns(4)
@@ -77,7 +70,6 @@ def render_dashboard_metrics(G_view, met: dict) -> None:
         m3.metric("Assortativity", fmt(met.get("assortativity")), help=help_icon("Assortativity"))
         m4.metric("Clustering", fmt(met.get("clustering")), help=help_icon("Clustering"))
 
-    # Card 4: Entropy & Robustness
     with st.container(border=True):
         st.markdown("#### 🎲 Энтропия и Устойчивость")
         e1, e2, e3 = st.columns(3)
@@ -98,7 +90,6 @@ def render_dashboard_metrics(G_view, met: dict) -> None:
         a2.metric("β (Redundancy)", fmt(met.get("beta_red")), help=help_icon("beta_red"))
         a3.metric("1/λ_max (Epi thr)", fmt(met.get("epi_thr")), help=help_icon("epi_thr"))
 
-    # Card 5: Advanced Geometry
     st.subheader("🧭 Геометрия / робастность")
 
     g1, g2, g3, g4 = st.columns(4)
@@ -134,7 +125,6 @@ def render_dashboard_metrics(G_view, met: dict) -> None:
 
 
 def render_dashboard_charts(G_view, apply_plot_defaults) -> None:
-    """Render degree/weight distributions."""
     st.markdown("### 📈 Распределения")
     d1, d2 = st.columns(2)
 

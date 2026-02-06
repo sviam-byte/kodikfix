@@ -1,4 +1,3 @@
-"""Normalization helpers for plotting curves."""
 
 from __future__ import annotations
 
@@ -10,8 +9,6 @@ import pandas as pd
 
 def normalize_series(s: pd.Series, mode: str) -> pd.Series:
     """
-    Normalize a numeric series for plotting.
-    Modes:
       - "none": no change
       - "rel0": y / y0 (if y0==0 -> keep as-is)
       - "delta0": y - y0
@@ -63,7 +60,6 @@ def normalize_df(
     mode: str,
     out_col: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Return a copy with normalized column."""
     if df is None or df.empty or y_col not in df.columns:
         return df
     d = df.copy()

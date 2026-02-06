@@ -1,4 +1,3 @@
-"""Typed session-state models used in the Streamlit app."""
 
 from __future__ import annotations
 
@@ -13,25 +12,21 @@ from .preprocess import filter_edges
 
 @dataclass
 class GraphEntry:
-    """Typed metadata for a graph stored in Streamlit session state."""
-
     id: str
     name: str
     source: str
     edges: pd.DataFrame
-    # Метаданные колонок теперь строго типизированы, а не просто dict.
     src_col: str
     dst_col: str
     created_at: float
 
     def get_filtered_edges(self, min_conf: float, min_weight: float) -> pd.DataFrame:
-        """Return edges filtered by confidence/weight thresholds."""
+        """"""
         return filter_edges(self.edges, self.src_col, self.dst_col, min_conf, min_weight)
 
 
 @dataclass
 class ExperimentEntry:
-    """Typed metadata for an experiment stored in Streamlit session state."""
 
     id: str
     name: str
@@ -52,7 +47,6 @@ def build_graph_entry(
     entry_id: str,
     created_at: float | None = None,
 ) -> GraphEntry:
-    """Factory for GraphEntry to keep creation consistent across the app."""
     return GraphEntry(
         id=entry_id,
         name=name,
@@ -74,7 +68,6 @@ def build_experiment_entry(
     entry_id: str,
     created_at: float | None = None,
 ) -> ExperimentEntry:
-    """Factory for ExperimentEntry to keep creation consistent across the app."""
     return ExperimentEntry(
         id=entry_id,
         name=name,

@@ -18,10 +18,7 @@ def _pick_nodes_adaptive(
     k: int,
     rng: np.random.Generator,
 ) -> Optional[list]:
-    """
-    Pick k nodes from the CURRENT graph H according to adaptive strategy.
-    Returns None for unsupported strategies to fall back to existing code.
-    """
+
     if k <= 0 or H.number_of_nodes() == 0:
         return []
 
@@ -45,7 +42,6 @@ def _pick_nodes_adaptive(
 # Rich-Club helpers
 # =========================
 def strength_ranking(G: nx.Graph) -> list:
-    """Rank nodes by weighted degree (strength)."""
     strength = dict(G.degree(weight="weight"))
     nodes = list(G.nodes())
     nodes_sorted = sorted(nodes, key=lambda n: strength.get(n, 0.0), reverse=True)
@@ -53,7 +49,6 @@ def strength_ranking(G: nx.Graph) -> list:
 
 
 def richclub_top_fraction(G: nx.Graph, rc_frac: float) -> list:
-    """Return top fraction of nodes by strength."""
     nodes_sorted = strength_ranking(G)
     if not nodes_sorted:
         return []
@@ -62,7 +57,6 @@ def richclub_top_fraction(G: nx.Graph, rc_frac: float) -> list:
 
 
 def richclub_by_density_threshold(G: nx.Graph, min_density: float, max_frac: float) -> list:
-    """Return the largest prefix with induced density above threshold."""
     nodes_sorted = strength_ranking(G)
     n = len(nodes_sorted)
     if n == 0:
@@ -93,7 +87,6 @@ def pick_targets_for_attack(
     rc_max_frac: float,
     fast_mode: bool = False,
 ) -> list:
-    """Select nodes to remove per attack strategy."""
     nodes = list(G.nodes())
     if not nodes:
         return []
@@ -112,7 +105,7 @@ def pick_targets_for_attack(
         H = add_dist_attr(G)
         n = H.number_of_nodes()
         # ОПТИМИЗАЦИЯ: контролируем k_samples.
-        # В fast_mode делаем очень грубую оценку (15 сэмплов достаточно для топ-узлов).
+        # В fast_mode делаем очень грубую оценку (15 сэмплов достаточно для топ-узлов)
         if fast_mode:
             k_samples = min(15, n)
         else:
@@ -140,7 +133,6 @@ def pick_targets_for_attack(
 
 
 def lcc_fraction(G: nx.Graph, N0: int) -> float:
-    """Compute fraction of nodes in the largest connected component."""
     if G.number_of_nodes() == 0 or N0 <= 0:
         return 0.0
     lcc = len(max(nx.connected_components(G), key=len))
@@ -164,7 +156,6 @@ def run_attack(
     fast_mode: bool = False,
     progress_cb=None,
 ):
-    """Unified runner for both static (centrality) and adaptive (weak nodes) attacks."""
     G = as_simple_undirected(G_in).copy()
     N0 = G.number_of_nodes()
 
@@ -174,7 +165,6 @@ def run_attack(
     total_to_remove = int(N0 * float(remove_frac))
     is_adaptive = attack_kind in ("low_degree", "weak_strength", "random")
 
-    # Pre-calculate targets for static strategies.
     static_targets = []
     if not is_adaptive:
         static_targets = pick_targets_for_attack(
@@ -182,13 +172,12 @@ def run_attack(
             fast_mode=fast_mode
         )
 
-    # Simulation loop.
     ks = np.linspace(0, total_to_remove, int(steps) + 1).round().astype(int).tolist()
     np_rng = np.random.default_rng(int(seed))
     history, states, removed_log = [], [], []
 
     for i, target_k in enumerate(ks):
-        # прогрессбар для UI: если не нужен — просто None
+        # прогрессбар для UI
         if progress_cb is not None:
             try:
                 progress_cb(i, len(ks) - 1, target_k)
@@ -199,16 +188,13 @@ def run_attack(
 
         if keep_states:
             states.append(G.copy())
-        # Metrics snapshot.
         # В fast_mode считаем тяжелые метрики только на первых/последних шагах
-        # и чуть реже внутри (чтобы UI не "мертвел").
         is_first_last = (i == 0) or (i == len(ks) - 1)
         if fast_mode:
             heavy = is_first_last or (i % max(1, int(compute_heavy_every) * 2) == 0)
         else:
             heavy = (i % max(1, int(compute_heavy_every)) == 0)
 
-        # Спектральное/модульность и прочие "тяжелые" части считаем только на heavy шагах.
         skip_spectral = not heavy
 
         met = calculate_metrics(
@@ -224,7 +210,6 @@ def run_attack(
                 "step": i,
                 "removed_frac": len(removed_log) / N0,
                 "lcc_frac": lcc_fraction(G, N0),
-                # Унифицируем метрики (чтобы downstream не проверял ключи вручную).
                 "N": met.get("N", G.number_of_nodes()),
                 "E": met.get("E", G.number_of_edges()),
                 "eff_w": met.get("eff_w", np.nan),
@@ -235,7 +220,6 @@ def run_attack(
         )
         history.append(met)
 
-        # Node removal.
         if i < len(ks) - 1:
             num_to_del = ks[i + 1] - len(removed_log)
             if num_to_del > 0:
@@ -262,10 +246,7 @@ def run_edge_attack(
     curvature_sample_edges: int = 80,
     progress_cb=None,
 ):
-    """Edge-removal attack using weight/confidence, flux, or Ricci-based rankings.
 
-    Returns df_hist and aux, where aux contains removed edge order for downstream UI.
-    """
     if G.number_of_edges() == 0:
         df = pd.DataFrame(
             [
@@ -285,7 +266,6 @@ def run_edge_attack(
     kind = str(kind)
 
     # --------------------------
-    # Cheap rankings by attributes
     # --------------------------
     def _safe_float(value, default: float = 0.0) -> float:
         """Convert to float with finite fallback for edge attributes."""
@@ -309,10 +289,10 @@ def run_edge_attack(
 
     else:
         # --------------------------
-        # Expensive rankings: Ricci / Flux
+        # Ricci / Flux
         # --------------------------
         rng = np.random.default_rng(int(seed))
-        max_eval = 600  # Cap edge curvature evaluations for speed.
+        max_eval = 600 
         edge_list = [(u, v) for (u, v, _d) in edges]
         if len(edge_list) > max_eval:
             sample_idx = rng.choice(len(edge_list), size=max_eval, replace=False)
@@ -323,13 +303,11 @@ def run_edge_attack(
         kappa: dict[tuple, float] = {}
         flux: dict[tuple, float] = {}
 
-        # Flux precompute (RW / Evo).
         if kind in ("flux_high_rw", "flux_high_evo", "flux_high_rw_x_neg_ricci"):
             flow_mode = "evo" if kind.endswith("_evo") else "rw"
             _ne, ef = compute_energy_flow(H0, steps=20, flow_mode=flow_mode, damping=1.0)
             flux = dict(ef)
 
-        # Curvature on sampled edges.
         if kind.startswith("ricci_") or kind == "flux_high_rw_x_neg_ricci":
             for (u, v) in sampled:
                 try:
@@ -392,7 +370,7 @@ def run_edge_attack(
 
     rows = []
     for i, k in enumerate(ks):
-        # прогрессбар для UI: если не нужен — просто None
+
         if progress_cb is not None:
             try:
                 progress_cb(i, len(ks) - 1, k)
@@ -424,7 +402,6 @@ def run_edge_attack(
             "step": i,
             "removed_frac": float(removed_frac),
             "removed_k": int(k),
-            # Явно приводим типы, чтобы downstream-таблицы были стабильны.
             "N": int(metrics.get("N", H.number_of_nodes())),
             "E": int(metrics.get("E", H.number_of_edges())),
             "C": int(metrics.get("C", np.nan)) if "C" in metrics else np.nan,

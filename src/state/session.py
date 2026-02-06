@@ -24,7 +24,7 @@ class SessionManager:
         self.experiments = st.session_state["experiments"]
         self.wrappers = st.session_state["wrappers"]
 
-        self.trim_memory()  # да, прямо тут; иначе оно раздувается вечно
+        self.trim_memory()  
 
     def set_graph_entry(self, entry: GraphEntry) -> None:
         self.graphs[entry.id] = entry
@@ -35,7 +35,7 @@ class SessionManager:
         if graph_id in self.graphs:
             del self.graphs[graph_id]
         if graph_id in self.wrappers:
-            # костыль: иногда wrapper держит кучу памяти
+            # иногда wrapper держит кучу памяти
             del self.wrappers[graph_id]
         if self.active_graph_id == graph_id:
             self.active_graph_id = next(iter(self.graphs.keys()), None)
@@ -49,13 +49,10 @@ class SessionManager:
         self.trim_memory()
 
     def trim_memory(self) -> None:
-        # TODO: нормальный LRU, а не этот позор. Сейчас: "оставь последние".
         max_g = int(settings.MAX_GRAPHS_IN_MEMORY)
         max_e = int(settings.MAX_EXPS_IN_MEMORY)
 
-        # graphs: dict сохраняет порядок вставки
         if len(self.graphs) > max_g:
-            # сначала пытаемся убрать всё, кроме активного
             for gid in list(self.graphs.keys()):
                 if len(self.graphs) <= max_g:
                     break
@@ -63,7 +60,6 @@ class SessionManager:
                     continue
                 del self.graphs[gid]
 
-            # если всё равно много — рубим с начала
             while len(self.graphs) > max_g:
                 del self.graphs[next(iter(self.graphs))]
 
@@ -73,7 +69,6 @@ class SessionManager:
             st.session_state["experiments"] = self.experiments[-max_e:]
             self.experiments = st.session_state["experiments"]
 
-    # --- sugar ---
     def make_empty_entry(self) -> GraphEntry:
         return build_graph_entry(name="Empty", source="empty")
 

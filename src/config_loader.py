@@ -1,10 +1,5 @@
-"""Загрузка конфигов и статических ассетов.
+"""Закомментить надо
 
-Здесь живёт то, что не должно размазываться по app.py/ui_blocks.py:
-- справка по метрикам (yaml)
-- общий CSS (assets/style.css)
-
-Streamlit-кэш держит это в памяти между перерендерами.
 """
 
 from __future__ import annotations
@@ -17,13 +12,11 @@ import yaml
 
 
 def _project_root() -> Path:
-    # src/.. -> корень репо
     return Path(__file__).resolve().parents[1]
 
 
 @st.cache_data(show_spinner=False)
 def load_metrics_info() -> Dict[str, Dict[str, str]]:
-    """Прочитать config/metrics_info.yaml."""
     path = _project_root() / "config" / "metrics_info.yaml"
     if not path.exists():
         return {}
@@ -37,6 +30,5 @@ def load_metrics_info() -> Dict[str, Dict[str, str]]:
 
 @st.cache_data(show_spinner=False)
 def load_css() -> str:
-    """Прочитать assets/style.css."""
     path = _project_root() / "assets" / "style.css"
     return path.read_text(encoding="utf-8") if path.exists() else ""

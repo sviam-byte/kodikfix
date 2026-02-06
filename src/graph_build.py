@@ -2,8 +2,14 @@ import numpy as np
 import networkx as nx
 import pandas as pd
 
+"""
+табличка -> нетворк граф
++ повторно проверяем (на случай, если оно пришло не из препроцесс, а из случайного графа)
+ещё здесь выделяется LCC
+"""
+
+
 def build_graph_from_edges(df_edges: pd.DataFrame, src_col: str, dst_col: str) -> nx.Graph:
-    """Build a graph from an edge table and normalize weight/confidence values."""
     G = nx.from_pandas_edgelist(
         df_edges,
         source=src_col,
@@ -34,7 +40,6 @@ def build_graph_from_edges(df_edges: pd.DataFrame, src_col: str, dst_col: str) -
 
 
 def lcc_subgraph(G: nx.Graph) -> nx.Graph:
-    """Return the largest connected component subgraph."""
     if G.number_of_nodes() == 0:
         return G.copy()
     comp = max(nx.connected_components(G), key=len)
@@ -42,7 +47,6 @@ def lcc_subgraph(G: nx.Graph) -> nx.Graph:
 
 
 def graph_to_edge_df(G: nx.Graph) -> pd.DataFrame:
-    """Serialize graph edges to a dataframe with src/dst/weight/confidence."""
     rows = []
     for u, v, d in G.edges(data=True):
         rows.append(
@@ -57,7 +61,6 @@ def graph_to_edge_df(G: nx.Graph) -> pd.DataFrame:
 
 
 def graph_summary(G: nx.Graph) -> str:
-    """Return a human-readable summary for the graph."""
     N = G.number_of_nodes()
     E = G.number_of_edges()
     C = nx.number_connected_components(G) if N > 0 else 0

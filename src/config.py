@@ -1,6 +1,6 @@
-"""Настройки приложения.
+"""
+дефолтные настройки приложения
 
-Без pydantic и env-магии: если надо поменять дефолты — правь здесь.
 """
 
 from __future__ import annotations
@@ -10,8 +10,6 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Settings:
-    """Набор параметров по умолчанию для визуализации и расчётов."""
-
     # Визуал
     PLOT_HEIGHT: int = 800
     PLOT_TEMPLATE: str = "plotly_dark"
@@ -25,12 +23,11 @@ class Settings:
     RICCI_SAMPLE_EDGES: int = 80
     APPROX_EFFICIENCY_K: int = 32
 
-    # Память/мусор (streamlit любит раздуваться)
+    # чтоб стримлм не кушал память
     MAX_GRAPHS_IN_MEMORY: int = 8
     MAX_EXPS_IN_MEMORY: int = 40
 
-    # Ricci: сколько ребер по умолчанию сэмпли...
-    # Эвристика фазового перехода
+    # Эвристика фазового перехода, захардкорено
     CRITICAL_JUMP_THRESHOLD: float = 0.35
 
     # Дефолты для энергии

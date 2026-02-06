@@ -1,4 +1,3 @@
-"""Mix/Hrish attacks that rewire or replace edges while preserving distributions."""
 
 from __future__ import annotations
 
@@ -18,7 +17,6 @@ from .utils import as_simple_undirected
 
 
 def _safe_attr_float(x, default: float = 1.0) -> float:
-    """Привести к float и вернуть default при нечисловых/бесконечных значениях."""
     try:
         v = float(x)
     except (TypeError, ValueError):
@@ -30,7 +28,6 @@ def _sample_edge_attrs_from_empirical(
     rng: np.random.Generator,
     attrs_pool: list[dict],
 ) -> dict:
-    """Sample edge attrs (weight/confidence) from empirical pool."""
     if not attrs_pool:
         return {"weight": 1.0, "confidence": 1.0}
     d = attrs_pool[int(rng.integers(0, len(attrs_pool)))]
@@ -43,7 +40,6 @@ def _sample_edge_attrs_from_empirical(
 
 
 def _edge_swap_degree_preserving(H: nx.Graph, n_swaps: int, seed: int) -> int:
-    """Degree-preserving double-edge swap (best-effort)."""
     if H.number_of_edges() < 2 or H.number_of_nodes() < 4 or n_swaps <= 0:
         return 0
     try:
@@ -55,7 +51,6 @@ def _edge_swap_degree_preserving(H: nx.Graph, n_swaps: int, seed: int) -> int:
         )
         return int(n_swaps)
     except nx.NetworkXError:
-        # Не удалось найти валидные свопы (граф слишком мал или жесткая топология).
         return 0
 
 
@@ -66,10 +61,6 @@ def _replace_edges_from_source(
     rng: np.random.Generator,
     attrs_pool: list[dict],
 ) -> int:
-    """
-    Remove k edges at random, then add k edges sampled from a source null graph.
-    Edge attrs are sampled from the empirical pool.
-    """
     if k_replace <= 0 or H.number_of_edges() == 0:
         return 0
     edges_H = list(H.edges())
@@ -105,14 +96,7 @@ def run_mix_attack(
     replace_from: str = "ER",
     progress_cb=None,
 ):
-    """
-    Run mix-style attacks with a progress axis in mix_frac [0,1].
 
-    kind:
-      - "mix_degree_preserving": rewire only via double-edge-swap
-      - "mix_weightconf_preserving": replace edges from null model, sample attrs
-      - "hrish_mix": both channels using alpha/beta
-    """
     rng = np.random.default_rng(int(seed))
     H0 = as_simple_undirected(G)
     H = H0.copy()
@@ -146,7 +130,6 @@ def run_mix_attack(
     total_replaced_done = 0
 
     for i, x in enumerate(xs):
-        # UI-progress: пригодится на больших графах, иначе просто None
         if progress_cb is not None:
             try:
                 progress_cb(i, len(xs) - 1, x)

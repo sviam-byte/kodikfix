@@ -1,4 +1,4 @@
-"""Мини-профилирование: декоратор timeit."""
+"""Мини-профилирование декоратор timeit."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def timeit(name: str | None = None) -> Callable[[F], F]:
-    """Замер времени выполнения функции и лог в logging."""
     def deco(fn: F) -> F:
         label = name or fn.__name__
         logger = logging.getLogger("kodik.perf")

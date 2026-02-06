@@ -10,7 +10,6 @@ def fig_metrics_over_steps(
     normalize_mode: str = "none",
     height: int = 820,
 ) -> go.Figure:
-    """Plot key metrics over removal steps for a single experiment."""
     fig = go.Figure()
     if df_hist is None or df_hist.empty:
         fig.update_layout(title="empty")
@@ -49,7 +48,6 @@ def fig_compare_attacks(
     normalize_mode: str = "none",
     height: int = 820,
 ) -> go.Figure:
-    """Compare multiple experiment curves on a shared axis."""
     fig = go.Figure()
     for name, df in curves:
         if df is None or df.empty or x_col not in df.columns or y_col not in df.columns:
@@ -63,7 +61,6 @@ def fig_compare_attacks(
 
 
 def fig_compare_graphs_scalar(df_cmp: pd.DataFrame, x: str, y: str, title: str) -> go.Figure:
-    """Compare graph-level scalar metrics as a bar chart."""
     fig = go.Figure()
     if df_cmp is None or df_cmp.empty:
         fig.update_layout(title="empty")

@@ -21,7 +21,6 @@ try:
     _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_fh)
 except Exception:
-    # ну и ладно, переживём
     pass
 
 st.set_page_config(
@@ -32,7 +31,6 @@ st.set_page_config(
 )
 st.title("Graph Lab")
 
-# 2) Imports from modular architecture
 from src.config import settings
 from src.io_load import load_uploaded_any
 from src.preprocess import coerce_fixed_format
@@ -42,19 +40,17 @@ from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.ui_blocks import inject_custom_css
 
-# Tabs
 from src.ui.tabs import attacks as tab_attacks
 from src.ui.tabs import compare as tab_compare
 from src.ui.tabs import dashboard as tab_dashboard
 from src.ui.tabs import energy as tab_energy
 from src.ui.tabs import structure as tab_structure
 
-# 3) Init
 inject_custom_css()
 ctx.ensure_initialized()
 
 
-# --- Helpers (местами нарочно "грязные") ---
+# --- Helpers ---
 
 def new_id(prefix):
     import uuid
@@ -63,7 +59,6 @@ def new_id(prefix):
 
 
 def _guess_cols(columns):
-    """Примитивный угадыватель колонок (UI-ха... пока так)."""
     cols = [str(c) for c in columns]
     low = [c.lower() for c in cols]
 
@@ -230,20 +225,18 @@ with st.sidebar:
                     else:
                         tmp_df["confidence"] = 100.0
 
-                    # грязно, но эффективно: NaN -> дефолты
+                    # NaN -> дефолты
                     tmp_df["weight"] = tmp_df["weight"].fillna(1.0)
                     tmp_df["confidence"] = tmp_df["confidence"].fillna(100.0)
 
                     name = st.session_state.get("__pending_upload_name", "upload")
                     add_graph_to_state(name, tmp_df, "upload", "src", "dst")
 
-                    # cleanup
                     st.session_state.pop("__pending_upload_error", None)
                     st.session_state.pop("__pending_upload_df", None)
                     st.session_state.pop("__pending_upload_name", None)
                     st.rerun()
 
-    # Demo Graph
     with st.expander("🎲 Демо граф"):
         from src.null_models import make_er_gnm
 
@@ -281,7 +274,6 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    # Cache / memory hacks
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🧹 Clear cache", help="Сброс st.cache_* (иногда лечит странные подвисоны)"):
@@ -309,7 +301,7 @@ with st.sidebar:
 
 
 # ============================================================
-# 5) ACTIVE GRAPH LOGIC
+# 5) AАКТИВНЫЙ ГРАФЧИК
 # ============================================================
 if not ctx.graphs:
     st.warning("Workspace пуст. Загрузите файл или создайте демо-граф в сайдбаре.")
@@ -353,14 +345,12 @@ with st.sidebar:
 
     seed_val = int(st.number_input("Seed", value=settings.DEFAULT_SEED))
 
-    # Ricci trigger
     curv_n = int(st.slider("Ricci edges", 20, 300, int(settings.RICCI_SAMPLE_EDGES)))
     do_ricci = st.button("Compute Ricci (slow)")
 
     # DEBUG: если совсем странно
     # st.write(active_entry.edges.head(5))
 
-# Build graphs
 G_view = GraphService.build_graph(
     active_entry.edges,
     active_entry.src_col,
@@ -379,7 +369,6 @@ G_full = GraphService.build_graph(
     "Global",
 )
 
-# Base metrics (fast)
 with st.spinner("Calculating metrics..."):
     met = GraphService.compute_metrics(
         active_entry.edges,
@@ -484,4 +473,4 @@ elif current_tab == tab_names[5]:
     )
 
 st.markdown("---")
-st.caption("Kodik Lab | de-AI-ified + UX bits")
+st.caption("Kodik Лабчик")

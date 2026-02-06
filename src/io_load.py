@@ -6,14 +6,12 @@ import pandas as pd
 from pandas.errors import ParserError
 
 def load_uploaded_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Load uploaded bytes into a DataFrame for CSV or Excel inputs."""
     name = (filename or "").lower()
     bio = io.BytesIO(file_bytes)
 
     if name.endswith((".xlsx", ".xls")):
         df = pd.read_excel(bio)
     else:
-        # Try utf-8 with replacement; fallback to cp1251 for legacy files.
         try:
             df = pd.read_csv(bio, sep=None, engine="python", encoding_errors="replace")
         except (UnicodeDecodeError, ParserError):
@@ -31,7 +29,6 @@ def load_uploaded_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
 
 def clean_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
-    Clean fixed format by position:
       0: src id
       1: dst id
       8: confidence
@@ -47,7 +44,6 @@ def clean_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     df = df_any.copy()
 
-    # Normalize types and allow for missing/invalid values.
     df[src_col] = pd.to_numeric(df[src_col], errors="coerce").astype("Int64")
     df[dst_col] = pd.to_numeric(df[dst_col], errors="coerce").astype("Int64")
     df[conf_col] = pd.to_numeric(df[conf_col], errors="coerce")

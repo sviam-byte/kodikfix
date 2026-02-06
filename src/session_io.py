@@ -13,8 +13,7 @@ from .state_models import (
 
 
 class GraphDataEncoder(json.JSONEncoder):
-    """JSON encoder for numpy/pandas-friendly payloads."""
-    def default(self, obj):  # noqa: ANN001 - JSONEncoder API uses untyped args.
+    def default(self, obj):  
         if isinstance(obj, (np.integer, np.floating, np.bool_)):
             return obj.item()
         if isinstance(obj, np.ndarray):
@@ -36,29 +35,21 @@ class GraphDataEncoder(json.JSONEncoder):
 
 
 def _json_dumps_bytes(payload: dict) -> bytes:
-    """Serialize payload with GraphDataEncoder to UTF-8 bytes."""
     return json.dumps(payload, cls=GraphDataEncoder, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _df_to_b64_csv(df: pd.DataFrame) -> str:
-    """Serialize a DataFrame to a base64-encoded CSV string."""
     csv = df.to_csv(index=False).encode("utf-8")
     return base64.b64encode(csv).decode("ascii")
 
 
 def _b64_csv_to_df(s: str) -> pd.DataFrame:
-    """Deserialize a base64-encoded CSV string into a DataFrame."""
     raw = base64.b64decode(s.encode("ascii"))
     return pd.read_csv(pd.io.common.BytesIO(raw))
 
 
 def export_workspace_json(graphs: dict, experiments: list[ExperimentEntry]) -> bytes:
-    """Экспорт workspace (graphs + experiments) в JSON bytes.
 
-    Допускаются два формата в session_state:
-    - новый: GraphEntry / ExperimentEntry
-    - легаси: dict-пэйлоады
-    """
     g_out: dict[str, dict] = {}
     for gid, g in graphs.items():
         if isinstance(g, GraphEntry):
@@ -112,7 +103,6 @@ def export_workspace_json(graphs: dict, experiments: list[ExperimentEntry]) -> b
 
 
 def import_workspace_json(blob: bytes) -> tuple[dict[str, GraphEntry], list[ExperimentEntry]]:
-    """Импорт workspace из JSON bytes."""
     payload = json.loads(blob.decode("utf-8"))
     graphs_raw = payload.get("graphs", {})
     exps_raw = payload.get("experiments", [])
@@ -150,7 +140,6 @@ def import_workspace_json(blob: bytes) -> tuple[dict[str, GraphEntry], list[Expe
 
 
 def export_experiments_json(experiments: list[ExperimentEntry]) -> bytes:
-    """Export experiments only (without graph storage) as JSON bytes."""
     e_out: list[dict] = []
     for e in experiments:
         if isinstance(e, ExperimentEntry):
@@ -182,7 +171,6 @@ def export_experiments_json(experiments: list[ExperimentEntry]) -> bytes:
 
 
 def import_experiments_json(blob: bytes) -> list[ExperimentEntry]:
-    """Import experiments from JSON bytes."""
     payload = json.loads(blob.decode("utf-8"))
     exps_raw = payload.get("experiments", [])
     exps: list[ExperimentEntry] = []
