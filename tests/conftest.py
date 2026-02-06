@@ -1,4 +1,3 @@
-"""Pytest configuration to ensure the repo root is on sys.path."""
 
 from __future__ import annotations
 
