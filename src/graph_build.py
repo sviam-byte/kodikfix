@@ -4,6 +4,7 @@ import pandas as pd
 
 from .config import settings
 from .weights import policy_from_settings, apply_weight_policy_scalar
+from .preprocess import filter_edges
 
 """
 табличка -> нетворк граф
@@ -57,6 +58,24 @@ def build_graph_from_edges(
         G.remove_edges_from(to_drop)
     if G.number_of_edges() == 0:
         raise ValueError("Graph has zero edges after weight sanitization.")
+    return G
+
+
+def build_graph(
+    df_edges: pd.DataFrame,
+    *,
+    src_col: str = "src",
+    dst_col: str = "dst",
+    min_conf: float = 0.0,
+    min_weight: float = 0.0,
+    analysis_mode: str = "Global",
+    strict: bool = True,
+) -> nx.Graph:
+    """Полный пайплайн сборки: фильтры -> граф -> (опционально) LCC."""
+    df_filtered = filter_edges(df_edges, src_col, dst_col, float(min_conf), float(min_weight))
+    G = build_graph_from_edges(df_filtered, src_col, dst_col, strict=strict)
+    if str(analysis_mode).startswith("LCC"):
+        G = lcc_subgraph(G)
     return G
 
 

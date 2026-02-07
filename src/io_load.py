@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pandas as pd
 from pandas.errors import ParserError
 
 from .preprocess import coerce_fixed_format
+
+
+def load_edges(path_or_bytes: str | Path | bytes, filename: str | None = None) -> pd.DataFrame:
+    """Load edges table from a file path or uploaded bytes."""
+    if isinstance(path_or_bytes, (str, Path)):
+        path = Path(path_or_bytes)
+        if path.suffix.lower() in (".xlsx", ".xls"):
+            df = pd.read_excel(path)
+        else:
+            df = pd.read_csv(path, sep=None, engine="python", encoding_errors="replace")
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+    if isinstance(path_or_bytes, (bytes, bytearray)):
+        use_name = filename or ""
+        return load_uploaded_any(bytes(path_or_bytes), use_name)
+    raise TypeError("path_or_bytes must be a file path or raw bytes")
 
 
 def load_uploaded_any(file_bytes: bytes, filename: str) -> pd.DataFrame:

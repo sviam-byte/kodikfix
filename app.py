@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+import networkx as nx
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -32,8 +33,9 @@ st.set_page_config(
 st.title("Graph Lab")
 
 from src.config import settings
-from src.io_load import load_uploaded_any
+from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
+from src.graph_build import build_graph
 from src.services.graph_service import GraphService
 from src.session_io import export_experiments_json, export_workspace_json, import_workspace_json
 from src.state.session import ctx
@@ -108,6 +110,36 @@ def save_experiment_to_state(name, gid, kind, params, df_hist):
     return eid
 
 
+@st.cache_data(show_spinner=False)
+def cached_load_edges(file_bytes: bytes, filename: str, fixed: bool) -> tuple[pd.DataFrame, dict | None]:
+    """Загрузить таблицу рёбер с кэшем (ускоряет переключение вкладок)."""
+    df_any = load_edges(file_bytes, filename)
+    if fixed:
+        df_edges, meta = coerce_fixed_format(df_any)
+        return df_edges, meta
+    return df_any, None
+
+
+@st.cache_resource(show_spinner=False)
+def cached_build_graph(
+    df_edges: pd.DataFrame,
+    src_col: str,
+    dst_col: str,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+) -> nx.Graph:
+    """Собрать граф с кэшем (тяжёлый объект)."""
+    return build_graph(
+        df_edges,
+        src_col=src_col,
+        dst_col=dst_col,
+        min_conf=min_conf,
+        min_weight=min_weight,
+        analysis_mode=analysis_mode,
+    )
+
+
 # ============================================================
 # 4) SIDEBAR
 # ============================================================
@@ -149,13 +181,13 @@ with st.sidebar:
             st.session_state["last_upload_hash"] = file_hash
 
             try:
-                df_raw = load_uploaded_any(raw_bytes, uploaded_file.name)
+                df_raw, _ = cached_load_edges(raw_bytes, uploaded_file.name, fixed=False)
                 st.session_state["__pending_upload_df"] = df_raw
                 st.session_state["__pending_upload_name"] = uploaded_file.name
 
                 # пытаемся авто-режимом
                 try:
-                    df_edges, meta = coerce_fixed_format(df_raw)
+                    df_edges, meta = cached_load_edges(raw_bytes, uploaded_file.name, fixed=True)
                     add_graph_to_state(
                         uploaded_file.name,
                         df_edges,
@@ -351,7 +383,7 @@ with st.sidebar:
     # DEBUG: если совсем странно
     # st.write(active_entry.edges.head(5))
 
-G_view = GraphService.build_graph(
+G_view = cached_build_graph(
     active_entry.edges,
     active_entry.src_col,
     active_entry.dst_col,
@@ -360,7 +392,7 @@ G_view = GraphService.build_graph(
     analysis_mode,
 )
 
-G_full = GraphService.build_graph(
+G_full = cached_build_graph(
     active_entry.edges,
     active_entry.src_col,
     active_entry.dst_col,
