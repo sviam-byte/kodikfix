@@ -1,5 +1,4 @@
 import math
-import random
 from typing import Optional
 
 import networkx as nx
@@ -91,11 +90,14 @@ def pick_targets_for_attack(
     if not nodes:
         return []
 
-    rng = random.Random(int(seed))
+    rng = np.random.default_rng(int(seed))
 
     if attack_kind == "random":
         k = min(len(nodes), step_size)
-        return rng.sample(nodes, k)
+        if k <= 0:
+            return []
+        # Generator.choice returns ndarray; convert to plain python list.
+        return rng.choice(nodes, size=k, replace=False).tolist()
 
     if attack_kind == "degree":
         strength = dict(G.degree(weight="weight"))

@@ -32,6 +32,22 @@ from src.utils import as_simple_undirected, get_node_strength
 
 _layout_cached = GraphService.compute_layout3d
 
+
+def _hash_graph(G: nx.Graph) -> str:
+    """Stable hash for caching graph-derived metrics."""
+    if G is None:
+        return "none"
+    try:
+        return nx.weisfeiler_lehman_graph_hash(G, edge_attr="weight")
+    except Exception:
+        return f"{G.number_of_nodes()}-{G.number_of_edges()}"
+
+
+@st.cache_data(show_spinner=False, hash_funcs={nx.Graph: _hash_graph})
+def _cached_betweenness(G: nx.Graph) -> dict:
+    """Cached betweenness centrality (costly on large graphs)."""
+    return nx.betweenness_centrality(G, normalized=True)
+
 # Загружаем справку по метрикам один раз на модуль.
 _info = load_metrics_info()
 METRIC_HELP = _info.get("metric_help", {})
@@ -99,7 +115,7 @@ def _fallback_removal_order(G: nx.Graph, kind: str, seed: int):
         if H.number_of_nodes() > 5000:
             nodes.sort(key=lambda n: H.degree(n), reverse=True)
             return nodes
-        b = nx.betweenness_centrality(H, normalized=True)
+        b = _cached_betweenness(H)
         nodes.sort(key=lambda n: b.get(n, 0.0), reverse=True)
         return nodes
 
