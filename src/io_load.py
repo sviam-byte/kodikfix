@@ -5,6 +5,8 @@ import io
 import pandas as pd
 from pandas.errors import ParserError
 
+from .preprocess import coerce_fixed_format
+
 
 def load_uploaded_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
     name = (filename or "").lower()
@@ -29,37 +31,15 @@ def load_uploaded_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
 
 
 def clean_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Compatibility wrapper for the legacy fixed-format loader.
+
+    Delegates to :func:`src.preprocess.coerce_fixed_format` so that all weight
+    handling stays consistent across the codebase.
     """
-      0: src id
-      1: dst id
-      8: confidence
-      9: weight
-    """
-    if df_any.shape[1] < 10:
-        raise ValueError("Need >= 10 columns (fixed format).")
-
-    src_col = df_any.columns[0]
-    dst_col = df_any.columns[1]
-    conf_col = df_any.columns[8]
-    w_col = df_any.columns[9]
-
-    df = df_any.copy()
-
-    df[src_col] = pd.to_numeric(df[src_col], errors="coerce").astype("Int64")
-    df[dst_col] = pd.to_numeric(df[dst_col], errors="coerce").astype("Int64")
-    df[conf_col] = pd.to_numeric(df[conf_col], errors="coerce")
-    df[w_col] = pd.to_numeric(
-        df[w_col].astype(str).str.replace(",", ".", regex=False),
-        errors="coerce",
-    )
-
-    df = df.rename(columns={conf_col: "confidence", w_col: "weight"})
-    df = df.dropna(subset=[src_col, dst_col, "confidence", "weight"])
-    df = df[df["weight"] > 0]
-
+    df, meta0 = coerce_fixed_format(df_any)
     meta = {
-        "SRC_COL": src_col,
-        "DST_COL": dst_col,
+        "SRC_COL": meta0["src_col"],
+        "DST_COL": meta0["dst_col"],
         "CONF_COL": "confidence",
         "WEIGHT_COL": "weight",
     }

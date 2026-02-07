@@ -2,6 +2,9 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+from .config import settings
+from .weights import policy_from_settings, apply_weight_policy_scalar
+
 """
 табличка -> нетворк граф
 + повторно проверяем (на случай, если оно пришло не из препроцесс, а из случайного графа)
@@ -9,7 +12,13 @@ import pandas as pd
 """
 
 
-def build_graph_from_edges(df_edges: pd.DataFrame, src_col: str, dst_col: str) -> nx.Graph:
+def build_graph_from_edges(
+    df_edges: pd.DataFrame,
+    src_col: str,
+    dst_col: str,
+    *,
+    strict: bool = True,
+) -> nx.Graph:
     G = nx.from_pandas_edgelist(
         df_edges,
         source=src_col,
@@ -17,7 +26,10 @@ def build_graph_from_edges(df_edges: pd.DataFrame, src_col: str, dst_col: str) -
         edge_attr=["weight", "confidence"],
         create_using=nx.Graph(),
     )
-    for _, _, d in G.edges(data=True):
+    pol = policy_from_settings(settings.WEIGHT_POLICY, settings.WEIGHT_EPS, settings.WEIGHT_SHIFT)
+    to_drop = []
+
+    for u, v, d in G.edges(data=True):
         w_raw = d.get("weight", 1.0)
         c_raw = d.get("confidence", 0.0)
         try:
@@ -29,13 +41,22 @@ def build_graph_from_edges(df_edges: pd.DataFrame, src_col: str, dst_col: str) -
         except (TypeError, ValueError):
             c = 0.0
 
-        if not np.isfinite(w) or w <= 0:
-            raise ValueError(f"edge weight must be finite and >0, got {w!r}")
+        w2 = apply_weight_policy_scalar(w, pol)
+        if w2 is None:
+            if strict:
+                raise ValueError(f"edge weight must be finite and >0 under policy={pol.mode!r}, got {w!r}")
+            to_drop.append((u, v))
+            continue
+        w = float(w2)
         if not np.isfinite(c):
             raise ValueError(f"edge confidence must be finite, got {c!r}")
 
-        d["weight"] = w
+        d["weight"] = float(w)
         d["confidence"] = c
+    if to_drop:
+        G.remove_edges_from(to_drop)
+    if G.number_of_edges() == 0:
+        raise ValueError("Graph has zero edges after weight sanitization.")
     return G
 
 

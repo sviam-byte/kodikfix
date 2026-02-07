@@ -18,6 +18,16 @@ class Settings:
 
     # Расчёты
     DEFAULT_SEED: int = 42
+
+    # Политика весов (важно для корректности и воспроизводимости)
+    # Возможные значения:
+    # - "drop_nonpositive": удалить рёбра с w<=0 (дефолт, строго для dist=1/w)
+    # - "abs": заменить w <- |w| (подходит для корреляций, но теряется знак)
+    # - "clip": заменить w <- max(w, eps)
+    # - "shift": сдвинуть веса на фиксированную константу (w <- w + shift, затем max(w, eps))
+    WEIGHT_POLICY: str = "drop_nonpositive"
+    WEIGHT_EPS: float = 1e-9
+    WEIGHT_SHIFT: float = 0.0
     RICCI_CUTOFF: float = 8.0
     RICCI_MAX_SUPPORT: int = 60
     RICCI_SAMPLE_EDGES: int = 80

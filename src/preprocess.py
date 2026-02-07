@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .config import settings
+from .weights import policy_from_settings, apply_weight_policy_to_series
+
 
 def coerce_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
@@ -36,7 +39,10 @@ def coerce_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     out = df[[SRC_COL, DST_COL, CONF_COL, WEIGHT_COL]].copy()
     out = out.rename(columns={CONF_COL: "confidence", WEIGHT_COL: "weight"})
     out = out.dropna(subset=[SRC_COL, DST_COL, "confidence", "weight"])
-    out = out[out["weight"] > 0]
+
+    pol = policy_from_settings(settings.WEIGHT_POLICY, settings.WEIGHT_EPS, settings.WEIGHT_SHIFT)
+    out["weight"], keep = apply_weight_policy_to_series(out["weight"], pol)
+    out = out[keep]
 
     if out.empty:
         raise ValueError("После очистки данные пустые (проверь numeric confidence/weight и id).")
@@ -71,7 +77,11 @@ def filter_edges(
 
     df = df.dropna(subset=["confidence", "weight"])
     df = df[df["confidence"] >= min_conf]
+
+    pol = policy_from_settings(settings.WEIGHT_POLICY, settings.WEIGHT_EPS, settings.WEIGHT_SHIFT)
+    df["weight"], keep = apply_weight_policy_to_series(df["weight"], pol)
+    df = df[keep]
+
     df = df[df["weight"] >= min_weight]
-    df = df[df["weight"] > 0]
 
     return df
