@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import networkx as nx
+import numpy as np
 
 from ..utils import as_simple_undirected
 
@@ -35,7 +35,7 @@ def _rw_transition_matrix(G: nx.Graph, nodes: List) -> np.ndarray:
         if s <= 0:
             P[i, i] = 1.0
         else:
-            for w, j in zip(ws, js):
+            for w, j in zip(ws, js, strict=False):
                 P[i, j] = w / s
     return P
 

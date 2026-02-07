@@ -2,26 +2,24 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
 import scipy.sparse.linalg as spla
-
-from networkx.algorithms.community import modularity, louvain_communities
+from networkx.algorithms.community import louvain_communities, modularity
 
 from ..config import settings
-from ..profiling import timeit
-
 from ..core_math import (
     add_dist_attr,
-    network_entropy_rate,
     evolutionary_entropy_demetrius,
-    ollivier_ricci_summary,
-    fragility_from_entropy,
     fragility_from_curvature,
+    fragility_from_entropy,
+    network_entropy_rate,
+    ollivier_ricci_summary,
 )
+from ..profiling import timeit
 
 GraphMetrics = dict[str, int | float | str | Any]
 

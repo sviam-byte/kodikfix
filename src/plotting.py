@@ -1,7 +1,7 @@
 import pandas as pd
 import plotly.graph_objects as go
 
-from .plot_norm import normalize_series, normalize_df
+from .plot_norm import normalize_df, normalize_series
 
 
 def fig_metrics_over_steps(

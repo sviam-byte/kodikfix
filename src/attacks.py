@@ -2,13 +2,13 @@ import math
 import random
 from typing import Optional
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
 
 from .config import settings
 from .core_math import ollivier_ricci_edge
-from .metrics import calculate_metrics, add_dist_attr, compute_energy_flow
+from .metrics import add_dist_attr, calculate_metrics, compute_energy_flow
 from .utils import as_simple_undirected, get_node_strength
 
 
