@@ -4,20 +4,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import multiprocessing
 import random
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
 from joblib import Parallel, delayed
 from scipy.stats import entropy as scipy_entropy
 
-from .utils import as_simple_undirected
 from .profiling import timeit
+from .utils import as_simple_undirected
 
 # -----------------------------
 # Entropy
@@ -191,7 +191,7 @@ def _one_step_measure(H: nx.Graph, x) -> Dict:
     if s <= 0:
         p = 1.0 / len(neigh)
         return {y: p for y in neigh}
-    return {y: w / s for y, w in zip(neigh, ws)}
+    return {y: w / s for y, w in zip(neigh, ws, strict=False)}
 
 
 def _quantize_probs(probs: Dict, scale: int) -> Tuple[List, List[int]]:
@@ -244,9 +244,9 @@ def _emd_w1_transport(
         return 0.0
 
     Gf = nx.DiGraph()
-    for u, m in zip(S_nodes, S_mass):
+    for u, m in zip(S_nodes, S_mass, strict=False):
         Gf.add_node(("S", u), demand=-int(m))
-    for v, m in zip(D_nodes, D_mass):
+    for v, m in zip(D_nodes, D_mass, strict=False):
         Gf.add_node(("D", v), demand=+int(m))
 
     for u in S_nodes:
@@ -401,9 +401,15 @@ def _pf_eigs_sparse(A):
 
 
 def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
-    """
-      P_ij = a_ij * u_j / (lam * u_i),  π_i ∝ u_i v_i
-      H_evo = -Σ_i π_i Σ_j P_ij log P_ij
+    """Demetrius evolutionary entropy (Perron-Frobenius Markov chain).
+
+    We build the PF-induced Markov chain:
+        P_ij = a_ij * u_j / (lam * u_i),  pi_i proportional to u_i * v_i
+        H_evo = -sum_i pi_i sum_j P_ij log_base(P_ij)
+
+    Implementation notes:
+    - Works with non-negative edge weights. Non-finite / non-positive weights are sanitized to 1.0.
+    - Entropy is computed in O(nnz) time without materializing a dense P matrix.
     """
     H = _normalize_edge_weights(as_simple_undirected(G))
     if H.number_of_nodes() < 2 or H.number_of_edges() == 0:
@@ -415,42 +421,27 @@ def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
     if A.data.size:
         A.data = np.maximum(A.data, 0.0)
 
-    n = A.shape[0]
+    n = int(A.shape[0])
+
+    # Right PF eigenpair (A u = lam u) and left PF eigenvector (A^T v = lam v).
     if n <= 600:
         Ad = A.toarray()
-        vals, vecs = np.linalg.eig(Ad)
-        idx = int(np.argmax(np.real(vals)))
-        lam = float(np.real(vals[idx]))
-        u = np.real(vecs[:, idx])
-        v = u
+        vals_r, vecs_r = np.linalg.eig(Ad)
+        idx_r = int(np.argmax(np.real(vals_r)))
+        lam = float(np.real(vals_r[idx_r]))
+        u = np.real(vecs_r[:, idx_r])
+        vals_l, vecs_l = np.linalg.eig(Ad.T)
+        idx_l = int(np.argmax(np.real(vals_l)))
+        v = np.real(vecs_l[:, idx_l])
     else:
-        import scipy.sparse.linalg as spla
-
-        vals_r, vecs_r = spla.eigs(A, k=1, which="LR")
-        lam = float(np.real(vals_r[0]))
-        u = np.real(vecs_r[:, 0])
-        v = u
+        lam, u, v = _pf_eigs_sparse(A)
 
     if not np.isfinite(lam) or lam <= 0:
         return float("nan")
 
+    # Ensure strictly positive vectors (PF theorem gives non-negative; we regularize).
     u = np.abs(u) + 1e-15
     v = np.abs(v) + 1e-15
-
-    P = np.zeros((n, n), dtype=float)
-    A_coo = A.tocoo()
-    for i, j, aij in zip(A_coo.row, A_coo.col, A_coo.data):
-        if aij <= 0:
-            continue
-        P[i, j] += float(aij) * float(u[j]) / (float(lam) * float(u[i]))
-
-    row_sums = P.sum(axis=1)
-    for i in range(n):
-        s = float(row_sums[i])
-        if s > 0:
-            P[i, :] /= s
-        else:
-            P[i, :] = 1.0 / n
 
     pi = u * v
     Z = float(pi.sum())
@@ -459,13 +450,29 @@ def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
     pi = pi / Z
 
     log_base = math.log(base)
+    # For row i: P_ij = a_ij * u_j / (lam * u_i). The normalization over j cancels lam*u_i:
+    #   sum_j P_ij = (sum_j a_ij u_j) / (lam u_i)
+    # so normalized probabilities per row are:
+    #   p_ij = (a_ij u_j) / sum_j(a_ij u_j)
     H_evo = 0.0
+    indptr = A.indptr
+    indices = A.indices
+    data = A.data
     for i in range(n):
-        row = P[i, :]
-        mask = row > 0
-        if not np.any(mask):
+        start, end = int(indptr[i]), int(indptr[i + 1])
+        if start == end:
             continue
-        h_i = -float(np.sum(row[mask] * (np.log(row[mask]) / log_base)))
+        js = indices[start:end]
+        aijs = data[start:end]
+        weights = aijs * u[js]
+        s = float(weights.sum())
+        if not np.isfinite(s) or s <= 0:
+            continue
+        p_row = weights / s
+        mask = p_row > 0
+        if not mask.any():
+            continue
+        h_i = -float((p_row[mask] * (np.log(p_row[mask]) / log_base)).sum())
         H_evo += float(pi[i]) * h_i
 
     return float(H_evo)

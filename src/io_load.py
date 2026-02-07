@@ -5,6 +5,7 @@ import io
 import pandas as pd
 from pandas.errors import ParserError
 
+
 def load_uploaded_any(file_bytes: bytes, filename: str) -> pd.DataFrame:
     name = (filename or "").lower()
     bio = io.BytesIO(file_bytes)

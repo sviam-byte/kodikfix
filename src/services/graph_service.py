@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Optional, Tuple
+from typing import Tuple
 
-import streamlit as st
-import pandas as pd
 import networkx as nx
+import pandas as pd
+import streamlit as st
 
 from ..config import settings
-from ..preprocess import filter_edges
 from ..graph_build import build_graph_from_edges, lcc_subgraph
 from ..graph_wrapper import GraphWrapper
 from ..core.graph_ops import calculate_metrics, compute_3d_layout
 from ..core.physics import simulate_energy_flow
-from ..core_math import ollivier_ricci_summary, fragility_from_curvature
+from ..core_math import fragility_from_curvature, ollivier_ricci_summary
+from ..preprocess import filter_edges
 
 
 def _hash_df_fast(df: pd.DataFrame) -> str:

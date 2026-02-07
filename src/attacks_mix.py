@@ -1,18 +1,17 @@
 
 from __future__ import annotations
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
-
-from .metrics import calculate_metrics
-from .null_models import make_er_gnm, make_configuration_model
 from .core_math import (
-    entropy_degree,
-    entropy_weights,
     entropy_confidence,
+    entropy_degree,
     entropy_triangle_support,
+    entropy_weights,
 )
+from .metrics import calculate_metrics
+from .null_models import make_configuration_model, make_er_gnm
 from .utils import as_simple_undirected
 
 

@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Lint core library code; UI/Streamlit files often bend style rules by design.
+exclude = [
+  "app.py",
+  "src/ui/**",
+  "src/ui_blocks.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/attacks.py" = ["E731"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]

@@ -5,12 +5,12 @@ from typing import Any, Dict
 import networkx as nx
 
 from ..core_math import (
+    entropy_confidence,
     entropy_degree,
     entropy_weights,
-    entropy_confidence,
-    network_entropy_rate,
     evolutionary_entropy_demetrius,
     fragility_from_entropy,
+    network_entropy_rate,
 )
 
 

@@ -1,9 +1,9 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Dict
-import time
 
 import pandas as pd
 
