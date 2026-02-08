@@ -21,3 +21,5 @@ Thumbs.db
 
 # Streamlit
 .streamlit/
+
+# User-provided custom instructions

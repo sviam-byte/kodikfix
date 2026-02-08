@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import networkx as nx
 import numpy as np
 
+from ..config import EPS_W
 from ..utils import as_simple_undirected
 
 
@@ -64,13 +65,13 @@ def _pf_markov(
         if norm == 0:
             break
         x = y / norm
-        lam = float((x @ (A @ x)) / max(1e-12, (x @ x)))
+        lam = float((x @ (A @ x)) / max(EPS_W, (x @ x)))
         if abs(lam - lam_old) < tol:
             break
         lam_old = lam
 
     v = np.abs(x) + 1e-15
-    lam = float((v @ (A @ v)) / max(1e-12, (v @ v)))
+    lam = float((v @ (A @ v)) / max(EPS_W, (v @ v)))
     if not np.isfinite(lam) or lam <= 0:
         P = _rw_transition_matrix(G, nodes)
         pi = np.ones(n, dtype=float) / max(1, n)
@@ -90,7 +91,7 @@ def _pf_markov(
             P[i, :] = row / rs
 
     pi_raw = v * v
-    pi = pi_raw / max(1e-12, float(pi_raw.sum()))
+    pi = pi_raw / max(EPS_W, float(pi_raw.sum()))
     return P, pi
 
 

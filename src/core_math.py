@@ -16,6 +16,15 @@ import pandas as pd
 from joblib import Parallel, delayed
 from scipy.stats import entropy as scipy_entropy
 
+from .config import (
+    EPS_LOG,
+    EPS_W,
+    RICCI_CUTOFF,
+    RICCI_MASS_SCALE,
+    RICCI_MAX_SUPPORT,
+    RICCI_SAMPLE_EDGES,
+)
+from .null import compute_null_threshold
 from .profiling import timeit
 from .utils import as_simple_undirected
 
@@ -76,6 +85,7 @@ def classify_phase_transition(
     df: pd.DataFrame,
     x_col: str = "removed_frac",
     y_col: str = "lcc_frac",
+    null_jump_samples: Optional[List[float]] = None,
 ) -> dict:
     """
     Эвристика "взрывного" распада:
@@ -106,18 +116,20 @@ def classify_phase_transition(
     dy = np.diff(y)
     idx = int(np.argmin(dy))
     jump = float(-dy[idx]) 
-    y_span = float(max(1e-12, np.nanmax(y) - np.nanmin(y)))
+    y_span = float(max(EPS_W, np.nanmax(y) - np.nanmin(y)))
     jump_fraction = float(jump / y_span)
 
     critical_x = float(x[idx + 1]) if idx + 1 < len(x) else float(x[-1])
 
-    is_abrupt = bool(jump_fraction >= 0.35)
+    threshold = compute_null_threshold(null_jump_samples or [])
+    is_abrupt = bool(jump_fraction >= threshold)
 
     return {
         "is_abrupt": is_abrupt,
         "critical_x": critical_x,
         "jump": jump,
         "jump_fraction": jump_fraction,
+        "threshold": threshold,
     }
 
 # -----------------------------
@@ -130,7 +142,7 @@ def add_dist_attr(G: nx.Graph) -> nx.Graph:
         w = float(d.get("weight", 1.0))
         if not np.isfinite(w) or w <= 0:
             raise ValueError(f"edge weight must be finite and >0, got {w!r}")
-        d["dist"] = 1.0 / w
+        d["dist"] = 1.0 / max(w, EPS_W)
     return H
 
 
@@ -165,7 +177,7 @@ def network_entropy_rate(G: nx.Graph, base: float = math.e) -> float:
     inv_d = np.reciprocal(d, out=np.zeros_like(d), where=d > 0)
     P = A.multiply(inv_d[:, None])
 
-    data_log = np.log(P.data + 1e-20) / np.log(base)
+    data_log = np.log(P.data + EPS_LOG) / np.log(base)
     ent_data = -(P.data * data_log)
 
     P_ent = P.copy()
@@ -265,9 +277,9 @@ def ollivier_ricci_edge(
     x,
     y,
     *,
-    max_support: int = 60,
-    cutoff: float = 8.0,
-    scale: int = 120_000,
+    max_support: int = RICCI_MAX_SUPPORT,
+    cutoff: float = RICCI_CUTOFF,
+    scale: int = RICCI_MASS_SCALE,
     missing_cost: float = 1e6,
 ) -> Optional[float]:
     """
@@ -315,16 +327,16 @@ class CurvatureSummary:
 @timeit('ollivier_ricci_summary')
 def ollivier_ricci_summary(
     G: nx.Graph,
-    sample_edges: int = 150,
+    sample_edges: int = RICCI_SAMPLE_EDGES,
     seed: int = 42,
-    max_support: int = 60,
-    cutoff: float = 8.0,
-    scale: int = 120_000,
+    max_support: int = RICCI_MAX_SUPPORT,
+    cutoff: float = RICCI_CUTOFF,
+    scale: int = RICCI_MASS_SCALE,
     progress_cb=None,
     force_sequential: bool = False,
     **_ignored,
 ) -> CurvatureSummary:
-    # ЗАМЕТКА: progress_cb нужен только для UI 
+    # ЗАМЕТКА: progress_cb нужен только для UI.
     H = _normalize_edge_weights(as_simple_undirected(G))
     if H.number_of_edges() == 0:
         return CurvatureSummary(0.0, 0.0, 0.0, 0, 0)

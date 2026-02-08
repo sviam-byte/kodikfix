@@ -29,12 +29,18 @@ def make_energy_flow_figure_3d(
     hotspot_size_mult: float = 4.0,
     base_node_opacity: float = 0.25,
     rw_impulse: bool = True,
-    **_ignored: object,
+    max_nodes_viz: int = 6000,
+    node_subset_mode: str = "top_degree",
+    seed: int = 0,
+    node_size: float = 6.0,
+    node_base_size: float | None = None,
+    vis_contrast: float = 1.0,
+    vis_clip: float = 0.0,
+    edge_subset_mode: str = "all",
+    max_edges_viz: int = 1500,
+    anim_duration: int = 80,
 ) -> go.Figure:
     """Render an animated 3D energy flow figure.
-
-    Extra keyword arguments are accepted via ``_ignored`` for compatibility with
-    callers that pass through plotting options.
     """
     if node_frames is None or edge_frames is None:
         node_frames, edge_frames = simulate_energy_flow(
@@ -54,15 +60,15 @@ def make_energy_flow_figure_3d(
         return go.Figure()
 
     # Limit nodes for browser performance (huge marker arrays kill Plotly 3D).
-    max_nodes_viz = int(_ignored.get("max_nodes_viz", 6000) or 6000)
-    node_subset_mode = str(_ignored.get("node_subset_mode", "top_degree") or "top_degree").lower()
+    max_nodes_viz = int(max_nodes_viz)
+    node_subset_mode = str(node_subset_mode or "top_degree").lower()
     if max_nodes_viz > 0 and len(nodes) > max_nodes_viz:
         if node_subset_mode in ("top_degree", "top_strength"):
             degs = [(n, G.degree(n)) for n in nodes]
             degs.sort(key=lambda t: t[1], reverse=True)
             nodes = [n for n, _ in degs[:max_nodes_viz]]
         else:
-            rng = np.random.default_rng(int(_ignored.get("seed", 0) or 0))
+            rng = np.random.default_rng(int(seed))
             nodes = rng.choice(np.asarray(nodes, dtype=object), size=max_nodes_viz, replace=False).tolist()
 
     steps = min(int(steps), len(node_frames) - 1)
@@ -106,13 +112,12 @@ def make_energy_flow_figure_3d(
     xs, ys, zs = coords[:, 0], coords[:, 1], coords[:, 2]
 
     # UI opts (passed through from tabs/energy.py).
-    node_size = float(_ignored.get("node_size", 6) or 6)
-    vis_gamma = float(_ignored.get("vis_contrast", 1.0) or 1.0)
-    vis_clip = float(_ignored.get("vis_clip", 0.0) or 0.0)
-    edge_subset_mode = str(_ignored.get("edge_subset_mode", "all") or "all").lower()
-    max_edges_viz = int(_ignored.get("max_edges_viz", 1500) or 1500)
-
-    node_base_size = float(_ignored.get("node_size", 5) or 5)
+    node_size = float(node_size)
+    node_base_size = float(node_base_size if node_base_size is not None else node_size)
+    vis_gamma = float(vis_contrast)
+    vis_clip = float(vis_clip)
+    edge_subset_mode = str(edge_subset_mode or "all").lower()
+    max_edges_viz = int(max_edges_viz)
 
     def _node_traces(frame_idx: int) -> List[go.Scatter3d]:
         """Build node core + glow traces for a "fire" effect."""
@@ -123,10 +128,13 @@ def make_energy_flow_figure_3d(
 
         # Нормализация 0..1 для цвета
         intensities = np.clip(energies / Emax, 0.0, 1.0)
+        if vis_clip > 0:
+            clip_max = max(1e-6, 1.0 - vis_clip)
+            intensities = np.clip(intensities, 0.0, clip_max) / clip_max
 
         # Гамма-коррекция для визуализации (чтобы средние значения были виднее)
-        # vis_gamma = _ignored.get("vis_contrast", 1.0)
-        # intensities = np.power(intensities, 1.0 / vis_gamma)
+        if np.isfinite(vis_gamma) and vis_gamma > 0:
+            intensities = np.power(intensities, 1.0 / vis_gamma)
 
         # Динамический размер: чем больше энергии, тем жирнее узел
         # size = base + base * intensity * multiplier
@@ -276,7 +284,7 @@ def make_energy_flow_figure_3d(
 
     fig = go.Figure(data=data0, frames=frames)
     # Скорость анимации (мс/кадр) можно передать через kwargs (например, anim_duration=...).
-    anim_duration = int(_ignored.get("anim_duration", 80) or 80)
+    anim_duration = int(anim_duration)
 
     fig.update_layout(
         scene=dict(

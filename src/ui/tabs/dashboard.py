@@ -12,7 +12,7 @@ from src.ui_blocks import render_dashboard_metrics, render_dashboard_charts
 
 
 def _node_metrics_df(G: nx.Graph) -> pd.DataFrame:
-    # TODO: нормально оформить метрики узлов (центральности и т.п.). Сейчас нужно «чтобы выгружалось».
+    # TODO: оформить узловые метрики (центральности и т.п.) в отдельный блок.
     nodes = list(G.nodes())
 
     deg = dict(G.degree())
@@ -23,7 +23,7 @@ def _node_metrics_df(G: nx.Graph) -> pd.DataFrame:
             s += float(d.get("weight", 1.0))
         strength[n] = s
 
-    # clustering в nx медленный на огромных графах — поэтому ограничение. Да, костыль.
+    # Practical limitation for UI responsiveness on very large graphs.
     if G.number_of_nodes() <= 3000:
         clust = nx.clustering(G)
     else:

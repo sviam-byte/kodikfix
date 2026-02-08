@@ -160,7 +160,6 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
                     max_edges_viz=int(max_edges_viz),
                     max_nodes_viz=int(max_nodes_viz),
                     edge_subset_mode=str(edge_subset_mode),
-                    vis_log=True,
                 )
             except Exception as e:
                 # Streamlit Cloud иногда редактирует текст ошибки. Покажем тип/сообщение явно.

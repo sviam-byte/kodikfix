@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Any
+from typing import Any, Callable
 
 import networkx as nx
 import numpy as np
@@ -10,7 +10,7 @@ import pandas as pd
 import scipy.sparse.linalg as spla
 from networkx.algorithms.community import louvain_communities, modularity
 
-from ..config import settings
+from ..config import EPS_W, settings
 from ..core_math import (
     add_dist_attr,
     evolutionary_entropy_demetrius,
@@ -199,6 +199,7 @@ def calculate_metrics(
     curvature_sample_edges: int = 150,
     curvature_max_support: int = settings.RICCI_MAX_SUPPORT,
     curvature_cutoff: float = settings.RICCI_CUTOFF,
+    progress_cb: Callable[[float], None] | None = None,
     skip_spectral: bool = False,
     **kwargs,
 ) -> GraphMetrics:
@@ -281,19 +282,26 @@ def calculate_metrics(
 
     beta_red = (E - (N - C)) / float(E) if E > 0 else float("nan")
 
-    tau_relax = (1.0 / l2) if (np.isfinite(l2) and l2 > 1e-12) else float("nan")
-    epi_thr = (1.0 / lmax) if (np.isfinite(lmax) and lmax > 1e-12) else float("nan")
+    tau_relax = (1.0 / l2) if (np.isfinite(l2) and l2 > EPS_W) else float("nan")
+    epi_thr = (1.0 / lmax) if (np.isfinite(lmax) and lmax > EPS_W) else float("nan")
 
     H_rw = float(network_entropy_rate(G, base=math.e))
     H_evo = float(evolutionary_entropy_demetrius(G, base=math.e))
 
     if compute_curvature and G.number_of_edges() > 0:
+        def _progress_cb(i: int, total: int, *_args) -> None:
+            if progress_cb is None:
+                return
+            frac = float(i) / float(max(1, total))
+            progress_cb(min(1.0, max(0.0, frac)))
+
         curv = ollivier_ricci_summary(
             G,
             sample_edges=curvature_sample_edges,
             seed=seed,
             max_support=curvature_max_support,
             cutoff=curvature_cutoff,
+            progress_cb=_progress_cb if progress_cb is not None else None,
         )
         kappa_mean = float(curv.kappa_mean)
         kappa_median = float(curv.kappa_median)
@@ -364,7 +372,7 @@ def compute_3d_layout(G: nx.Graph, seed: int) -> dict:
 
     # Fast path: считаем 2D (это намного быстрее сходится),
     # а Z-координату синтезируем из centrality
-    # Уменьшаем итерации до 15 — этого хватит, чтобы "расправить" ком.
+    # Improves convergence for dense layouts without overworking the solver.
     pos2 = nx.spring_layout(G, dim=2, weight="weight", seed=seed, iterations=15, threshold=1e-3)
 
    

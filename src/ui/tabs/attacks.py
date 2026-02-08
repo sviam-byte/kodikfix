@@ -356,7 +356,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
 
                 if family.startswith("Node"):
                     with st.spinner(f"Node attack: {kind}"):
-                        # TODO: этот прогрессбар иногда прыгает (streamlit...), но лучше чем просто
+                        # TODO: stabilize the progress indicator updates in Streamlit.
                         bar = st.progress(0.0)
                         msg = st.empty()
 

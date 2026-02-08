@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 # 1) Config & Logging
-# TODO: вынести логгер в отдельный модуль, но сейчас не до этого.
+# TODO: move logger to separate module.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("kodik")
 
@@ -102,7 +102,7 @@ def save_experiment_to_state(name, gid, kind, params, df_hist):
         history=df_hist,
         entry_id=eid,
     )
-    # да, это напрямую в session — потому что так проще
+    # Store directly in session state to keep the workflow lightweight.
     if hasattr(ctx, "add_experiment"):
         ctx.add_experiment(exp)
     else:
@@ -420,7 +420,24 @@ if "__ricci_cache" not in st.session_state:
     st.session_state["__ricci_cache"] = {}
 
 if do_ricci:
-    curv = GraphService.compute_ricci_progress(G_view, sample_edges=curv_n, seed=seed_val)
+    bar = st.progress(0.0)
+    msg = st.empty()
+
+    def _progress_cb(frac: float) -> None:
+        bar.progress(min(1.0, max(0.0, frac)))
+
+    def _status_cb(text: str) -> None:
+        msg.caption(text)
+
+    curv = GraphService.compute_ricci_progress(
+        G_view,
+        sample_edges=curv_n,
+        seed=seed_val,
+        progress_cb=_progress_cb,
+        status_cb=_status_cb,
+    )
+    bar.empty()
+    msg.empty()
     st.session_state["__ricci_cache"][ricci_key] = curv
 
 if ricci_key in st.session_state["__ricci_cache"]:
