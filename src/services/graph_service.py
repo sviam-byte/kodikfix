@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-from typing import Tuple
+from typing import Callable, Tuple
 
 import networkx as nx
 import pandas as pd
-import streamlit as st
 
 from ..config import settings
 from ..graph_build import build_graph_from_edges, lcc_subgraph
@@ -16,22 +14,8 @@ from ..core_math import fragility_from_curvature, ollivier_ricci_summary
 from ..preprocess import filter_edges
 
 
-def _hash_df_fast(df: pd.DataFrame) -> str:
-    if df is None:
-        return "None"
-    cols = list(df.columns)
-    shape = df.shape
-    head = df.head(1000)
-    hasher = hashlib.md5()
-    hasher.update(str(shape).encode())
-    hasher.update(str(cols).encode())
-    hasher.update(pd.util.hash_pandas_object(head, index=True).values.tobytes())
-    return hasher.hexdigest()
-
-
 class GraphService:
     @staticmethod
-    @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: _hash_df_fast})
     def filter_edges(
         edges: pd.DataFrame,
         src_col: str,
@@ -42,7 +26,6 @@ class GraphService:
         return filter_edges(edges, src_col, dst_col, float(min_conf), float(min_weight))
 
     @staticmethod
-    @st.cache_resource(show_spinner=False, hash_funcs={pd.DataFrame: _hash_df_fast})
     def build_graph(
         edges: pd.DataFrame,
         src_col: str,
@@ -58,7 +41,6 @@ class GraphService:
         return G
 
     @staticmethod
-    @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: _hash_df_fast})
     def compute_metrics(
         edges: pd.DataFrame,
         src_col: str,
@@ -69,6 +51,7 @@ class GraphService:
         seed: int,
         compute_curvature: bool,
         curvature_sample_edges: int,
+        progress_cb: Callable[[float], None] | None = None,
     ) -> dict:
         G = GraphService.build_graph(edges, src_col, dst_col, min_conf, min_weight, analysis_mode)
         return calculate_metrics(
@@ -77,10 +60,10 @@ class GraphService:
             seed=int(seed),
             compute_curvature=bool(compute_curvature),
             curvature_sample_edges=int(curvature_sample_edges),
+            progress_cb=progress_cb,
         )
 
     @staticmethod
-    @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: _hash_df_fast})
     def compute_layout3d(
         edges: pd.DataFrame,
         src_col: str,
@@ -94,7 +77,6 @@ class GraphService:
         return compute_3d_layout(G, seed=int(seed))
 
     @staticmethod
-    @st.cache_data(show_spinner=False, hash_funcs={pd.DataFrame: _hash_df_fast})
     def compute_energy_frames(
         edges: pd.DataFrame,
         src_col: str,
@@ -128,12 +110,10 @@ class GraphService:
         return node_frames, edge_frames
 
     @staticmethod
-    @st.cache_data(show_spinner=False, hash_funcs={GraphWrapper: lambda w: w.get_version()})
     def compute_layout2d(wrapper: GraphWrapper, seed: int = 0, dim: int = 2) -> dict:
         return nx.spring_layout(wrapper.G, seed=int(seed), dim=int(dim))
 
     @staticmethod
-    @st.cache_data(show_spinner=False, hash_funcs={GraphWrapper: lambda w: w.get_version()})
     def compute_curvature(
         wrapper: GraphWrapper,
         *,
@@ -165,19 +145,20 @@ class GraphService:
         *,
         sample_edges: int = settings.RICCI_SAMPLE_EDGES,
         seed: int = 0,
+        progress_cb: Callable[[float], None] | None = None,
+        status_cb: Callable[[str], None] | None = None,
     ) -> dict:
-        # Да, это сервис, и да, тут st.progress. Это сознательный костыль:
-        # joblib-параллелизм не даёт нормальный прогресс, а UX без прогресса — боль.
-        bar = st.progress(0.0)
-        msg = st.empty()
+        """Compute curvature with optional progress callbacks for the UI."""
 
-        def _cb(i, total, x=None, y=None):
-            frac = float(i) / float(max(1, total))
-            bar.progress(min(1.0, max(0.0, frac)))
-            if x is not None and y is not None:
-                msg.caption(f"Ricci: {i}/{total}  ({x}—{y})")
-            else:
-                msg.caption(f"Ricci: {i}/{total}")
+        def _cb(i: int, total: int, x=None, y=None) -> None:
+            if progress_cb is not None:
+                frac = float(i) / float(max(1, total))
+                progress_cb(min(1.0, max(0.0, frac)))
+            if status_cb is not None:
+                if x is not None and y is not None:
+                    status_cb(f"Ricci: {i}/{total}  ({x}—{y})")
+                else:
+                    status_cb(f"Ricci: {i}/{total}")
 
         curv = ollivier_ricci_summary(
             G,
@@ -185,12 +166,9 @@ class GraphService:
             seed=int(seed),
             max_support=settings.RICCI_MAX_SUPPORT,
             cutoff=settings.RICCI_CUTOFF,
-            progress_cb=_cb,
+            progress_cb=_cb if (progress_cb is not None or status_cb is not None) else None,
             force_sequential=True,
         )
-
-        bar.empty()
-        msg.empty()
 
         return {
             "summary": {
@@ -202,15 +180,3 @@ class GraphService:
             },
             "fragility": float(fragility_from_curvature(curv.kappa_mean)),
         }
-
-
-
-# Совместимость с существующими импортами/именами в app.py
-_filter_edges_cached = GraphService.filter_edges
-_build_graph_cached = GraphService.build_graph
-_metrics_cached = GraphService.compute_metrics
-_layout_cached = GraphService.compute_layout3d
-_energy_frames_cached = GraphService.compute_energy_frames
-
-compute_layout_cached = GraphService.compute_layout2d
-compute_curvature_cached = GraphService.compute_curvature

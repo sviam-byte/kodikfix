@@ -57,6 +57,29 @@ pytest -q
 Для корреляционных весов обычно используют `abs` (с потерей знака) либо `shift/clip`
 (в зависимости от смысла весов).
 
+## Design parameters and heuristics
+
+This project is an interactive research tool. Some numerical and runtime-related
+parameters are heuristic by design. They are centralized in `src/config.py`.
+
+### Numerical stability
+- `EPS_W`, `EPS_LOG` protect against division/log singularities.
+
+### Ricci / W₁ approximation
+- `RICCI_MASS_SCALE` discretizes neighbor measures for min-cost flow.
+- `RICCI_MAX_SUPPORT`, `RICCI_CUTOFF`, `RICCI_SAMPLE_EDGES` limit runtime on large graphs.
+
+### Phase-transition detection (recommended)
+We detect jumps in graph metrics using a null-model-based threshold:
+
+1. Generate a null ensemble (degree-preserving rewires).
+2. Compute jump scores on the same trajectory.
+3. Set threshold as the `1 - JUMP_ALPHA` quantile of null jumps.
+4. Flag transition if `jump_fraction >= threshold`.
+
+`0.35` is used only as a fallback quick-screening value when null-model
+statistics are not available.
+
 ## Что внутри
 
 - **Dashboard**: быстрые метрики + распределения.
