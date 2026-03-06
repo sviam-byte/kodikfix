@@ -10,10 +10,67 @@
 pip install -r requirements.txt
 ```
 
-2) Запустить:
+2) Запустить UI:
 
 ```bash
 streamlit run app.py
+```
+
+или через helper-скрипт:
+
+```bash
+python run_local.py ui
+```
+
+
+### Windows: запуск через `.bat`
+
+Подготовка окружения:
+
+```bat
+setup_env.bat
+```
+
+Запуск интерфейса (двойной клик или из консоли):
+
+```bat
+run_ui.bat
+```
+
+Запуск CLI:
+
+```bat
+run_cli.bat metrics data.csv --src src --dst dst
+run_cli.bat attack data.csv --family node --kind degree --frac 0.5
+run_cli.bat mixfrac --patient patient.csv --healthy hc1.csv hc2.csv
+```
+
+## Локальный запуск без Streamlit
+
+CLI поддерживает subcommands `metrics`, `attack`, `mixfrac`.
+
+Через helper-скрипт:
+
+```bash
+python run_local.py cli metrics data.csv --src src --dst dst --compute-curvature
+python run_local.py cli attack data.csv --family node --kind degree --frac 0.5 --steps 30 --history-out attack.csv
+python run_local.py cli attack data.csv --family mix --kind hrish_mix --steps 20 --replace-from CFG --out mix.json
+python run_local.py cli mixfrac --patient patient.csv --healthy hc1.csv hc2.csv hc3.csv --metrics kappa_mean,kappa_frac_negative,clustering --match-mode nearest --out mixfrac.json
+```
+
+Или напрямую через модуль:
+
+```bash
+python -m src.cli metrics data.csv
+python -m src.cli attack data.csv --family edge --kind ricci_most_negative --compute-curvature
+python -m src.cli mixfrac --patient patient.csv --healthy hc1.csv hc2.csv
+```
+
+Для обратной совместимости старый вызов без subcommand по-прежнему работает
+как `metrics`:
+
+```bash
+python -m src.cli data.csv --src src --dst dst
 ```
 
 ## Разработка (lint + тесты)
@@ -118,3 +175,15 @@ statistics are not available.
 - Веса рёбер (`weight`) интерпретируются как **неотрицательная** мера силы/пропускной способности связи.
 - Для некоторых метрик используется преобразование расстояний `dist = 1/weight` — это допущение. Для корреляционных весов (в т.ч. отрицательных) нужна отдельная политика препроцессинга.
 - Часть расчётов на больших графах использует аппроксимации/ограничения по времени (например, sampling в betweenness). Это может менять ranking, но ускоряет интерактивный UI.
+
+## Рекомендуемый локальный сценарий
+
+Для Windows:
+
+1. Запустить `setup_env.bat`
+2. Потом `run_ui.bat`
+
+Или для CLI:
+
+1. `setup_env.bat`
+2. `run_cli.bat ...`

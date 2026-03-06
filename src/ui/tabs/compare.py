@@ -94,16 +94,27 @@ def render(
             if sel_exps:
                 curves = []
                 x_candidates = []
+                effective_mix_ok = True
                 for eid in sel_exps:
                     e = next(x for x in exps if x.id == eid)
                     df_hist = _forward_fill_heavy(e.history)
                     curves.append((e.name, df_hist))
                     if "mix_frac" in df_hist.columns:
                         x_candidates.append("mix_frac")
+                        if "mix_frac_effective" not in df_hist.columns:
+                            effective_mix_ok = False
                     else:
                         x_candidates.append("removed_frac")
+                        effective_mix_ok = False
 
-                x_col = "mix_frac" if x_candidates and all(x == "mix_frac" for x in x_candidates) else "removed_frac"
+                all_mix = bool(x_candidates) and all(x == "mix_frac" for x in x_candidates)
+                if all_mix:
+                    x_axis_options = ["mix_frac"]
+                    if effective_mix_ok:
+                        x_axis_options.append("mix_frac_effective")
+                    x_col = st.selectbox("X Axis", x_axis_options, index=0, key="cmp_mix_x_axis")
+                else:
+                    x_col = "removed_frac"
 
                 fig_lines = fig_compare_attacks(
                     curves,

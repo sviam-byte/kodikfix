@@ -37,7 +37,13 @@ from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
 from src.graph_build import build_graph
 from src.services.graph_service import GraphService
-from src.session_io import export_experiments_json, export_workspace_json, import_workspace_json
+from src.session_io import (
+    export_experiments_json,
+    export_experiments_xlsx,
+    export_workspace_json,
+    import_workspace_json,
+)
+from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.ui_blocks import inject_custom_css
@@ -167,6 +173,14 @@ with st.sidebar:
             if st.button("Export Exps"):
                 b = export_experiments_json(ctx.experiments)
                 st.download_button("JSON", b, "experiments.json", "application/json")
+            if st.button("Export Exps XLSX"):
+                b_xlsx = export_experiments_xlsx(ctx.experiments)
+                st.download_button(
+                    "XLSX",
+                    b_xlsx,
+                    "experiments.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
     st.markdown("---")
     st.subheader("📂 Данные")
@@ -379,6 +393,51 @@ with st.sidebar:
 
     curv_n = int(st.slider("Ricci edges", 20, 300, int(settings.RICCI_SAMPLE_EDGES)))
     do_ricci = st.button("Compute Ricci (slow)")
+
+    st.markdown("---")
+    st.subheader("📊 Export for statistics")
+    st.caption("Tidy tables for p-value / regression / mixed models")
+
+    stats_eff_k = int(st.number_input("Stats eff_k", min_value=4, max_value=512, value=32, step=4))
+    stats_do_curv = st.checkbox("Include curvature in subject_metrics", value=True)
+
+    stats_zip = export_stats_zip_bytes(
+        ctx.graphs,
+        ctx.experiments,
+        min_conf=float(min_conf),
+        min_weight=float(min_weight),
+        analysis_mode=str(analysis_mode),
+        eff_sources_k=int(stats_eff_k),
+        seed=int(seed_val),
+        compute_curvature=bool(stats_do_curv),
+        curvature_sample_edges=int(curv_n),
+    )
+    st.download_button(
+        "Stats ZIP (CSV)",
+        data=stats_zip,
+        file_name="stats_tables.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+
+    stats_xlsx = export_stats_xlsx_bytes(
+        ctx.graphs,
+        ctx.experiments,
+        min_conf=float(min_conf),
+        min_weight=float(min_weight),
+        analysis_mode=str(analysis_mode),
+        eff_sources_k=int(stats_eff_k),
+        seed=int(seed_val),
+        compute_curvature=bool(stats_do_curv),
+        curvature_sample_edges=int(curv_n),
+    )
+    st.download_button(
+        "Stats XLSX",
+        data=stats_xlsx,
+        file_name="stats_tables.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
     # DEBUG: если совсем странно
     # st.write(active_entry.edges.head(5))

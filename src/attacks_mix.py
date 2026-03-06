@@ -61,7 +61,7 @@ def _replace_edges_from_source(
     rng: np.random.Generator,
     attrs_pool: list[dict],
 ) -> int:
-    if k_replace <= 0 or H.number_of_edges() == 0:
+    if k_replace <= 0 or H.number_of_edges() == 0 or not source_edges:
         return 0
     edges_H = list(H.edges())
     rng.shuffle(edges_H)
@@ -94,8 +94,13 @@ def run_mix_attack(
     beta_replace: float = 0.4,
     swaps_per_edge: float = 0.5,
     replace_from: str = "ER",
+    fast_mode: bool = False,
     progress_cb=None,
 ):
+
+    # fast_mode пока оставлен для API-совместимости с UI/CLI.
+    # В текущей реализации run_mix_attack режим не меняет вычисления.
+    _ = fast_mode
 
     rng = np.random.default_rng(int(seed))
     H0 = as_simple_undirected(G)
@@ -104,7 +109,9 @@ def run_mix_attack(
     N = H.number_of_nodes()
     M = H.number_of_edges()
     if N == 0:
-        return pd.DataFrame([{"step": 0, "mix_frac": 0.0, "N": 0, "E": 0}]), {"kind": kind}
+        return pd.DataFrame(
+            [{"step": 0, "mix_frac": 0.0, "mix_frac_effective": 0.0, "N": 0, "E": 0}]
+        ), {"kind": kind}
 
     steps = max(1, int(steps))
     xs = np.linspace(0.0, 1.0, steps + 1).tolist()
@@ -137,6 +144,10 @@ def run_mix_attack(
                 progress_cb(i, len(xs) - 1)
 
         heavy = (i % int(max(1, heavy_every)) == 0) or (i == steps)
+        requested_swaps = 0
+        requested_replaced = 0
+        swaps_done_step = 0
+        replaced_done_step = 0
 
         if i > 0:
             dx = float(x) - float(xs[i - 1])
@@ -144,13 +155,17 @@ def run_mix_attack(
             target_ops = max(1, int(round(dx * float(M))))
 
             if kind == "mix_degree_preserving":
-                n_swaps = int(round(target_ops * float(swaps_per_edge)))
-                total_swaps_done += _edge_swap_degree_preserving(H, n_swaps=n_swaps, seed=int(seed) + i)
-            elif kind == "mix_weightconf_preserving":
-                k_rep = int(round(target_ops))
-                total_replaced_done += _replace_edges_from_source(
-                    H, source_edges, k_replace=k_rep, rng=rng, attrs_pool=attrs_pool
+                requested_swaps = int(round(target_ops * float(swaps_per_edge)))
+                swaps_done_step = _edge_swap_degree_preserving(
+                    H, n_swaps=requested_swaps, seed=int(seed) + i
                 )
+                total_swaps_done += swaps_done_step
+            elif kind == "mix_weightconf_preserving":
+                requested_replaced = int(round(target_ops))
+                replaced_done_step = _replace_edges_from_source(
+                    H, source_edges, k_replace=requested_replaced, rng=rng, attrs_pool=attrs_pool
+                )
+                total_replaced_done += replaced_done_step
             else:
                 a = float(alpha_rewire)
                 b = float(beta_replace)
@@ -158,12 +173,16 @@ def run_mix_attack(
                 a /= s
                 b /= s
 
-                n_swaps = int(round(a * target_ops * float(swaps_per_edge)))
-                k_rep = int(round(b * target_ops))
-                total_swaps_done += _edge_swap_degree_preserving(H, n_swaps=n_swaps, seed=int(seed) + i)
-                total_replaced_done += _replace_edges_from_source(
-                    H, source_edges, k_replace=k_rep, rng=rng, attrs_pool=attrs_pool
+                requested_swaps = int(round(a * target_ops * float(swaps_per_edge)))
+                requested_replaced = int(round(b * target_ops))
+                swaps_done_step = _edge_swap_degree_preserving(
+                    H, n_swaps=requested_swaps, seed=int(seed) + i
                 )
+                replaced_done_step = _replace_edges_from_source(
+                    H, source_edges, k_replace=requested_replaced, rng=rng, attrs_pool=attrs_pool
+                )
+                total_swaps_done += swaps_done_step
+                total_replaced_done += replaced_done_step
 
         m = calculate_metrics(
             H,
@@ -172,9 +191,20 @@ def run_mix_attack(
             compute_curvature=False,
         )
 
+        mix_frac_effective = float(total_replaced_done) / float(max(1, M))
+        swap_frac_effective = float(total_swaps_done) / float(max(1, M))
+
         row = {
             "step": int(i),
             "mix_frac": float(x),
+            "mix_frac_effective": float(min(1.0, max(0.0, mix_frac_effective))),
+            "swap_frac_effective": float(max(0.0, swap_frac_effective)),
+            "requested_swaps_step": int(requested_swaps),
+            "requested_replaced_step": int(requested_replaced),
+            "swaps_done_step": int(swaps_done_step),
+            "replaced_done_step": int(replaced_done_step),
+            "total_swaps_done": int(total_swaps_done),
+            "total_replaced_done": int(total_replaced_done),
             "N": int(m.get("N", H.number_of_nodes())),
             "E": int(m.get("E", H.number_of_edges())),
             "C": int(m.get("C", np.nan)) if "C" in m else np.nan,
@@ -214,5 +244,12 @@ def run_mix_attack(
         "alpha_rewire": float(alpha_rewire),
         "beta_replace": float(beta_replace),
         "swaps_per_edge": float(swaps_per_edge),
+        "effective_mix_frac_final": float(
+            min(1.0, max(0.0, total_replaced_done / float(max(1, M))))
+        ),
+        "effective_swap_frac_final": float(
+            max(0.0, total_swaps_done / float(max(1, M)))
+        ),
+        "M_baseline": int(M),
     }
     return df, aux
