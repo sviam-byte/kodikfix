@@ -117,6 +117,17 @@ def build_subject_metrics_table(
             n_edges = graph.number_of_edges()
             large_graph = n_nodes > 300
             huge_graph = n_nodes > 1200 or n_edges > 8000
+
+            def _metric_progress(frac: float) -> None:
+                """Map inner metric progress to outer per-graph export progress."""
+                if progress_cb is None:
+                    return
+                progress_cb(
+                    (idx - 1) + min(0.95, max(0.0, float(frac))),
+                    total,
+                    f"{entry.name} · Ricci {int(round(float(frac) * 100))}%",
+                )
+
             met = calculate_metrics(
                 graph,
                 eff_sources_k=int(eff_sources_k),
@@ -128,6 +139,7 @@ def build_subject_metrics_table(
                 diameter_samples=6 if (lightweight or large_graph) else 16,
                 skip_clustering=bool(lightweight),
                 skip_assortativity=bool(lightweight),
+                progress_cb=_metric_progress if bool(compute_curvature and not lightweight) else None,
             )
             met = _metrics_to_plain_dict(met)
             row = {
@@ -146,6 +158,8 @@ def build_subject_metrics_table(
             }
             row.update(met)
             rows.append(row)
+            if progress_cb is not None:
+                progress_cb(idx, total, f"{entry.name} ✓")
         except Exception as exc:
             # Export should be robust: keep failed rows with error description.
             rows.append(
@@ -165,6 +179,8 @@ def build_subject_metrics_table(
                     "export_error": str(exc),
                 }
             )
+            if progress_cb is not None:
+                progress_cb(idx, total, f"{entry.name} ✗ {type(exc).__name__}")
 
     if progress_cb is not None:
         progress_cb(total, total, "done")

@@ -53,6 +53,14 @@ def _graph_export_bytes(G: nx.Graph, fmt: str) -> bytes:
     return sio.getvalue().encode("utf-8")
 
 
+def _full_metrics_df(met: dict) -> pd.DataFrame:
+    """Flatten full metric mapping into a stable two-column dataframe."""
+    rows = []
+    for k, v in sorted((met or {}).items(), key=lambda kv: kv[0]):
+        rows.append({"metric": str(k), "value": v})
+    return pd.DataFrame(rows)
+
+
 def render(G_view: nx.Graph | None, met: dict, active_entry: GraphEntry) -> None:
     """Дэшборд: быстрый обзор + простые выгрузки."""
     if G_view is None:
@@ -78,6 +86,22 @@ def render(G_view: nx.Graph | None, met: dict, active_entry: GraphEntry) -> None
     st.markdown("---")
 
     render_dashboard_charts(G_view, apply_plot_defaults)
+
+    st.markdown("---")
+    st.subheader("Все рассчитанные метрики")
+    df_full = _full_metrics_df(met)
+    st.dataframe(df_full, use_container_width=True, height=420)
+    st.download_button(
+        "⬇️ Скачать current_subject_metrics.csv",
+        data=df_full.to_csv(index=False).encode("utf-8"),
+        file_name=f"{active_entry.name}_current_subject_metrics.csv",
+        mime="text/csv",
+        key="dl_current_subject_metrics_csv",
+    )
+    st.caption(
+        "Здесь видны и те метрики, которые не помещаются в карточки сверху: "
+        "beta, lmax, thresh, tau_lcc, entropy_deg, kappa_var, kappa_skew, kappa_entropy и др."
+    )
 
     st.markdown("---")
     st.subheader("Экспорт")
