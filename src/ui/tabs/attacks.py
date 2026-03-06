@@ -17,6 +17,8 @@ from src.attacks import run_attack, run_edge_attack
 from src.attacks_mix import run_mix_attack
 from src.core_math import classify_phase_transition
 from src.config_loader import load_metrics_info
+from src.metrics import calculate_metrics
+from src.mix_frac_estimator import estimate_mix_frac_star
 from src.plotting import fig_metrics_over_steps, fig_compare_attacks
 from src.services.graph_service import GraphService
 from src.state_models import GraphEntry
@@ -71,6 +73,63 @@ ATTACK_PRESETS_EDGE = {
     "Betweenness": {"kind": "edge_betweenness"},
     "Rici (Ollivier)": {"kind": "edge_ricci"},
 }
+
+# Метрики для UI блока mix_frac*.
+# Список оставлен явным, чтобы пользователь видел «безопасный» набор полей,
+# которые гарантированно поддерживаются calculate_metrics / trajectory-кривыми.
+MIX_FRAC_METRIC_OPTIONS = [
+    "kappa_mean",
+    "kappa_frac_negative",
+    "kappa_median",
+    "kappa_var",
+    "kappa_skew",
+    "kappa_entropy",
+    "clustering",
+    "mod",
+    "avg_degree",
+    "density",
+    "eff_w",
+    "l2_lcc",
+    "lcc_frac",
+    "H_rw",
+    "H_evo",
+    "fragility_kappa",
+]
+
+
+def _build_current_graph_for_entry(
+    entry: GraphEntry,
+    *,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+) -> nx.Graph:
+    """Собрать граф для конкретного entry с текущими UI-фильтрами."""
+    return GraphService.build_graph(
+        entry.edges,
+        entry.src_col,
+        entry.dst_col,
+        float(min_conf),
+        float(min_weight),
+        str(analysis_mode),
+    )
+
+
+def _needs_curvature_for_metrics(metrics: list[str]) -> bool:
+    """Нужен ли пересчет curvature для выбранного набора метрик."""
+    return any(str(m).startswith("kappa_") or str(m) == "fragility_kappa" for m in metrics)
+
+
+def _guess_hc_like_graph_ids(graphs: dict, active_graph_id: str | None) -> list[str]:
+    """Эвристика: предложить healthy/control графы по имени и источнику."""
+    hc_ids: list[str] = []
+    for gid, entry in graphs.items():
+        if gid == active_graph_id:
+            continue
+        txt = f"{getattr(entry, 'name', '')} {getattr(entry, 'source', '')}".lower()
+        if any(tok in txt for tok in ("hc", "healthy", "control", "norm", "норма", "контроль")):
+            hc_ids.append(gid)
+    return hc_ids
 
 def _extract_removed_order(aux):
     if isinstance(aux, dict):
@@ -704,6 +763,182 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         st.rerun()
 
     st.markdown("---")
+
+    # --------------------------
+    # MIX_FRAC* ESTIMATOR
+    # --------------------------
+    st.subheader("mix_frac* estimator")
+    st.caption(
+        "Оценка: на какой точке randomization trajectory текущий граф "
+        "становится наиболее похож на patient-like профиль."
+    )
+
+    graphs = st.session_state["graphs"]
+    all_gids = list(graphs.keys())
+    hc_guess = _guess_hc_like_graph_ids(graphs, active_entry.id)
+
+    mf_col1, mf_col2 = st.columns([1, 1.2])
+
+    with mf_col1:
+        with st.container(border=True):
+            st.markdown("### Параметры mix_frac*")
+
+            healthy_gids = st.multiselect(
+                "Healthy / reference graphs",
+                [gid for gid in all_gids if gid != active_entry.id],
+                default=hc_guess,
+                format_func=lambda gid: f"{graphs[gid].name} ({graphs[gid].source})",
+                key="mixfrac_hc_gids",
+            )
+
+            match_mode = st.radio(
+                "Match mode",
+                ["nearest", "interpolate"],
+                horizontal=True,
+                key="mixfrac_match_mode",
+                help="nearest = matching по вектору метрик; interpolate = старый одномерный режим.",
+            )
+
+            if match_mode == "nearest":
+                selected_metrics = st.multiselect(
+                    "Метрики сопоставления",
+                    MIX_FRAC_METRIC_OPTIONS,
+                    default=["kappa_mean", "kappa_frac_negative", "clustering"],
+                    key="mixfrac_metrics_multi",
+                )
+            else:
+                one_metric = st.selectbox(
+                    "Метрика сопоставления",
+                    MIX_FRAC_METRIC_OPTIONS,
+                    index=0,
+                    key="mixfrac_metric_single",
+                )
+                selected_metrics = [one_metric]
+
+            mf_steps = st.slider("Trajectory steps", 4, 50, 20, 1, key="mixfrac_steps")
+            mf_replace_from = st.selectbox(
+                "Replace from",
+                ["CFG", "ER"],
+                index=0,
+                key="mixfrac_replace_from",
+            )
+            mf_effk = st.slider("Efficiency k", 8, 256, 32, key="mixfrac_effk")
+            mf_seed = st.number_input("Seed (mix_frac*)", value=int(seed_val), step=1, key="mixfrac_seed")
+            mf_n_boot = st.slider("Bootstrap n", 100, 5000, 1000, 100, key="mixfrac_n_boot")
+
+            run_mixfrac = st.button(
+                "🧭 Estimate mix_frac*",
+                type="primary",
+                use_container_width=True,
+                key="mixfrac_run",
+            )
+
+    with mf_col2:
+        mixfrac_res = st.session_state.get("__mix_frac_star_result")
+        if mixfrac_res:
+            m1, m2, m3 = st.columns(3)
+            star = mixfrac_res.get("mix_frac_star", float("nan"))
+            ci_low = mixfrac_res.get("ci_low", float("nan"))
+            ci_high = mixfrac_res.get("ci_high", float("nan"))
+            med_dist = mixfrac_res.get("distance_median", float("nan"))
+
+            m1.metric("mix_frac*", f"{star:.4f}" if np.isfinite(star) else "NaN")
+            m2.metric(
+                "95% CI",
+                f"[{ci_low:.4f}, {ci_high:.4f}]" if np.isfinite(ci_low) and np.isfinite(ci_high) else "NaN",
+            )
+            m3.metric("median distance", f"{med_dist:.4f}" if np.isfinite(med_dist) else "NaN")
+
+            st.write(
+                {
+                    "match_mode": mixfrac_res.get("match_mode"),
+                    "used_metrics": mixfrac_res.get("used_metrics", []),
+                    "replace_from": mixfrac_res.get("replace_from"),
+                    "healthy_n": mixfrac_res.get("healthy_n"),
+                }
+            )
+
+            vals = [float(v) for v in mixfrac_res.get("mix_frac_values", []) if np.isfinite(v)]
+            dists = [float(v) for v in mixfrac_res.get("distances", []) if np.isfinite(v)]
+            if vals:
+                st.markdown("#### По healthy-кривым")
+                df_show = pd.DataFrame(
+                    {
+                        "mix_frac_value": vals,
+                        "distance": dists[: len(vals)] if dists else [np.nan] * len(vals),
+                    }
+                )
+                st.dataframe(df_show, use_container_width=True)
+        else:
+            st.info("Выбери healthy-графы и запусти оценку.")
+
+    if run_mixfrac:
+        if not healthy_gids:
+            st.error("Нужен хотя бы один healthy/reference graph.")
+        elif not selected_metrics:
+            st.error("Выбери хотя бы одну метрику.")
+        else:
+            needs_curv = _needs_curvature_for_metrics(selected_metrics)
+            curv_edges = int(st.session_state.get("__curvature_sample_edges", 120))
+
+            with st.spinner("Считаю patient profile и healthy trajectories..."):
+                patient_graph = _build_current_graph_for_entry(
+                    active_entry,
+                    min_conf=float(min_conf),
+                    min_weight=float(min_weight),
+                    analysis_mode=str(analysis_mode),
+                )
+
+                patient_metrics = calculate_metrics(
+                    patient_graph,
+                    eff_sources_k=int(mf_effk),
+                    seed=int(mf_seed),
+                    compute_curvature=bool(needs_curv),
+                    curvature_sample_edges=int(curv_edges),
+                )
+
+                healthy_graphs = []
+                skipped = []
+                for gid in healthy_gids:
+                    entry = graphs[gid]
+                    try:
+                        g_h = _build_current_graph_for_entry(
+                            entry,
+                            min_conf=float(min_conf),
+                            min_weight=float(min_weight),
+                            analysis_mode=str(analysis_mode),
+                        )
+                        if g_h.number_of_nodes() > 0 and g_h.number_of_edges() > 0:
+                            healthy_graphs.append(g_h)
+                        else:
+                            skipped.append(entry.name)
+                    except Exception:
+                        # Один кривой граф не должен ломать весь расчет.
+                        skipped.append(entry.name)
+
+                if not healthy_graphs:
+                    st.error("После фильтрации не осталось пригодных healthy-графов.")
+                else:
+                    res = estimate_mix_frac_star(
+                        healthy_graphs,
+                        patient_metrics,
+                        target_metric=selected_metrics if match_mode == "nearest" else selected_metrics[0],
+                        match_mode=str(match_mode),
+                        steps=int(mf_steps),
+                        seed=int(mf_seed),
+                        eff_sources_k=int(mf_effk),
+                        replace_from=str(mf_replace_from),
+                        n_boot=int(mf_n_boot),
+                    )
+
+                    dists = [float(v) for v in res.get("distances", []) if np.isfinite(v)]
+                    res["distance_median"] = float(np.median(dists)) if dists else float("nan")
+                    res["replace_from"] = str(mf_replace_from)
+                    res["healthy_n"] = int(len(healthy_graphs))
+                    res["skipped_graphs"] = skipped
+                    st.session_state["__mix_frac_star_result"] = res
+                    st.success("mix_frac* посчитан.")
+                    st.rerun()
 
     # --------------------------
     # PRESET BATCH (same graph)

@@ -329,6 +329,10 @@ class CurvatureSummary:
     kappa_entropy: float = float("nan")
     # Полный вектор kappa; tuple сохраняет hashability dataclass-объекта.
     kappa_values: tuple = ()
+    # Доля edge-сэмплов, для которых curvature не удалось вычислить.
+    skipped_frac: float = float("nan")
+    # Размер подвыборки ребер, фактически использованной в summary.
+    sampled_edges: int = 0
 
 
 @timeit('ollivier_ricci_summary')
@@ -346,7 +350,9 @@ def ollivier_ricci_summary(
     # ЗАМЕТКА: progress_cb нужен только для UI.
     H = _normalize_edge_weights(as_simple_undirected(G))
     if H.number_of_edges() == 0:
-        return CurvatureSummary(0.0, 0.0, 0.0, 0, 0)
+        return CurvatureSummary(
+            0.0, 0.0, 0.0, 0, 0, sampled_edges=0, skipped_frac=0.0
+        )
 
     edges = list(H.edges())
     rng = random.Random(int(seed))
@@ -378,6 +384,7 @@ def ollivier_ricci_summary(
     skipped = len(edges) - len(kappas)
 
     if len(kappas) == 0:
+        sampled = int(len(edges))
         return CurvatureSummary(
             float('nan'),
             float('nan'),
@@ -388,6 +395,8 @@ def ollivier_ricci_summary(
             float('nan'),
             float('nan'),
             (),
+            skipped_frac=float(skipped / max(1, sampled)),
+            sampled_edges=sampled,
         )
 
     arr = np.array(kappas, dtype=float)
@@ -404,6 +413,7 @@ def ollivier_ricci_summary(
         k_skew = float("nan")
     # Энтропия гистограммы kappa — признак «размазанности» распределения.
     k_ent = entropy_histogram(arr, bins="fd") if arr.size >= 5 else float("nan")
+    sampled = int(len(edges))
 
     return CurvatureSummary(
         kappa_mean=float(arr.mean()),
@@ -415,6 +425,8 @@ def ollivier_ricci_summary(
         kappa_skew=k_skew,
         kappa_entropy=k_ent,
         kappa_values=tuple(arr.tolist()),
+        skipped_frac=float(skipped / max(1, sampled)),
+        sampled_edges=sampled,
     )
 
 
