@@ -23,6 +23,16 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         st.warning("⚠️ Граф большой. Тяжелые метрики (Ricci, Efficiency) считаются в фоновом режиме.")
     col_vis_ctrl, col_vis_main = st.columns([1, 4])
 
+    graph_state_key = (
+        active_entry.id,
+        analysis_mode,
+        float(min_conf),
+        float(min_weight),
+        int(seed_val),
+    )
+    if "__structure_render_ok" not in st.session_state:
+        st.session_state["__structure_render_ok"] = {}
+
     with col_vis_ctrl:
         st.subheader("Настройки 3D")
         show_labels = st.checkbox("Показать ID узлов", False)
@@ -53,9 +63,20 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
             index=2,
         )
 
+        render_3d_now = st.button("🕸️ Построить 3D", key=f"btn_render_3d_{active_entry.id}")
+        if render_3d_now:
+            st.session_state["__structure_render_ok"][graph_state_key] = True
+
+        if graph_state_key not in st.session_state["__structure_render_ok"]:
+            st.info("3D отключен до нажатия кнопки, чтобы вкладка открывалась быстро.")
+
     with col_vis_main:
         if G_view.number_of_nodes() > 2000:
             st.warning(f"Граф большой ({G_view.number_of_nodes()} узлов). 3D может тормозить.")
+
+        # Ленивая отрисовка: предотвращает запуск тяжелых вычислений до явного запроса.
+        if graph_state_key not in st.session_state["__structure_render_ok"]:
+            st.stop()
 
         # Небольшой прогрессбар: Streamlit кэш скрывает длительные вычисления, но UX без индикации — боль.
         pb = st.progress(0.0)

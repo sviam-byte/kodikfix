@@ -751,19 +751,33 @@ if st.session_state.get("__upload_status"):
 if st.session_state.get("__pending_upload_error"):
     st.error(st.session_state["__pending_upload_error"])
 
-with st.spinner("Calculating metrics..."):
-    met = cached_calculate_metrics(
-        G_view,
-        int(seed_val),
-        int(settings.RICCI_SAMPLE_EDGES),
-    )
+# -----------------------------
+# Base metrics: no auto-compute
+# -----------------------------
+metrics_key = (
+    cur_gid,
+    analysis_mode,
+    float(min_conf),
+    float(min_weight),
+    int(seed_val),
+)
+
+if "__base_metrics_cache" not in st.session_state:
+    st.session_state["__base_metrics_cache"] = {}
+
+# Минимальный набор, чтобы дэшборд мог открыться мгновенно.
+met = {
+    "N": G_view.number_of_nodes() if G_view is not None else 0,
+    "E": G_view.number_of_edges() if G_view is not None else 0,
+}
 
 with st.container(border=True):
-    p1, p2, p3, p4 = st.columns(4)
+    p1, p2, p3, p4, p5 = st.columns([1, 1, 1, 1, 1.2])
     p1.metric("Nodes", G_view.number_of_nodes())
     p2.metric("Edges", G_view.number_of_edges())
     p3.metric("Mode", analysis_mode)
     p4.metric("Ricci edges", curv_n)
+    compute_base_now = p5.button("📊 Compute base metrics", key="btn_compute_base_metrics")
 
     if G_view.number_of_nodes() == 0:
         st.error(
@@ -771,14 +785,29 @@ with st.container(border=True):
             "Уменьши Min Confidence / Min Weight или проверь входные данные."
         )
     else:
-        st.info(
-            "Базовые метрики уже посчитаны ниже автоматически. "
-            "Ricci-кривизна считается отдельно кнопкой слева: 'Compute Ricci (slow)'."
+        if metrics_key in st.session_state["__base_metrics_cache"]:
+            met = st.session_state["__base_metrics_cache"][metrics_key]
+            st.success(
+                f"Граф собран: {G_view.number_of_nodes()} узлов, "
+                f"{G_view.number_of_edges()} рёбер. Базовые метрики уже в кэше."
+            )
+        else:
+            st.warning(
+                "Для ускорения старта базовые метрики больше не считаются автоматически. "
+                "Нажми 'Compute base metrics', если они нужны."
+            )
+
+if compute_base_now and G_view.number_of_nodes() > 0:
+    with st.spinner("Calculating base metrics..."):
+        met = cached_calculate_metrics(
+            G_view,
+            int(seed_val),
+            int(settings.RICCI_SAMPLE_EDGES),
         )
-        st.success(
-            f"Граф собран: {G_view.number_of_nodes()} узлов, "
-            f"{G_view.number_of_edges()} рёбер. Базовые метрики готовы."
-        )
+    st.session_state["__base_metrics_cache"][metrics_key] = met
+
+if metrics_key in st.session_state["__base_metrics_cache"]:
+    met = st.session_state["__base_metrics_cache"][metrics_key]
 
 # Ricci отдельно, с прогрессом + свой кэш
 ricci_key = (cur_gid, analysis_mode, float(min_conf), float(min_weight), int(seed_val), int(curv_n))
@@ -823,22 +852,29 @@ st.markdown("---")
 # ============================================================
 # 7) TABS ROUTER
 # ============================================================
-tabs = st.tabs(["📊 Дэшборд", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"])
+active_tab = st.radio(
+    "Раздел",
+    ["📊 Дэшборд", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"],
+    horizontal=True,
+    key="main_active_tab",
+)
 
-with tabs[0]:
+if active_tab == "📊 Дэшборд":
     tab_dashboard.render(G_view, met, active_entry)
 
-with tabs[1]:
+elif active_tab == "⚡ Energy":
     tab_energy.render(
         G_view,
         active_entry,
         seed_val,
         active_entry.src_col,
         active_entry.dst_col,
-        min_conf, min_weight, analysis_mode,
+        min_conf,
+        min_weight,
+        analysis_mode,
     )
 
-with tabs[2]:
+elif active_tab == "🕸️ 3D":
     tab_structure.render(
         G_view,
         active_entry,
@@ -850,7 +886,7 @@ with tabs[2]:
         analysis_mode,
     )
 
-with tabs[3]:
+elif active_tab == "🧪 Null":
     tab_attacks.render_null_models(
         G_view,
         G_full,
@@ -860,7 +896,7 @@ with tabs[3]:
         add_graph_callback=add_graph_to_state,
     )
 
-with tabs[4]:
+elif active_tab == "💥 Attack":
     tab_attacks.render_attack_lab(
         G_view,
         active_entry,
@@ -873,7 +909,7 @@ with tabs[4]:
         save_experiment_callback=save_experiment_to_state,
     )
 
-with tabs[5]:
+elif active_tab == "🆚 Compare":
     tab_compare.render(
         G_view,
         active_entry,
