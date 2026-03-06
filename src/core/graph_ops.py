@@ -6,7 +6,6 @@ from typing import Any, Callable
 
 import networkx as nx
 import numpy as np
-import pandas as pd
 import scipy.sparse.linalg as spla
 from networkx.algorithms.community import louvain_communities, modularity
 

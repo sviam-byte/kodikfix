@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Callable
 from pathlib import Path
+from typing import Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
@@ -11,7 +11,6 @@ import pandas as pd
 from .graph_build import build_graph_from_edges, lcc_subgraph
 from .metrics import calculate_metrics
 from .state_models import ExperimentEntry, GraphEntry
-
 
 DEFAULT_TRAJECTORY_META_COLS = {
     "step",
@@ -118,14 +117,14 @@ def build_subject_metrics_table(
             large_graph = n_nodes > 300
             huge_graph = n_nodes > 1200 or n_edges > 8000
 
-            def _metric_progress(frac: float) -> None:
+            def _metric_progress(frac: float, _idx: int = idx, _name: str = entry.name) -> None:
                 """Map inner metric progress to outer per-graph export progress."""
                 if progress_cb is None:
                     return
                 progress_cb(
-                    (idx - 1) + min(0.95, max(0.0, float(frac))),
+                    (_idx - 1) + min(0.95, max(0.0, float(frac))),
                     total,
-                    f"{entry.name} · Ricci {int(round(float(frac) * 100))}%",
+                    f"{_name} · Ricci {int(round(float(frac) * 100))}%",
                 )
 
             met = calculate_metrics(
