@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from .config import settings
-from .weights import policy_from_settings, apply_weight_policy_to_series
+from .weights import apply_weight_policy_to_series, policy_from_settings
 
 
 def coerce_fixed_format(df_any: pd.DataFrame) -> tuple[pd.DataFrame, dict]:

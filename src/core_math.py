@@ -28,6 +28,7 @@ from .null import compute_null_threshold
 from .profiling import timeit
 from .utils import as_simple_undirected
 
+
 # -----------------------------
 # Entropy
 # -----------------------------

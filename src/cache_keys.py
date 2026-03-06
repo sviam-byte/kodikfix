@@ -2,6 +2,7 @@ import hashlib
 
 import networkx as nx
 
+
 def graph_to_edge_payload(G: nx.Graph, decimals: int = 8) -> tuple:
     edges = []
     for u, v, d in G.edges(data=True):
