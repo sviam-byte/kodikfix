@@ -5,6 +5,7 @@ import io
 import logging
 import math
 import os
+import traceback
 from pathlib import Path
 
 import networkx as nx
@@ -39,16 +40,38 @@ from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
 from src.graph_build import build_graph
 from src.services.graph_service import GraphService
-from src.session_io import (
-    export_experiments_json,
-    export_experiments_xlsx,
-    export_workspace_json,
-    import_workspace_json,
-)
 from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.ui_blocks import inject_custom_css
+
+# session_io функциональность опциональна для UI.
+# Если импорт упал (например, из-за отсутствующего xlsx-engine),
+# приложение должно продолжить работу с остальными вкладками.
+SESSION_IO_AVAILABLE = True
+SESSION_IO_IMPORT_ERROR = None
+try:
+    from src.session_io import (
+        export_experiments_json,
+        export_experiments_xlsx,
+        export_workspace_json,
+        import_workspace_json,
+    )
+except Exception as e:  # pylint: disable=broad-except
+    SESSION_IO_AVAILABLE = False
+    SESSION_IO_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    logger.exception("session_io import failed\n%s", traceback.format_exc())
+
+    def _session_io_unavailable(*args, **kwargs):
+        raise RuntimeError(
+            "session_io недоступен. "
+            f"Первичная ошибка импорта: {SESSION_IO_IMPORT_ERROR}"
+        )
+
+    export_experiments_json = _session_io_unavailable
+    export_experiments_xlsx = _session_io_unavailable
+    export_workspace_json = _session_io_unavailable
+    import_workspace_json = _session_io_unavailable
 
 from src.ui.tabs import attacks as tab_attacks
 from src.ui.tabs import compare as tab_compare
@@ -156,7 +179,7 @@ def _mat_obj_to_subject_names(obj: np.ndarray, n_rows: int) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def cached_load_packed_mat_graphs(file_bytes: bytes, filename: str) -> list[tuple[str, pd.DataFrame]]:
+def cached_load_packed_mat_graphs(file_bytes: bytes, filename: str) -> tuple[list[tuple[str, pd.DataFrame]], int]:
     """
     Загрузить MAT-файл формата:
       - data: (subjects, packed_edges)
@@ -198,7 +221,52 @@ def cached_load_packed_mat_graphs(file_bytes: bytes, filename: str) -> list[tupl
         )
         graphs.append((subj_names[i], df))
 
-    return graphs
+    return graphs, int(n_nodes)
+
+
+def _clear_pending_upload_state():
+    """Очистить временное состояние загрузок/стейджинга для сайдбара."""
+    for key in [
+        "__pending_upload_df",
+        "__pending_upload_name",
+        "__pending_upload_error",
+        "__mat_stage_name",
+        "__mat_stage_graphs",
+        "__mat_stage_subjects",
+        "__mat_stage_n_nodes",
+        "__mat_stage_source_filename",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _import_staged_mat_graphs(selected_idx: list[int] | None = None):
+    """Импортировать выбранные MAT-графы из staging в рабочий state."""
+    graphs = st.session_state.get("__mat_stage_graphs")
+    subjects = st.session_state.get("__mat_stage_subjects")
+    source_filename = st.session_state.get("__mat_stage_source_filename", "mat-upload")
+    if not graphs or not subjects:
+        raise RuntimeError("Нет staged MAT-графов для импорта")
+
+    if selected_idx is None:
+        selected_idx = list(range(len(graphs)))
+
+    added_ids = []
+    base = Path(source_filename).stem
+    for i in selected_idx:
+        subj_name = subjects[i]
+        df_edges = graphs[i]
+        gid = add_graph_to_state(
+            f"{base} :: {subj_name}",
+            df_edges,
+            "mat-upload",
+            "src",
+            "dst",
+        )
+        added_ids.append(gid)
+
+    if added_ids:
+        ctx.active_graph_id = added_ids[0]
+    return added_ids
 
 
 @st.cache_data(show_spinner=False)
@@ -241,31 +309,42 @@ with st.sidebar:
         t1, t2 = st.tabs(["Workspace", "Exps"])
 
         with t1:
-            if st.button("Export Workspace"):
-                b = export_workspace_json(ctx.graphs, ctx.experiments)
-                st.download_button("JSON", b, "workspace.json", "application/json")
+            if not SESSION_IO_AVAILABLE:
+                st.warning("Workspace import/export временно недоступен.")
+                with st.expander("Показать причину"):
+                    st.code(SESSION_IO_IMPORT_ERROR or "unknown session_io error")
+            else:
+                if st.button("Export Workspace"):
+                    b = export_workspace_json(ctx.graphs, ctx.experiments)
+                    st.download_button("JSON", b, "workspace.json", "application/json")
 
-            up_ws = st.file_uploader("Load Workspace", type=["json"], key="up_ws")
-            if up_ws:
-                gs, ex = import_workspace_json(up_ws.getvalue())
-                st.session_state["graphs"] = gs
-                st.session_state["experiments"] = ex
-                if gs:
-                    ctx.active_graph_id = next(iter(gs.keys()))
-                st.rerun()
+                up_ws = st.file_uploader("Load Workspace", type=["json"], key="up_ws")
+                if up_ws:
+                    try:
+                        gs, ex = import_workspace_json(up_ws.getvalue())
+                        st.session_state["graphs"] = gs
+                        st.session_state["experiments"] = ex
+                        if gs:
+                            ctx.active_graph_id = next(iter(gs.keys()))
+                        st.rerun()
+                    except Exception as e:  # pylint: disable=broad-except
+                        st.error(f"Workspace import error: {type(e).__name__}: {e}")
 
         with t2:
-            if st.button("Export Exps"):
-                b = export_experiments_json(ctx.experiments)
-                st.download_button("JSON", b, "experiments.json", "application/json")
-            if st.button("Export Exps XLSX"):
-                b_xlsx = export_experiments_xlsx(ctx.experiments)
-                st.download_button(
-                    "XLSX",
-                    b_xlsx,
-                    "experiments.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+            if not SESSION_IO_AVAILABLE:
+                st.warning("Experiments export временно недоступен.")
+            else:
+                if st.button("Export Exps"):
+                    b = export_experiments_json(ctx.experiments)
+                    st.download_button("JSON", b, "experiments.json", "application/json")
+                if st.button("Export Exps XLSX"):
+                    b_xlsx = export_experiments_xlsx(ctx.experiments)
+                    st.download_button(
+                        "XLSX",
+                        b_xlsx,
+                        "experiments.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
     st.markdown("---")
     st.subheader("📂 Данные")
@@ -279,30 +358,23 @@ with st.sidebar:
         if file_hash != st.session_state.get("last_upload_hash"):
             st.session_state["last_upload_hash"] = file_hash
 
+            # На новом файле очищаем состояние прошлых попыток/staging.
+            _clear_pending_upload_state()
+
             if uploaded_file.name.lower().endswith(".mat"):
                 try:
-                    packed_graphs = cached_load_packed_mat_graphs(raw_bytes, uploaded_file.name)
+                    packed_graphs, n_nodes = cached_load_packed_mat_graphs(raw_bytes, uploaded_file.name)
                     if not packed_graphs:
                         raise ValueError("MAT-файл прочитан, но графы не извлечены")
 
-                    added_ids = []
-                    base = Path(uploaded_file.name).stem
-                    for subj_name, df_edges in packed_graphs:
-                        gid = add_graph_to_state(
-                            f"{base} :: {subj_name}",
-                            df_edges,
-                            "mat-upload",
-                            "src",
-                            "dst",
-                        )
-                        added_ids.append(gid)
-
-                    if added_ids:
-                        ctx.active_graph_id = added_ids[0]
-
+                    st.session_state["__mat_stage_name"] = uploaded_file.name
+                    st.session_state["__mat_stage_source_filename"] = uploaded_file.name
+                    st.session_state["__mat_stage_graphs"] = [df for _, df in packed_graphs]
+                    st.session_state["__mat_stage_subjects"] = [name for name, _ in packed_graphs]
+                    st.session_state["__mat_stage_n_nodes"] = int(n_nodes)
                     st.session_state["__upload_status"] = (
-                        f"Импортировано {len(added_ids)} графов из {uploaded_file.name} "
-                        f"(packed upper-triangle MAT format)."
+                        f"MAT распознан: {len(packed_graphs)} субъектов, {n_nodes} узлов. "
+                        "Выбери ниже, что импортировать."
                     )
                     st.session_state.pop("__pending_upload_error", None)
                     st.rerun()
@@ -334,6 +406,65 @@ with st.sidebar:
 
             except Exception as e:
                 st.session_state["__pending_upload_error"] = str(e)
+
+    if st.session_state.get("__mat_stage_graphs"):
+        st.markdown("---")
+        st.subheader("🧠 MAT batch import")
+
+        mat_name = st.session_state.get("__mat_stage_name", "unknown.mat")
+        mat_subjects = st.session_state.get("__mat_stage_subjects", [])
+        mat_n_nodes = st.session_state.get("__mat_stage_n_nodes", 0)
+        mat_count = len(mat_subjects)
+
+        st.caption(f"{mat_name}: {mat_count} subjects, {mat_n_nodes} nodes each")
+
+        default_preview_n = min(10, mat_count)
+        preview_n = st.number_input(
+            "Сколько субъектов показать",
+            min_value=1,
+            max_value=max(1, mat_count),
+            value=default_preview_n,
+            step=1,
+            key="__mat_preview_n",
+        )
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "idx": list(range(min(preview_n, mat_count))),
+                    "subject": mat_subjects[: int(preview_n)],
+                }
+            ),
+            use_container_width=True,
+            height=220,
+        )
+
+        selected_subjects = st.multiselect(
+            "Import selected subjects",
+            options=mat_subjects,
+            default=mat_subjects[: min(3, mat_count)],
+            key="__mat_selected_subjects",
+        )
+
+        b1, b2, b3 = st.columns(3)
+        if b1.button("Import selected", use_container_width=True):
+            selected_set = set(selected_subjects)
+            idx = [i for i, s in enumerate(mat_subjects) if s in selected_set]
+            if not idx:
+                st.warning("Ничего не выбрано для импорта.")
+            else:
+                added_ids = _import_staged_mat_graphs(idx)
+                st.session_state["__upload_status"] = f"Импортировано {len(added_ids)} выбранных графов из {mat_name}."
+                _clear_pending_upload_state()
+                st.rerun()
+        if b2.button("Import all", use_container_width=True):
+            added_ids = _import_staged_mat_graphs(None)
+            st.session_state["__upload_status"] = f"Импортировано {len(added_ids)} графов из {mat_name}."
+            _clear_pending_upload_state()
+            st.rerun()
+        if b3.button("Cancel", use_container_width=True):
+            _clear_pending_upload_state()
+            st.info("MAT staging очищен.")
+            st.rerun()
 
     # Column mapping UI (если авто-режим не взлетел)
     if st.session_state.get("__pending_upload_df") is not None:
