@@ -157,6 +157,7 @@ def run_attack(
     keep_states: bool = False,
     fast_mode: bool = False,
     progress_cb=None,
+    row_cb=None,
 ):
     G = as_simple_undirected(G_in).copy()
     N0 = G.number_of_nodes()
@@ -222,6 +223,8 @@ def run_attack(
             }
         )
         history.append(met)
+        if row_cb is not None:
+            row_cb(dict(met), i, len(ks) - 1)
 
         if i < len(ks) - 1:
             num_to_del = ks[i + 1] - len(removed_log)
@@ -249,6 +252,7 @@ def run_edge_attack(
     curvature_sample_edges: int = 80,
     fast_mode: bool = False,
     progress_cb=None,
+    row_cb=None,
 ):
 
     if G.number_of_edges() == 0:
@@ -429,6 +433,8 @@ def run_edge_attack(
             "l2_lcc": float(metrics.get("l2_lcc", np.nan)) if heavy else np.nan,
         }
         rows.append(row)
+        if row_cb is not None:
+            row_cb(dict(row), i, len(ks) - 1)
 
     df_hist = pd.DataFrame(rows)
     aux = {
