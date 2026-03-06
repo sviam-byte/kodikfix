@@ -840,7 +840,15 @@ with st.sidebar:
 
     if st.button("🧠 Посчитать по плану", use_container_width=True):
         _run_article_plan(
-            G_view,
+            # Собираем граф локально, чтобы не зависеть от инициализации G_view ниже по файлу.
+            cached_build_graph(
+                active_entry.edges,
+                active_entry.src_col,
+                active_entry.dst_col,
+                min_conf,
+                min_weight,
+                analysis_mode,
+            ),
             cur_gid=str(cur_gid),
             analysis_mode=str(analysis_mode),
             min_conf=float(min_conf),
