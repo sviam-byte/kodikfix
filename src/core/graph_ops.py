@@ -308,12 +308,18 @@ def calculate_metrics(
         kappa_frac_negative = float(curv.kappa_frac_negative)
         kappa_computed_edges = int(curv.computed_edges)
         kappa_skipped_edges = int(curv.skipped_edges)
+        kappa_var = float(curv.kappa_var)
+        kappa_skew = float(curv.kappa_skew)
+        kappa_entropy = float(curv.kappa_entropy)
     else:
         kappa_mean = float("nan")
         kappa_median = float("nan")
         kappa_frac_negative = float("nan")
         kappa_computed_edges = 0
         kappa_skipped_edges = 0
+        kappa_var = float("nan")
+        kappa_skew = float("nan")
+        kappa_entropy = float("nan")
 
     frag_H = float(fragility_from_entropy(H_rw)) if np.isfinite(H_rw) else float("nan")
     frag_evo = float(fragility_from_entropy(H_evo)) if np.isfinite(H_evo) else float("nan")
@@ -351,6 +357,9 @@ def calculate_metrics(
         "kappa_frac_negative": kappa_frac_negative,
         "kappa_computed_edges": kappa_computed_edges,
         "kappa_skipped_edges": kappa_skipped_edges,
+        "kappa_var": kappa_var,
+        "kappa_skew": kappa_skew,
+        "kappa_entropy": kappa_entropy,
         "fragility_H": frag_H,
         "fragility_evo": frag_evo,
         "fragility_kappa": frag_k,

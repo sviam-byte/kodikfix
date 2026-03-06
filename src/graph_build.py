@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 
 from .config import settings
-from .weights import policy_from_settings, apply_weight_policy_scalar
 from .preprocess import filter_edges
+from .weights import apply_weight_policy_scalar, policy_from_settings
 
 """
 табличка -> нетворк граф

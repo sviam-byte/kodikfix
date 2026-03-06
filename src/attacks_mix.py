@@ -4,6 +4,7 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 import pandas as pd
+
 from .core_math import (
     entropy_confidence,
     entropy_degree,

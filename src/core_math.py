@@ -28,6 +28,7 @@ from .null import compute_null_threshold
 from .profiling import timeit
 from .utils import as_simple_undirected
 
+
 # -----------------------------
 # Entropy
 # -----------------------------
@@ -322,6 +323,12 @@ class CurvatureSummary:
     kappa_frac_negative: float
     computed_edges: int
     skipped_edges: int
+    # Расширенные статистики распределения кривизны (для batch/research анализа).
+    kappa_var: float = float("nan")
+    kappa_skew: float = float("nan")
+    kappa_entropy: float = float("nan")
+    # Полный вектор kappa; tuple сохраняет hashability dataclass-объекта.
+    kappa_values: tuple = ()
 
 
 @timeit('ollivier_ricci_summary')
@@ -371,15 +378,43 @@ def ollivier_ricci_summary(
     skipped = len(edges) - len(kappas)
 
     if len(kappas) == 0:
-        return CurvatureSummary(float('nan'), float('nan'), float('nan'), 0, int(skipped))
+        return CurvatureSummary(
+            float('nan'),
+            float('nan'),
+            float('nan'),
+            0,
+            int(skipped),
+            float('nan'),
+            float('nan'),
+            float('nan'),
+            (),
+        )
 
     arr = np.array(kappas, dtype=float)
+
+    # Исследовательские признаки формы распределения kappa.
+    # variance: определена от 2 наблюдений.
+    k_var = float(arr.var()) if arr.size >= 2 else float("nan")
+    # skewness: стабильна только от 3 наблюдений.
+    if arr.size >= 3:
+        m3 = float(((arr - arr.mean()) ** 3).mean())
+        s3 = float(arr.std() ** 3)
+        k_skew = m3 / s3 if s3 > 1e-15 else float("nan")
+    else:
+        k_skew = float("nan")
+    # Энтропия гистограммы kappa — признак «размазанности» распределения.
+    k_ent = entropy_histogram(arr, bins="fd") if arr.size >= 5 else float("nan")
+
     return CurvatureSummary(
         kappa_mean=float(arr.mean()),
         kappa_median=float(np.median(arr)),
         kappa_frac_negative=float((arr < 0).mean()),
         computed_edges=int(arr.size),
         skipped_edges=int(skipped),
+        kappa_var=k_var,
+        kappa_skew=k_skew,
+        kappa_entropy=k_ent,
+        kappa_values=tuple(arr.tolist()),
     )
 
 
