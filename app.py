@@ -39,6 +39,7 @@ from src.config import settings
 from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
 from src.graph_build import build_graph
+from src.core.graph_ops import calculate_metrics
 from src.services.graph_service import GraphService
 from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
 from src.state.session import ctx
@@ -324,6 +325,17 @@ def cached_calculate_metrics(
 
     Curvature is intentionally excluded here and computed separately in UI on demand.
     """
+    if G is None:
+        return {}
+    if G.number_of_nodes() == 0:
+        return {
+            "N": 0,
+            "E": 0,
+            "C": 0,
+            "density": 0.0,
+            "avg_degree": 0.0,
+        }
+
     # For very large graphs we trade some precision for responsiveness on rerenders.
     large_graph = G.number_of_nodes() > 300
     huge_graph = G.number_of_nodes() > 1200 or G.number_of_edges() > 8000
