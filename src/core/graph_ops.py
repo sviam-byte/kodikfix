@@ -276,17 +276,25 @@ def calculate_metrics(
         H_deg = float("nan")
 
     if G.number_of_edges() > 0:
-        edf = pd.DataFrame([d for _, _, d in G.edges(data=True)])
-        ws = (
-            pd.to_numeric(edf["weight"], errors="coerce").dropna().to_numpy()
-            if "weight" in edf
-            else np.array([])
-        )
-        cs = (
-            pd.to_numeric(edf["confidence"], errors="coerce").dropna().to_numpy()
-            if "confidence" in edf
-            else np.array([])
-        )
+        ws_list: list[float] = []
+        cs_list: list[float] = []
+        for _, _, d in G.edges(data=True):
+            w = d.get("weight")
+            c = d.get("confidence")
+            try:
+                w_f = float(w)
+            except (TypeError, ValueError):
+                w_f = None
+            try:
+                c_f = float(c)
+            except (TypeError, ValueError):
+                c_f = None
+            if w_f is not None and np.isfinite(w_f):
+                ws_list.append(w_f)
+            if c_f is not None and np.isfinite(c_f):
+                cs_list.append(c_f)
+        ws = np.asarray(ws_list, dtype=float) if ws_list else np.array([])
+        cs = np.asarray(cs_list, dtype=float) if cs_list else np.array([])
     else:
         ws = np.array([])
         cs = np.array([])
@@ -299,8 +307,13 @@ def calculate_metrics(
     tau_relax = (1.0 / l2) if (np.isfinite(l2) and l2 > EPS_W) else float("nan")
     epi_thr = (1.0 / lmax) if (np.isfinite(lmax) and lmax > EPS_W) else float("nan")
 
-    H_rw = float(network_entropy_rate(G, base=math.e))
-    H_evo = float(evolutionary_entropy_demetrius(G, base=math.e))
+    # These entropy-rate metrics are expensive and are skipped on light passes.
+    if is_heavy:
+        H_rw = float(network_entropy_rate(G, base=math.e))
+        H_evo = float(evolutionary_entropy_demetrius(G, base=math.e))
+    else:
+        H_rw = float("nan")
+        H_evo = float("nan")
 
     if compute_curvature and G.number_of_edges() > 0:
         def _progress_cb(i: int, total: int, *_args) -> None:

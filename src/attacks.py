@@ -193,15 +193,16 @@ def run_attack(
         # В fast_mode считаем тяжелые метрики только на первых/последних шагах
         is_first_last = (i == 0) or (i == len(ks) - 1)
         if fast_mode:
-            heavy = is_first_last or (i % max(1, int(compute_heavy_every) * 2) == 0)
+            heavy = is_first_last or (i % max(1, int(compute_heavy_every) * 3) == 0)
         else:
             heavy = (i % max(1, int(compute_heavy_every)) == 0)
 
-        skip_spectral = not heavy
+        skip_spectral = bool(fast_mode) or (not heavy)
+        eff_k_local = min(int(eff_sources_k), 8) if fast_mode and not is_first_last else int(eff_sources_k)
 
         met = calculate_metrics(
             G,
-            int(eff_sources_k),
+            eff_k_local,
             int(seed),
             False,
             skip_spectral=skip_spectral,
@@ -246,6 +247,7 @@ def run_edge_attack(
     compute_heavy_every: int = 2,
     compute_curvature: bool = False,
     curvature_sample_edges: int = 80,
+    fast_mode: bool = False,
     progress_cb=None,
 ):
 
@@ -386,15 +388,19 @@ def run_edge_attack(
                     H.remove_edge(u, v)
 
         removed_frac = (k / total_e) if total_e else 0.0
-        heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == steps)
+        if fast_mode:
+            heavy = (i == 0) or (i == steps) or (i % int(max(1, compute_heavy_every) * 3) == 0)
+        else:
+            heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == steps)
 
         is_really_heavy_step = (i == 0) or (i == len(ks) - 1)
         is_light_step = not heavy
-        skip_spectral = (H.number_of_nodes() > 500) and not is_really_heavy_step
+        skip_spectral = bool(fast_mode) or ((H.number_of_nodes() > 500) and not is_really_heavy_step)
+        eff_k_local = min(int(eff_k), 8) if fast_mode and not is_really_heavy_step else int(eff_k)
 
         metrics = calculate_metrics(
             H,
-            eff_sources_k=int(eff_k),
+            eff_sources_k=eff_k_local,
             seed=int(seed),
             compute_curvature=bool(compute_curvature and heavy),
             curvature_sample_edges=int(curvature_sample_edges),

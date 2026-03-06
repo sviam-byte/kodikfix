@@ -450,6 +450,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         df_hist, aux = run_attack(
                             G_view, kind, float(frac), int(steps), int(seed_run), int(eff_k),
                             rc_frac=0.1, compute_heavy_every=int(heavy_freq),
+                            fast_mode=bool(fast_mode),
                             progress_cb=_cb,
                         )
                         bar.empty(); msg.empty()
@@ -498,6 +499,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                             compute_heavy_every=int(heavy_freq),
                             compute_curvature=bool(st.session_state.get("__compute_curvature", False)),
                             curvature_sample_edges=int(st.session_state.get("__curvature_sample_edges", 80)),
+                            fast_mode=bool(fast_mode),
                             progress_cb=_cb,
                         )
                         bar.empty(); msg.empty()
