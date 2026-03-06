@@ -82,3 +82,15 @@ def test_cli_attack_and_mixfrac_subcommands(tmp_path: Path):
     payload_mix = json.loads(mix_out.read_text(encoding="utf-8"))
     assert payload_mix["mode"] == "mixfrac"
     assert "result" in payload_mix
+
+
+def test_cli_metrics_out_format_csv(tmp_path: Path):
+    data = tmp_path / "graph.csv"
+    out = tmp_path / "metrics.csv"
+    _write_edges(data)
+
+    code = cli.main(["metrics", str(data), "--out", str(out), "--out-format", "csv"])
+    assert code == 0
+    df = pd.read_csv(out)
+    assert "summary" in df.columns or "summary__N" in df.columns
+    assert "settings__seed" in df.columns

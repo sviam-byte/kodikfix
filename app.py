@@ -37,7 +37,12 @@ from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
 from src.graph_build import build_graph
 from src.services.graph_service import GraphService
-from src.session_io import export_experiments_json, export_workspace_json, import_workspace_json
+from src.session_io import (
+    export_experiments_json,
+    export_experiments_xlsx,
+    export_workspace_json,
+    import_workspace_json,
+)
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.ui_blocks import inject_custom_css
@@ -167,6 +172,14 @@ with st.sidebar:
             if st.button("Export Exps"):
                 b = export_experiments_json(ctx.experiments)
                 st.download_button("JSON", b, "experiments.json", "application/json")
+            if st.button("Export Exps XLSX"):
+                b_xlsx = export_experiments_xlsx(ctx.experiments)
+                st.download_button(
+                    "XLSX",
+                    b_xlsx,
+                    "experiments.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
     st.markdown("---")
     st.subheader("📂 Данные")

@@ -5,6 +5,18 @@ import sys
 from pathlib import Path
 
 
+def _find_python(root: Path) -> str:
+    """Prefer project-local virtualenv interpreter when available."""
+    candidates = [
+        root / ".venv" / "Scripts" / "python.exe",  # Windows venv
+        root / ".venv" / "bin" / "python",  # Linux/macOS venv
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entrypoint for running UI/CLI locally without memorizing long commands."""
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -18,16 +30,16 @@ def main(argv: list[str] | None = None) -> int:
 
     mode = argv[0]
     root = Path(__file__).resolve().parent
+    py = _find_python(root)
 
     if mode == "ui":
         extra = argv[1:]
-        cmd = [sys.executable, "-m", "streamlit", "run", str(root / "app.py"), *extra]
+        cmd = [py, "-m", "streamlit", "run", str(root / "app.py"), *extra]
         return int(subprocess.call(cmd))
 
     if mode == "cli":
-        from src.cli import main as cli_main
-
-        return int(cli_main(argv[1:]))
+        cmd = [py, "-m", "src.cli", *argv[1:]]
+        return int(subprocess.call(cmd))
 
     print(f"Unknown mode: {mode}", file=sys.stderr)
     return 2

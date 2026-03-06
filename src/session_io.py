@@ -4,6 +4,7 @@ import json
 import numpy as np
 import pandas as pd
 
+from .exporters import experiments_to_xlsx_bytes
 from .state_models import (
     ExperimentEntry,
     GraphEntry,
@@ -188,3 +189,8 @@ def import_experiments_json(blob: bytes) -> list[ExperimentEntry]:
             )
         )
     return exps
+
+
+def export_experiments_xlsx(experiments: list[ExperimentEntry]) -> bytes:
+    """Export experiments workbook as XLSX bytes for download."""
+    return experiments_to_xlsx_bytes(experiments)

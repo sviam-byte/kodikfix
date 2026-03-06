@@ -22,6 +22,29 @@ streamlit run app.py
 python run_local.py ui
 ```
 
+
+### Windows: запуск через `.bat`
+
+Подготовка окружения:
+
+```bat
+setup_env.bat
+```
+
+Запуск интерфейса (двойной клик или из консоли):
+
+```bat
+run_ui.bat
+```
+
+Запуск CLI:
+
+```bat
+run_cli.bat metrics data.csv --src src --dst dst
+run_cli.bat attack data.csv --family node --kind degree --frac 0.5
+run_cli.bat mixfrac --patient patient.csv --healthy hc1.csv hc2.csv
+```
+
 ## Локальный запуск без Streamlit
 
 CLI поддерживает subcommands `metrics`, `attack`, `mixfrac`.
@@ -152,3 +175,15 @@ statistics are not available.
 - Веса рёбер (`weight`) интерпретируются как **неотрицательная** мера силы/пропускной способности связи.
 - Для некоторых метрик используется преобразование расстояний `dist = 1/weight` — это допущение. Для корреляционных весов (в т.ч. отрицательных) нужна отдельная политика препроцессинга.
 - Часть расчётов на больших графах использует аппроксимации/ограничения по времени (например, sampling в betweenness). Это может менять ranking, но ускоряет интерактивный UI.
+
+## Рекомендуемый локальный сценарий
+
+Для Windows:
+
+1. Запустить `setup_env.bat`
+2. Потом `run_ui.bat`
+
+Или для CLI:
+
+1. `setup_env.bat`
+2. `run_cli.bat ...`

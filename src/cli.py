@@ -10,6 +10,7 @@ import pandas as pd
 from .attacks import run_attack, run_edge_attack
 from .attacks_mix import run_mix_attack
 from .config import settings
+from .exporters import export_metrics_payload, infer_output_format, payload_to_dataframe
 from .graph_build import build_graph_from_edges, graph_summary, lcc_subgraph
 from .metrics import calculate_metrics
 from .mix_frac_estimator import estimate_mix_frac_star
@@ -129,7 +130,18 @@ def _cmd_metrics(args) -> int:
         },
         "metrics": met,
     }
-    _write_json(payload, args.out)
+
+    if args.out == "-":
+        fmt = infer_output_format("stdout.json", args.out_format)
+        if fmt == "json":
+            txt = json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
+            print(txt)
+        elif fmt == "csv":
+            print(payload_to_dataframe(payload).to_csv(index=False))
+        else:
+            raise ValueError("For XLSX output, specify a file path in --out instead of stdout.")
+    else:
+        export_metrics_payload(payload, args.out, args.out_format)
     return 0
 
 
@@ -286,6 +298,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_metrics.add_argument("--compute-curvature", action="store_true")
     p_metrics.add_argument("--curvature-sample-edges", type=int, default=120)
     p_metrics.add_argument("--out", type=str, default="-")
+    p_metrics.add_argument(
+        "--out-format",
+        type=str,
+        default="auto",
+        choices=["auto", "json", "csv", "xlsx"],
+        help="Output format. auto = infer from --out extension",
+    )
 
     p_attack = subparsers.add_parser("attack", help="Run node/edge/mix attack locally")
     p_attack.add_argument("input", type=str, help="Path to CSV/Excel edge list")
