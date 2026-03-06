@@ -27,8 +27,15 @@ import pandas as pd
 from .graph_build import build_graph_from_edges, lcc_subgraph
 
 
-def load_matrix(path: Union[str, Path]) -> np.ndarray:
-    """Загрузить квадратную матрицу из файла."""
+def load_matrix(path: Union[str, Path], *, key: Optional[str] = None) -> np.ndarray:
+    """Загрузить квадратную матрицу из файла.
+
+    Parameters
+    ----------
+    key : optional, только для .mat
+        Имя переменной в MAT-файле. Если не задано, выбирается
+        самая большая квадратная матрица размером > 1x1.
+    """
     p = Path(path)
     if p.suffix == ".npy":
         return np.load(p)
@@ -41,11 +48,29 @@ def load_matrix(path: Union[str, Path]) -> np.ndarray:
         from scipy.io import loadmat
 
         data = loadmat(str(p))
-        # Ищем первую квадратную матрицу.
-        for _, value in data.items():
+        if key is not None:
+            if key not in data:
+                raise KeyError(f"Key {key!r} not found in {p}")
+            value = data[key]
+            if not (isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[0] == value.shape[1]):
+                raise ValueError(f"Variable {key!r} in {p} is not a square matrix")
+            return value.astype(float)
+
+        # По умолчанию пропускаем служебные __* и выбираем самую большую квадратную матрицу.
+        candidates: list[tuple[int, np.ndarray]] = []
+        for name, value in data.items():
+            if str(name).startswith("__"):
+                continue
             if isinstance(value, np.ndarray) and value.ndim == 2 and value.shape[0] == value.shape[1]:
-                return value.astype(float)
-        raise ValueError(f"No square matrix found in {p}")
+                if int(value.shape[0]) <= 1:
+                    continue
+                candidates.append((int(value.shape[0]), value))
+
+        if not candidates:
+            raise ValueError(f"No square matrix found in {p}")
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1].astype(float)
 
     # Иначе трактуем как CSV с квадратной матрицей.
     df = pd.read_csv(p, header=None)

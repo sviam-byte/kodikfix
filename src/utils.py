@@ -1,3 +1,5 @@
+import warnings
+
 import networkx as nx
 import numpy as np
 
@@ -9,6 +11,11 @@ def as_simple_undirected(G: nx.Graph) -> nx.Graph:
         H = H.to_undirected(as_view=False)
 
     if isinstance(H, (nx.MultiGraph, nx.MultiDiGraph)):
+        warnings.warn(
+            "MultiGraph/MultiDiGraph detected; collapsing parallel edges into a simple undirected graph by summing weights.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         # Склеиваем мульти-рёбра: суммируем веса и сохраняем первый набор атрибутов.
         # это упрощение, но обычно адекватное. система не поддерживает несколько рёбер между одними и теми же узлами
         #в будущем, безусловно, будет доделаны мультиграфы + ориентированные
