@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """UI tab for comparing graph metrics and experiment trajectories."""
 
+import networkx as nx
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -18,6 +19,33 @@ from src.ui.plots.charts import (
     forward_fill_heavy as _forward_fill_heavy,
 )
 from src.plotting import fig_compare_attacks
+
+
+def _hash_graph(G: nx.Graph) -> str:
+    """Build a stable hash for graph metric cache keys."""
+    if G is None:
+        return "none"
+    try:
+        return nx.weisfeiler_lehman_graph_hash(G, edge_attr="weight")
+    except Exception:  # pylint: disable=broad-except
+        return f"{G.number_of_nodes()}-{G.number_of_edges()}"
+
+
+@st.cache_data(show_spinner=False, hash_funcs={nx.Graph: _hash_graph})
+def _cached_scalar_metrics(G: nx.Graph, eff_sources_k: int = 16, seed: int = 42) -> dict:
+    """Cache scalar metric calculations used by compare-tab graph benchmarking."""
+    # Compare-tab is often rerendered; keep heavy metrics off for larger graphs.
+    large_graph = G.number_of_nodes() > 300
+    huge_graph = G.number_of_nodes() > 1200 or G.number_of_edges() > 8000
+    return calculate_metrics(
+        G,
+        eff_sources_k=int(eff_sources_k),
+        seed=int(seed),
+        compute_curvature=False,
+        compute_heavy=not large_graph,
+        skip_spectral=bool(huge_graph),
+        diameter_samples=6 if large_graph else 16,
+    )
 
 
 def render(
@@ -70,7 +98,7 @@ def render(
                     _G = lcc_subgraph(_G)
 
                 # Compute scalar metrics for each graph under current filters.
-                _m = calculate_metrics(_G, eff_sources_k=16, seed=42)
+                _m = _cached_scalar_metrics(_G, eff_sources_k=16, seed=42)
                 rows.append({"Name": entry.name, scalar_metric: _m.get(scalar_metric, np.nan)})
 
             df_cmp = pd.DataFrame(rows)

@@ -279,6 +279,42 @@ def cached_load_edges(file_bytes: bytes, filename: str, fixed: bool) -> tuple[pd
     return df_any, None
 
 
+def _hash_nx_graph_for_metrics(G: nx.Graph) -> str:
+    """Return a stable cache key for metric calculation based on graph topology/weights."""
+    if G is None:
+        return "none"
+    try:
+        return nx.weisfeiler_lehman_graph_hash(G, edge_attr="weight")
+    except Exception:  # pylint: disable=broad-except
+        # Fallback keeps cache functional even if hashing fails for rare graph edge cases.
+        return f"{G.number_of_nodes()}-{G.number_of_edges()}"
+
+
+@st.cache_data(show_spinner=False, hash_funcs={nx.Graph: _hash_nx_graph_for_metrics})
+def cached_calculate_metrics(
+    G: nx.Graph,
+    seed: int,
+    curvature_sample_edges: int,
+) -> dict:
+    """Calculate base metrics for an already built graph and cache the result.
+
+    Curvature is intentionally excluded here and computed separately in UI on demand.
+    """
+    # For very large graphs we trade some precision for responsiveness on rerenders.
+    large_graph = G.number_of_nodes() > 300
+    huge_graph = G.number_of_nodes() > 1200 or G.number_of_edges() > 8000
+    return calculate_metrics(
+        G,
+        eff_sources_k=settings.APPROX_EFFICIENCY_K,
+        seed=int(seed),
+        compute_curvature=False,
+        curvature_sample_edges=int(curvature_sample_edges),
+        compute_heavy=not large_graph,
+        skip_spectral=bool(huge_graph),
+        diameter_samples=6 if large_graph else 16,
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def cached_build_graph(
     df_edges: pd.DataFrame,
@@ -716,15 +752,9 @@ if st.session_state.get("__pending_upload_error"):
     st.error(st.session_state["__pending_upload_error"])
 
 with st.spinner("Calculating metrics..."):
-    met = GraphService.compute_metrics(
-        active_entry.edges,
-        active_entry.src_col,
-        active_entry.dst_col,
-        min_conf,
-        min_weight,
-        analysis_mode,
-        seed_val,
-        False,  # curvature отдельно
+    met = cached_calculate_metrics(
+        G_view,
+        int(seed_val),
         int(settings.RICCI_SAMPLE_EDGES),
     )
 
