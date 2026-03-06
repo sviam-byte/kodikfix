@@ -10,6 +10,14 @@ class SessionManager:
     """Управляет session_state (немного)."""
 
     def ensure_initialized(self) -> None:
+        # Версия UI-состояния для активного графа.
+        # Нужна, чтобы форсировать пересоздание некоторых streamlit-виджетов
+        # при переключении графа и не тащить "залипшие" значения.
+        if "__active_graph_ui_epoch" not in st.session_state:
+            st.session_state["__active_graph_ui_epoch"] = 0
+        if "__last_active_graph_id" not in st.session_state:
+            st.session_state["__last_active_graph_id"] = None
+
         if "graphs" not in st.session_state:
             st.session_state["graphs"] = {}
         if "active_graph_id" not in st.session_state:
@@ -24,12 +32,45 @@ class SessionManager:
         self.experiments = st.session_state["experiments"]
         self.wrappers = st.session_state["wrappers"]
 
-        self.trim_memory()  
+        if st.session_state.get("__last_active_graph_id") != self.active_graph_id:
+            st.session_state["__last_active_graph_id"] = self.active_graph_id
+            st.session_state["__active_graph_ui_epoch"] = int(
+                st.session_state.get("__active_graph_ui_epoch", 0)
+            ) + 1
+
+        self.trim_memory()
+
+    def _sync_core_state(self) -> None:
+        """Синхронизировать рабочие структуры менеджера со Streamlit session_state."""
+        st.session_state["graphs"] = self.graphs
+        st.session_state["active_graph_id"] = self.active_graph_id
+        st.session_state["experiments"] = self.experiments
+        st.session_state["wrappers"] = self.wrappers
+
+    def set_active_graph(self, graph_id: str | None) -> None:
+        """Установить активный граф и сбросить UI-виджеты, чувствительные к графу."""
+        self.active_graph_id = graph_id
+        st.session_state["active_graph_id"] = graph_id
+        if st.session_state.get("__last_active_graph_id") != graph_id:
+            st.session_state["__last_active_graph_id"] = graph_id
+            st.session_state["__active_graph_ui_epoch"] = int(
+                st.session_state.get("__active_graph_ui_epoch", 0)
+            ) + 1
+            # Эти ключи используются вкладкой Energy и должны очищаться
+            # при смене активного графа.
+            st.session_state.pop("energy_sources", None)
+            st.session_state.pop("src_select", None)
 
     def set_graph_entry(self, entry: GraphEntry) -> None:
         self.graphs[entry.id] = entry
-        st.session_state["graphs"] = self.graphs
+        self._sync_core_state()
         self.trim_memory()
+
+    def add_graph_entry(self, entry: GraphEntry, *, make_active: bool = True) -> None:
+        """Добавить граф в состояние и при необходимости сделать его активным."""
+        self.set_graph_entry(entry)
+        if make_active:
+            self.set_active_graph(entry.id)
 
     def drop_graph(self, graph_id: str) -> None:
         if graph_id in self.graphs:
@@ -39,13 +80,17 @@ class SessionManager:
             del self.wrappers[graph_id]
         if self.active_graph_id == graph_id:
             self.active_graph_id = next(iter(self.graphs.keys()), None)
-        st.session_state["graphs"] = self.graphs
-        st.session_state["active_graph_id"] = self.active_graph_id
-        st.session_state["wrappers"] = self.wrappers
+        self._sync_core_state()
+        st.session_state["__last_active_graph_id"] = self.active_graph_id
+        st.session_state["__active_graph_ui_epoch"] = int(
+            st.session_state.get("__active_graph_ui_epoch", 0)
+        ) + 1
+        st.session_state.pop("energy_sources", None)
+        st.session_state.pop("src_select", None)
 
     def add_experiment(self, exp) -> None:
         self.experiments.append(exp)
-        st.session_state["experiments"] = self.experiments
+        self._sync_core_state()
         self.trim_memory()
 
     def trim_memory(self) -> None:

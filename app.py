@@ -119,8 +119,7 @@ def add_graph_to_state(name, df, source, src, dst):
         dst_col=dst,
         entry_id=gid,
     )
-    ctx.set_graph_entry(entry)
-    ctx.active_graph_id = gid
+    ctx.add_graph_entry(entry, make_active=True)
     return gid
 
 
@@ -290,7 +289,9 @@ def _import_staged_mat_graphs(selected_idx: list[int] | None = None):
         added_ids.append(gid)
 
     if added_ids:
-        ctx.active_graph_id = added_ids[0]
+        # Делаем первый импортированный граф активным через API менеджера,
+        # чтобы синхронизировать session_state и UI epoch.
+        ctx.set_active_graph(added_ids[0])
     return added_ids
 
 
@@ -493,7 +494,7 @@ with st.sidebar:
                         st.session_state["graphs"] = gs
                         st.session_state["experiments"] = ex
                         if gs:
-                            ctx.active_graph_id = next(iter(gs.keys()))
+                            ctx.set_active_graph(next(iter(gs.keys())))
                         st.rerun()
                     except Exception as e:  # pylint: disable=broad-except
                         st.error(f"Workspace import error: {type(e).__name__}: {e}")
@@ -772,7 +773,7 @@ cur_gids = list(ctx.graphs.keys())
 cur_gid = ctx.active_graph_id
 if cur_gid not in cur_gids:
     cur_gid = cur_gids[0]
-    ctx.active_graph_id = cur_gid
+    ctx.set_active_graph(cur_gid)
 
 c1, c2 = st.columns([6, 1])
 with c1:
@@ -784,10 +785,11 @@ with c1:
         help="Выбери активный граф. Для MAT batch-формата здесь будут все субъекты.",
     )
     if sel != cur_gid:
-        ctx.active_graph_id = sel
+        ctx.set_active_graph(sel)
         st.rerun()
 
-active_entry = ctx.graphs[cur_gid]
+active_entry = ctx.graphs[ctx.active_graph_id]
+cur_gid = ctx.active_graph_id
 
 with c2:
     if st.button("❌ Del"):

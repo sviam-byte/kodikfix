@@ -21,6 +21,10 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         st.info("Сначала загрузите граф в сайдбаре (Load graph).")
         return
 
+    # Эпоха нужна для принудительного пересоздания ключей виджетов
+    # при смене активного графа (лечит "залипание" UI между графами).
+    ui_epoch = int(st.session_state.get("__active_graph_ui_epoch", 0))
+
     # --- БЛОК 1: МОДЕЛЬ И ИСТОЧНИКИ ---
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -29,6 +33,7 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
             "Тип распространения",
             ["phys", "rw", "evo"],
             help="Phys: давление/поток (как вода). RW: диффузия (как газ).",
+            key=f"energy_flow_mode_{active_entry.id}_{ui_epoch}",
         )
         rw_impulse = st.toggle("Импульсный режим (всплеск)", value=True)
 
@@ -39,7 +44,7 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         sources_ui = st.multiselect(
             "Источники (откуда течет)",
             options=list(G_view.nodes()),
-            default=st.session_state.get("energy_sources", []),
+            default=[x for x in st.session_state.get("energy_sources", []) if x in G_view.nodes()],
             key="src_select",
         )
         st.session_state["energy_sources"] = sources_ui
@@ -170,4 +175,8 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
 
         bar.progress(1.0)
         bar.empty(); stage.empty()
-        st.plotly_chart(fig_flow, use_container_width=True, key="plot_energy_flow")
+        st.plotly_chart(
+            fig_flow,
+            use_container_width=True,
+            key=f"plot_energy_flow_{active_entry.id}_{ui_epoch}",
+        )

@@ -19,6 +19,9 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
     if G_view is None:
         return
 
+    # Эпоха UI используется для reset ключей при смене активного графа.
+    ui_epoch = int(st.session_state.get("__active_graph_ui_epoch", 0))
+
     if G_view.number_of_nodes() > 1500:
         st.warning("⚠️ Граф большой. Тяжелые метрики (Ricci, Efficiency) считаются в фоновом режиме.")
     col_vis_ctrl, col_vis_main = st.columns([1, 4])
@@ -35,7 +38,11 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
 
     with col_vis_ctrl:
         st.subheader("Настройки 3D")
-        show_labels = st.checkbox("Показать ID узлов", False)
+        show_labels = st.checkbox(
+            "Показать ID узлов",
+            False,
+            key=f"struct_labels_{active_entry.id}_{ui_epoch}",
+        )
         node_size = st.slider("Размер узлов", 1, 20, 4)
         max_nodes_viz = st.slider("Макс. узлов (виз)", 500, 20000, 6000, step=500)
         # 20k edges перегружают браузер; 2.5k держат FPS комфортным.
@@ -159,7 +166,11 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
                     zaxis=dict(showbackground=False, showticklabels=False, title=""),
                 ),
             )
-            st.plotly_chart(fig_3d, use_container_width=True, key="plot_struct_3d")
+            st.plotly_chart(
+                fig_3d,
+                use_container_width=True,
+                key=f"plot_struct_3d_{active_entry.id}_{ui_epoch}",
+            )
         else:
             st.write("Граф пуст.")
 
