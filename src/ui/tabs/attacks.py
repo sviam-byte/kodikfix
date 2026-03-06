@@ -169,6 +169,20 @@ def _mixfrac_result_to_history(res: dict) -> pd.DataFrame:
         ]
     )
 
+
+def _live_history_preview(max_rows: int = 12):
+    """Build a tiny live table that shows the latest attack-trajectory rows."""
+    holder = st.empty()
+    rows: list[dict] = []
+
+    def _row_cb(row: dict, i: int, total: int) -> None:
+        _ = (i, total)  # kept for signature compatibility with attack callbacks
+        rows.append(dict(row))
+        df = pd.DataFrame(rows[-max_rows:])
+        holder.dataframe(df, use_container_width=True, height=260)
+
+    return holder, _row_cb
+
 def _extract_removed_order(aux):
     if isinstance(aux, dict):
         for k in ["removed_nodes", "removed_order", "order", "removal_order", "removed"]:
@@ -402,6 +416,8 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     with st.spinner(f"Mix attack: {kind}"):
                         bar = st.progress(0.0)
                         msg = st.empty()
+                        st.caption("Промежуточные шаги")
+                        preview_holder, row_cb = _live_history_preview()
 
                         def _cb(i, total, x=None):
                             frac_ = 0.0 if total <= 0 else min(1.0, max(0.0, i / total))
@@ -421,9 +437,11 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                             swaps_per_edge=float(swaps_per_edge),
                             replace_from=str(replace_from),
                             progress_cb=_cb,
+                            row_cb=row_cb,
                             fast_mode=fast_mode,
                         )
                         bar.empty(); msg.empty()
+                        preview_holder.empty()
                         df_hist = _forward_fill_heavy(df_hist)
                         phase_info = classify_phase_transition(
                             df_hist.rename(columns={"mix_frac": "removed_frac"})
@@ -456,6 +474,8 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         # TODO: stabilize the progress indicator updates in Streamlit.
                         bar = st.progress(0.0)
                         msg = st.empty()
+                        st.caption("Промежуточные шаги")
+                        preview_holder, row_cb = _live_history_preview()
 
                         def _cb(i, total, k=None):
                             frac_ = 0.0 if total <= 0 else min(1.0, max(0.0, i / total))
@@ -468,8 +488,10 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                             rc_frac=0.1, compute_heavy_every=int(heavy_freq),
                             fast_mode=bool(fast_mode),
                             progress_cb=_cb,
+                            row_cb=row_cb,
                         )
                         bar.empty(); msg.empty()
+                        preview_holder.empty()
                         df_hist = _forward_fill_heavy(df_hist)
                         removed_order = _extract_removed_order(aux) or _fallback_removal_order(G_view, kind, int(seed_run))
                         phase_info = classify_phase_transition(df_hist)
@@ -502,6 +524,8 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     with st.spinner(f"Edge attack: {kind}"):
                         bar = st.progress(0.0)
                         msg = st.empty()
+                        st.caption("Промежуточные шаги")
+                        preview_holder, row_cb = _live_history_preview()
 
                         def _cb(i, total, k=None):
                             # i=0..total; на больших графах это прям спасает психику
@@ -517,8 +541,10 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                             curvature_sample_edges=int(st.session_state.get("__curvature_sample_edges", 80)),
                             fast_mode=bool(fast_mode),
                             progress_cb=_cb,
+                            row_cb=row_cb,
                         )
                         bar.empty(); msg.empty()
+                        preview_holder.empty()
                         df_hist = _forward_fill_heavy(df_hist)
                         phase_info = classify_phase_transition(df_hist)
 

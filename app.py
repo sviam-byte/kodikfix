@@ -141,6 +141,30 @@ def save_experiment_to_state(name, gid, kind, params, df_hist):
     return eid
 
 
+def _export_progress_ui(prefix: str = "stats"):
+    """Create a compact progress UI bundle for long-running export jobs."""
+    bar = st.progress(0.0)
+    msg = st.empty()
+
+    def _cb(done: int, total: int, label: str) -> None:
+        total_ = max(1, int(total))
+        frac = min(1.0, max(0.0, float(done) / float(total_)))
+        bar.progress(frac)
+        if label == "done":
+            msg.caption("Экспорт завершён")
+        else:
+            msg.caption(f"{prefix}: {done}/{total_} · {label}")
+
+    return bar, msg, _cb
+
+
+def _stats_export_selection(export_scope: str, active_gid: str | None) -> list[str] | None:
+    """Resolve export scope to graph id list; None means export all graphs."""
+    if export_scope == "Active graph only" and active_gid:
+        return [active_gid]
+    return None
+
+
 def _packed_edge_count_to_n(m: int) -> int:
     """Восстановить число узлов n из packed-edge размера m=n*(n-1)/2."""
     if m <= 0:
@@ -683,45 +707,91 @@ with st.sidebar:
     st.caption("Tidy tables for p-value / regression / mixed models")
 
     stats_eff_k = int(st.number_input("Stats eff_k", min_value=4, max_value=512, value=32, step=4))
-    stats_do_curv = st.checkbox("Include curvature in subject_metrics", value=True)
+    stats_do_curv = st.checkbox("Include curvature in subject_metrics", value=False)
+    stats_scope = st.radio("Что экспортировать", ["Active graph only", "All graphs"], horizontal=False, index=0)
+    stats_lightweight = st.checkbox("Fast export (light metrics)", value=True)
 
-    stats_zip = export_stats_zip_bytes(
-        ctx.graphs,
-        ctx.experiments,
-        min_conf=float(min_conf),
-        min_weight=float(min_weight),
-        analysis_mode=str(analysis_mode),
-        eff_sources_k=int(stats_eff_k),
-        seed=int(seed_val),
-        compute_curvature=bool(stats_do_curv),
-        curvature_sample_edges=int(curv_n),
-    )
-    st.download_button(
-        "Stats ZIP (CSV)",
-        data=stats_zip,
-        file_name="stats_tables.zip",
-        mime="application/zip",
-        use_container_width=True,
+    if "__stats_export_cache" not in st.session_state:
+        st.session_state["__stats_export_cache"] = {}
+
+    export_graph_ids = _stats_export_selection(stats_scope, cur_gid)
+    export_key_base = (
+        tuple(export_graph_ids) if export_graph_ids is not None else ("__all__",),
+        float(min_conf),
+        float(min_weight),
+        str(analysis_mode),
+        int(stats_eff_k),
+        int(seed_val),
+        bool(stats_do_curv),
+        int(curv_n),
+        bool(stats_lightweight),
+        len(ctx.experiments),
     )
 
-    stats_xlsx = export_stats_xlsx_bytes(
-        ctx.graphs,
-        ctx.experiments,
-        min_conf=float(min_conf),
-        min_weight=float(min_weight),
-        analysis_mode=str(analysis_mode),
-        eff_sources_k=int(stats_eff_k),
-        seed=int(seed_val),
-        compute_curvature=bool(stats_do_curv),
-        curvature_sample_edges=int(curv_n),
-    )
-    st.download_button(
-        "Stats XLSX",
-        data=stats_xlsx,
-        file_name="stats_tables.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    b_zip, b_xlsx = st.columns(2)
+    if b_zip.button("Prepare ZIP", use_container_width=True):
+        bar, msg, cb = _export_progress_ui("ZIP")
+        try:
+            payload = export_stats_zip_bytes(
+                ctx.graphs,
+                ctx.experiments,
+                min_conf=float(min_conf),
+                min_weight=float(min_weight),
+                analysis_mode=str(analysis_mode),
+                eff_sources_k=int(stats_eff_k),
+                seed=int(seed_val),
+                compute_curvature=bool(stats_do_curv),
+                curvature_sample_edges=int(curv_n),
+                graph_ids=export_graph_ids,
+                progress_cb=cb,
+                lightweight=bool(stats_lightweight),
+            )
+            st.session_state["__stats_export_cache"][("zip", export_key_base)] = payload
+        finally:
+            bar.empty()
+            msg.empty()
+
+    if b_xlsx.button("Prepare XLSX", use_container_width=True):
+        bar, msg, cb = _export_progress_ui("XLSX")
+        try:
+            payload = export_stats_xlsx_bytes(
+                ctx.graphs,
+                ctx.experiments,
+                min_conf=float(min_conf),
+                min_weight=float(min_weight),
+                analysis_mode=str(analysis_mode),
+                eff_sources_k=int(stats_eff_k),
+                seed=int(seed_val),
+                compute_curvature=bool(stats_do_curv),
+                curvature_sample_edges=int(curv_n),
+                graph_ids=export_graph_ids,
+                progress_cb=cb,
+                lightweight=bool(stats_lightweight),
+            )
+            st.session_state["__stats_export_cache"][("xlsx", export_key_base)] = payload
+        finally:
+            bar.empty()
+            msg.empty()
+
+    zip_payload = st.session_state["__stats_export_cache"].get(("zip", export_key_base))
+    if zip_payload is not None:
+        st.download_button(
+            "Stats ZIP (CSV)",
+            data=zip_payload,
+            file_name="stats_tables.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    xlsx_payload = st.session_state["__stats_export_cache"].get(("xlsx", export_key_base))
+    if xlsx_payload is not None:
+        st.download_button(
+            "Stats XLSX",
+            data=xlsx_payload,
+            file_name="stats_tables.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
     # DEBUG: если совсем странно
     # st.write(active_entry.edges.head(5))
