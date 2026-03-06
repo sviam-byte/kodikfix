@@ -47,8 +47,24 @@ def _hash_graph(G: nx.Graph) -> str:
 
 @st.cache_data(show_spinner=False, hash_funcs={nx.Graph: _hash_graph})
 def _cached_betweenness(G: nx.Graph) -> dict:
-    """Cached betweenness centrality (costly on large graphs)."""
-    return nx.betweenness_centrality(G, normalized=True)
+    """Cached betweenness centrality with approximation on large graphs."""
+    n = G.number_of_nodes()
+    if n <= 250:
+        return nx.betweenness_centrality(G, normalized=True)
+
+    # Для больших графов используем сэмплирование source-узлов (k),
+    # чтобы удержать время расчета в интерактивных пределах.
+    if n <= 1000:
+        k = min(64, n)
+    else:
+        k = min(32, n)
+
+    return nx.betweenness_centrality(
+        G,
+        normalized=True,
+        k=k,
+        seed=42,
+    )
 
 # Загружаем справку по метрикам один раз на модуль.
 _info = load_metrics_info()
