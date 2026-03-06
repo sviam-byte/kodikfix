@@ -131,6 +131,28 @@ def _guess_hc_like_graph_ids(graphs: dict, active_graph_id: str | None) -> list[
             hc_ids.append(gid)
     return hc_ids
 
+
+def _mixfrac_result_to_history(res: dict) -> pd.DataFrame:
+    """Преобразовать результат mix_frac* в одно-строчную history-таблицу эксперимента."""
+    vals = [float(v) for v in res.get("mix_frac_values", []) if np.isfinite(v)]
+    dists = [float(v) for v in res.get("distances", []) if np.isfinite(v)]
+    return pd.DataFrame(
+        [
+            {
+                "mix_frac_star": float(res.get("mix_frac_star", np.nan)),
+                "ci_low": float(res.get("ci_low", np.nan)),
+                "ci_high": float(res.get("ci_high", np.nan)),
+                "distance_median": float(res.get("distance_median", np.nan)),
+                "distance_mean": float(np.mean(dists)) if dists else float("nan"),
+                "healthy_n": int(res.get("healthy_n", 0)),
+                "match_mode": str(res.get("match_mode", "")),
+                "replace_from": str(res.get("replace_from", "")),
+                "used_metrics": ",".join([str(x) for x in res.get("used_metrics", [])]),
+                "mix_frac_values_n": int(len(vals)),
+            }
+        ]
+    )
+
 def _extract_removed_order(aux):
     if isinstance(aux, dict):
         for k in ["removed_nodes", "removed_order", "order", "removal_order", "removed"]:
@@ -510,6 +532,33 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
     st.markdown("## Последний результат (для текущего графа)")
 
     exps_here = [e for e in st.session_state["experiments"] if e.graph_id == active_entry.id]
+    mixfrac_here = [
+        e for e in exps_here
+        if (e.params or {}).get("attack_family") == "mixfrac"
+    ]
+    if mixfrac_here:
+        mixfrac_here.sort(key=lambda x: x.created_at, reverse=True)
+        last_mixfrac = mixfrac_here[0]
+        mp = last_mixfrac.params or {}
+        with st.expander("Последний сохранённый mix_frac*", expanded=False):
+            st.write(
+                {
+                    "mix_frac_star": mp.get("mix_frac_star"),
+                    "ci_low": mp.get("ci_low"),
+                    "ci_high": mp.get("ci_high"),
+                    "distance_median": mp.get("distance_median"),
+                    "replace_from": mp.get("replace_from"),
+                    "healthy_n": mp.get("healthy_n"),
+                    "used_metrics": mp.get("used_metrics", []),
+                    "match_mode": mp.get("match_mode"),
+                }
+            )
+
+    # Визуализация "Последний результат" работает только по стандартным атакам.
+    exps_here = [
+        e for e in exps_here
+        if (e.params or {}).get("attack_family") in {"node", "edge", "mix"}
+    ]
     if not exps_here:
         st.info("Нет экспериментов. Запусти сверху.")
     else:
@@ -826,11 +875,17 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             mf_seed = st.number_input("Seed (mix_frac*)", value=int(seed_val), step=1, key="mixfrac_seed")
             mf_n_boot = st.slider("Bootstrap n", 100, 5000, 1000, 100, key="mixfrac_n_boot")
 
-            run_mixfrac = st.button(
-                "🧭 Estimate mix_frac*",
+            mf_btn1, mf_btn2 = st.columns(2)
+            run_mixfrac = mf_btn1.button(
+                "🧭 Estimate",
                 type="primary",
                 use_container_width=True,
                 key="mixfrac_run",
+            )
+            save_mixfrac = mf_btn2.button(
+                "💾 Save result",
+                use_container_width=True,
+                key="mixfrac_save",
             )
 
     with mf_col2:
@@ -855,6 +910,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     "used_metrics": mixfrac_res.get("used_metrics", []),
                     "replace_from": mixfrac_res.get("replace_from"),
                     "healthy_n": mixfrac_res.get("healthy_n"),
+                    "skipped_graphs": mixfrac_res.get("skipped_graphs", []),
                 }
             )
 
@@ -869,6 +925,25 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     }
                 )
                 st.dataframe(df_show, use_container_width=True)
+
+                fig_vals = px.histogram(
+                    df_show,
+                    x="mix_frac_value",
+                    nbins=min(20, max(5, len(df_show))),
+                    title="Distribution of mix_frac values",
+                )
+                fig_vals.update_layout(template="plotly_dark")
+                st.plotly_chart(fig_vals, use_container_width=True, key="mixfrac_hist_vals")
+
+                if np.isfinite(df_show["distance"]).any():
+                    fig_dist = px.histogram(
+                        df_show,
+                        x="distance",
+                        nbins=min(20, max(5, len(df_show))),
+                        title="Distribution of matching distances",
+                    )
+                    fig_dist.update_layout(template="plotly_dark")
+                    st.plotly_chart(fig_dist, use_container_width=True, key="mixfrac_hist_dist")
         else:
             st.info("Выбери healthy-графы и запусти оценку.")
 
@@ -939,6 +1014,37 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     st.session_state["__mix_frac_star_result"] = res
                     st.success("mix_frac* посчитан.")
                     st.rerun()
+
+    if save_mixfrac:
+        mixfrac_res = st.session_state.get("__mix_frac_star_result")
+        if not mixfrac_res:
+            st.error("Сначала посчитай mix_frac*.")
+        else:
+            label = (
+                f"{active_entry.name} | mix_frac* | "
+                f"{mixfrac_res.get('match_mode', 'nearest')} | "
+                f"{mixfrac_res.get('replace_from', 'CFG')}"
+            )
+            _save_experiment(
+                name=label,
+                graph_id=active_entry.id,
+                kind="mix_frac_estimate",
+                params={
+                    "attack_family": "mixfrac",
+                    "mix_frac_star": float(mixfrac_res.get("mix_frac_star", np.nan)),
+                    "ci_low": float(mixfrac_res.get("ci_low", np.nan)),
+                    "ci_high": float(mixfrac_res.get("ci_high", np.nan)),
+                    "distance_median": float(mixfrac_res.get("distance_median", np.nan)),
+                    "replace_from": str(mixfrac_res.get("replace_from", "")),
+                    "healthy_n": int(mixfrac_res.get("healthy_n", 0)),
+                    "used_metrics": list(mixfrac_res.get("used_metrics", [])),
+                    "match_mode": str(mixfrac_res.get("match_mode", "")),
+                    "skipped_graphs": list(mixfrac_res.get("skipped_graphs", [])),
+                },
+                df_hist=_mixfrac_result_to_history(mixfrac_res),
+            )
+            st.success("mix_frac* result saved to experiments.")
+            st.rerun()
 
     # --------------------------
     # PRESET BATCH (same graph)

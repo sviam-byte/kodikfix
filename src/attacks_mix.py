@@ -94,8 +94,13 @@ def run_mix_attack(
     beta_replace: float = 0.4,
     swaps_per_edge: float = 0.5,
     replace_from: str = "ER",
+    fast_mode: bool = False,
     progress_cb=None,
 ):
+
+    # fast_mode пока оставлен для API-совместимости с UI/CLI.
+    # В текущей реализации run_mix_attack режим не меняет вычисления.
+    _ = fast_mode
 
     rng = np.random.default_rng(int(seed))
     H0 = as_simple_undirected(G)
