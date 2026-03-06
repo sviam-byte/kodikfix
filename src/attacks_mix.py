@@ -70,12 +70,18 @@ def _replace_edges_from_source(
 
     added = 0
     tries = 0
+    consecutive_fails = 0
     max_tries = max(1000, 20 * k_replace)
+    fail_limit = max(200, 5 * k_replace)
     while added < k_replace and tries < max_tries:
         tries += 1
         u, v = source_edges[int(rng.integers(0, len(source_edges)))]
         if u == v or H.has_edge(u, v):
+            consecutive_fails += 1
+            if consecutive_fails >= fail_limit:
+                break
             continue
+        consecutive_fails = 0
         attrs = _sample_edge_attrs_from_empirical(rng, attrs_pool)
         H.add_edge(u, v, **attrs)
         added += 1
@@ -184,11 +190,18 @@ def run_mix_attack(
                 total_swaps_done += swaps_done_step
                 total_replaced_done += replaced_done_step
 
+        # На light-шагах считаем только базовые метрики, чтобы ускорить длинные кривые.
+        skip_light = not heavy
         m = calculate_metrics(
             H,
             eff_sources_k=int(eff_sources_k),
             seed=int(seed),
             compute_curvature=False,
+            compute_heavy=heavy,
+            skip_spectral=skip_light,
+            skip_clustering=skip_light,
+            skip_assortativity=skip_light,
+            diameter_samples=16 if heavy else 6,
         )
 
         mix_frac_effective = float(total_replaced_done) / float(max(1, M))

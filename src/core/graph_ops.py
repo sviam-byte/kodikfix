@@ -209,6 +209,12 @@ def calculate_metrics(
     is_heavy = kwargs.get("compute_heavy", True)
     if not is_heavy:
         compute_curvature = False
+
+    # Тонкая настройка «лёгких» шагов для атак/батча без поломки API.
+    skip_clustering = bool(kwargs.get("skip_clustering", not is_heavy))
+    skip_assortativity = bool(kwargs.get("skip_assortativity", not is_heavy))
+    diameter_samples = int(kwargs.get("diameter_samples", 16 if is_heavy else 6))
+    ricci_n_jobs = kwargs.get("ricci_n_jobs", None)
     if N > 0:
         C = (
             nx.number_connected_components(G)
@@ -248,9 +254,17 @@ def calculate_metrics(
         eff_w = float("nan")
 
     ent = degree_entropy(G)
-    assort = nx.degree_assortativity_coefficient(G) if N > 2 and E > 0 else 0.0
-    clust = nx.average_clustering(H_u) if N > 2 and E > 0 else 0.0
-    diam = approx_diameter_lcc(G, seed=seed, samples=16)
+    assort = (
+        nx.degree_assortativity_coefficient(G)
+        if (N > 2 and E > 0 and not skip_assortativity)
+        else float("nan")
+    )
+    clust = (
+        nx.average_clustering(H_u)
+        if (N > 2 and E > 0 and not skip_clustering)
+        else float("nan")
+    )
+    diam = approx_diameter_lcc(G, seed=seed, samples=diameter_samples)
 
     beta = int(E - N + C) if N > 0 else 0
 
@@ -302,6 +316,7 @@ def calculate_metrics(
             max_support=curvature_max_support,
             cutoff=curvature_cutoff,
             progress_cb=_progress_cb if progress_cb is not None else None,
+            n_jobs=ricci_n_jobs,
         )
         kappa_mean = float(curv.kappa_mean)
         kappa_median = float(curv.kappa_median)

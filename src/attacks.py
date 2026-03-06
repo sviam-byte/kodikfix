@@ -389,6 +389,7 @@ def run_edge_attack(
         heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == steps)
 
         is_really_heavy_step = (i == 0) or (i == len(ks) - 1)
+        is_light_step = not heavy
         skip_spectral = (H.number_of_nodes() > 500) and not is_really_heavy_step
 
         metrics = calculate_metrics(
@@ -398,6 +399,10 @@ def run_edge_attack(
             compute_curvature=bool(compute_curvature and heavy),
             curvature_sample_edges=int(curvature_sample_edges),
             skip_spectral=skip_spectral,
+            compute_heavy=heavy,
+            skip_clustering=is_light_step,
+            skip_assortativity=is_light_step,
+            diameter_samples=16 if heavy else 6,
         )
 
         row = {
