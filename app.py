@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -116,6 +118,89 @@ def save_experiment_to_state(name, gid, kind, params, df_hist):
     return eid
 
 
+def _packed_edge_count_to_n(m: int) -> int:
+    """Восстановить число узлов n из packed-edge размера m=n*(n-1)/2."""
+    if m <= 0:
+        raise ValueError("Число packed-edge признаков должно быть > 0")
+
+    disc = 1 + 8 * int(m)
+    root = int(math.isqrt(disc))
+    if root * root != disc:
+        raise ValueError(
+            f"Число столбцов {m} не похоже на верхний треугольник матрицы: "
+            "m должно быть равно n*(n-1)/2"
+        )
+
+    n = (1 + root) // 2
+    if n * (n - 1) // 2 != m:
+        raise ValueError(f"Число столбцов {m} не раскладывается как n*(n-1)/2")
+    return int(n)
+
+
+def _mat_obj_to_subject_names(obj: np.ndarray, n_rows: int) -> list[str]:
+    """Преобразовать MATLAB object-array `subj_id` в список строковых имён."""
+    flat = np.asarray(obj, dtype=object).ravel().tolist()
+    out: list[str] = []
+    for x in flat:
+        if isinstance(x, np.ndarray):
+            if x.size == 1:
+                out.append(str(x.item()))
+            else:
+                out.append(" ".join(map(str, x.ravel().tolist())))
+        else:
+            out.append(str(x))
+
+    if len(out) < n_rows:
+        out.extend([f"subject_{i:03d}" for i in range(len(out), n_rows)])
+    return out[:n_rows]
+
+
+@st.cache_data(show_spinner=False)
+def cached_load_packed_mat_graphs(file_bytes: bytes, filename: str) -> list[tuple[str, pd.DataFrame]]:
+    """
+    Загрузить MAT-файл формата:
+      - data: (subjects, packed_edges)
+      - subj_id: optional subject ids
+
+    где packed_edges = n*(n-1)/2 (верхний треугольник без диагонали).
+    """
+    _ = filename  # участвует в ключе cache_data и не используется в логике ниже.
+    from scipy.io import loadmat
+
+    mat = loadmat(io.BytesIO(file_bytes))
+    if "data" not in mat:
+        raise ValueError("В .mat не найден ключ 'data'")
+
+    X = np.asarray(mat["data"], dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"'data' в .mat должна быть 2D, получено: ndim={X.ndim}")
+
+    n_subjects, m = X.shape
+    n_nodes = _packed_edge_count_to_n(int(m))
+    iu, ju = np.triu_indices(n_nodes, k=1)
+
+    if "subj_id" in mat:
+        subj_names = _mat_obj_to_subject_names(mat["subj_id"], n_subjects)
+    else:
+        subj_names = [f"subject_{i:03d}" for i in range(n_subjects)]
+
+    graphs: list[tuple[str, pd.DataFrame]] = []
+    for i in range(n_subjects):
+        row = np.asarray(X[i], dtype=float).ravel()
+        keep = np.isfinite(row)
+        df = pd.DataFrame(
+            {
+                "src": iu[keep].astype(int),
+                "dst": ju[keep].astype(int),
+                "weight": row[keep].astype(float),
+                "confidence": np.full(int(np.sum(keep)), 100.0, dtype=float),
+            }
+        )
+        graphs.append((subj_names[i], df))
+
+    return graphs
+
+
 @st.cache_data(show_spinner=False)
 def cached_load_edges(file_bytes: bytes, filename: str, fixed: bool) -> tuple[pd.DataFrame, dict | None]:
     """Загрузить таблицу рёбер с кэшем (ускоряет переключение вкладок)."""
@@ -185,7 +270,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📂 Данные")
 
-    uploaded_file = st.file_uploader("CSV / Excel", type=["csv", "xlsx", "xls"], key="up_data")
+    uploaded_file = st.file_uploader("CSV / Excel / MAT", type=["csv", "xlsx", "xls", "mat"], key="up_data")
 
     if uploaded_file:
         raw_bytes = uploaded_file.getvalue()
@@ -193,6 +278,37 @@ with st.sidebar:
 
         if file_hash != st.session_state.get("last_upload_hash"):
             st.session_state["last_upload_hash"] = file_hash
+
+            if uploaded_file.name.lower().endswith(".mat"):
+                try:
+                    packed_graphs = cached_load_packed_mat_graphs(raw_bytes, uploaded_file.name)
+                    if not packed_graphs:
+                        raise ValueError("MAT-файл прочитан, но графы не извлечены")
+
+                    added_ids = []
+                    base = Path(uploaded_file.name).stem
+                    for subj_name, df_edges in packed_graphs:
+                        gid = add_graph_to_state(
+                            f"{base} :: {subj_name}",
+                            df_edges,
+                            "mat-upload",
+                            "src",
+                            "dst",
+                        )
+                        added_ids.append(gid)
+
+                    if added_ids:
+                        ctx.active_graph_id = added_ids[0]
+
+                    st.session_state["__upload_status"] = (
+                        f"Импортировано {len(added_ids)} графов из {uploaded_file.name} "
+                        f"(packed upper-triangle MAT format)."
+                    )
+                    st.session_state.pop("__pending_upload_error", None)
+                    st.rerun()
+                except Exception as e:
+                    st.session_state["__pending_upload_error"] = f"MAT import error: {e}"
+                st.stop()
 
             try:
                 df_raw, _ = cached_load_edges(raw_bytes, uploaded_file.name, fixed=False)
@@ -359,13 +475,14 @@ if cur_gid not in cur_gids:
     cur_gid = cur_gids[0]
     ctx.active_graph_id = cur_gid
 
-c1, c2, c3 = st.columns([3, 1, 1])
+c1, c2 = st.columns([6, 1])
 with c1:
     sel = st.selectbox(
         "Активный граф",
         cur_gids,
         index=cur_gids.index(cur_gid),
         format_func=lambda x: f"{ctx.graphs[x].name} ({ctx.graphs[x].source})",
+        help="Выбери активный граф. Для MAT batch-формата здесь будут все субъекты.",
     )
     if sel != cur_gid:
         ctx.active_graph_id = sel
@@ -373,7 +490,7 @@ with c1:
 
 active_entry = ctx.graphs[cur_gid]
 
-with c3:
+with c2:
     if st.button("❌ Del"):
         ctx.drop_graph(cur_gid)
         st.rerun()
@@ -460,6 +577,13 @@ G_full = cached_build_graph(
     "Global",
 )
 
+if st.session_state.get("__upload_status"):
+    st.success(st.session_state["__upload_status"])
+    st.session_state.pop("__upload_status", None)
+
+if st.session_state.get("__pending_upload_error"):
+    st.error(st.session_state["__pending_upload_error"])
+
 with st.spinner("Calculating metrics..."):
     met = GraphService.compute_metrics(
         active_entry.edges,
@@ -472,6 +596,28 @@ with st.spinner("Calculating metrics..."):
         False,  # curvature отдельно
         int(settings.RICCI_SAMPLE_EDGES),
     )
+
+with st.container(border=True):
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Nodes", G_view.number_of_nodes())
+    p2.metric("Edges", G_view.number_of_edges())
+    p3.metric("Mode", analysis_mode)
+    p4.metric("Ricci edges", curv_n)
+
+    if G_view.number_of_nodes() == 0:
+        st.error(
+            "После фильтров граф пустой. "
+            "Уменьши Min Confidence / Min Weight или проверь входные данные."
+        )
+    else:
+        st.info(
+            "Базовые метрики уже посчитаны ниже автоматически. "
+            "Ricci-кривизна считается отдельно кнопкой слева: 'Compute Ricci (slow)'."
+        )
+        st.success(
+            f"Граф собран: {G_view.number_of_nodes()} узлов, "
+            f"{G_view.number_of_edges()} рёбер. Базовые метрики готовы."
+        )
 
 # Ricci отдельно, с прогрессом + свой кэш
 ricci_key = (cur_gid, analysis_mode, float(min_conf), float(min_weight), int(seed_val), int(curv_n))
@@ -511,30 +657,27 @@ if ricci_key in st.session_state["__ricci_cache"]:
     )
 
 
+st.markdown("---")
+
 # ============================================================
 # 7) TABS ROUTER
 # ============================================================
-tab_names = ["📊 Дэшборд", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"]
-current_tab = st.radio("Разделы", tab_names, horizontal=True, label_visibility="collapsed")
+tabs = st.tabs(["📊 Дэшборд", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"])
 
-st.markdown("---")
-
-if current_tab == tab_names[0]:
+with tabs[0]:
     tab_dashboard.render(G_view, met, active_entry)
 
-elif current_tab == tab_names[1]:
+with tabs[1]:
     tab_energy.render(
         G_view,
         active_entry,
         seed_val,
         active_entry.src_col,
         active_entry.dst_col,
-        min_conf,
-        min_weight,
-        analysis_mode,
+        min_conf, min_weight, analysis_mode,
     )
 
-elif current_tab == tab_names[2]:
+with tabs[2]:
     tab_structure.render(
         G_view,
         active_entry,
@@ -546,7 +689,7 @@ elif current_tab == tab_names[2]:
         analysis_mode,
     )
 
-elif current_tab == tab_names[3]:
+with tabs[3]:
     tab_attacks.render_null_models(
         G_view,
         G_full,
@@ -556,7 +699,7 @@ elif current_tab == tab_names[3]:
         add_graph_callback=add_graph_to_state,
     )
 
-elif current_tab == tab_names[4]:
+with tabs[4]:
     tab_attacks.render_attack_lab(
         G_view,
         active_entry,
@@ -569,7 +712,7 @@ elif current_tab == tab_names[4]:
         save_experiment_callback=save_experiment_to_state,
     )
 
-elif current_tab == tab_names[5]:
+with tabs[5]:
     tab_compare.render(
         G_view,
         active_entry,

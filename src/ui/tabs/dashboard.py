@@ -61,6 +61,12 @@ def render(G_view: nx.Graph | None, met: dict, active_entry: GraphEntry) -> None
 
     st.header(f"Обзор: {active_entry.name}")
 
+    if G_view.number_of_nodes() == 0:
+        st.error("Граф пуст. Проверь фильтры и входные данные.")
+        return
+
+    st.caption("Здесь показаны базовые метрики графа. Ricci — отдельный блок и считается по кнопке слева.")
+
     if G_view.number_of_nodes() > 1500:
         st.warning("⚠️ Граф большой. Тяжелые метрики считаются отдельно и могут быть медленными.")
 
