@@ -351,6 +351,102 @@ def cached_calculate_metrics(
     )
 
 
+def _normalize_ricci_payload(payload: dict | None) -> dict:
+    """Convert rich Ricci payload into flat dashboard metric keys."""
+    if not payload:
+        return {}
+    summary = dict(payload.get("summary", {}) or {})
+    return {
+        "kappa_mean": summary.get("kappa_mean"),
+        "kappa_median": summary.get("kappa_median"),
+        "kappa_frac_negative": summary.get("kappa_frac_negative"),
+        "kappa_computed_edges": summary.get("computed_edges"),
+        "kappa_skipped_edges": summary.get("skipped_edges"),
+        "fragility_kappa": payload.get("fragility"),
+    }
+
+
+def _run_article_plan(
+    G_view: nx.Graph,
+    *,
+    cur_gid: str,
+    analysis_mode: str,
+    min_conf: float,
+    min_weight: float,
+    seed_val: int,
+    curv_n: int,
+    stats_do_curv: bool,
+    stats_lightweight: bool,
+    export_graph_ids: list[str] | None,
+    export_key_base,
+) -> None:
+    """Run a single-click pipeline for article-ready metrics and exports."""
+    prog = st.progress(0.0)
+    msg = st.empty()
+
+    def _set(frac: float, text: str) -> None:
+        prog.progress(min(1.0, max(0.0, float(frac))))
+        msg.caption(text)
+
+    metrics_key = (
+        cur_gid,
+        analysis_mode,
+        float(min_conf),
+        float(min_weight),
+        int(seed_val),
+    )
+    ricci_key = (cur_gid, analysis_mode, float(min_conf), float(min_weight), int(seed_val), int(curv_n))
+
+    _set(0.02, "План: базовые метрики")
+    base = cached_calculate_metrics(G_view, int(seed_val), int(settings.RICCI_SAMPLE_EDGES))
+    st.session_state.setdefault("__base_metrics_cache", {})[metrics_key] = base
+
+    _set(0.18, f"План: Ricci ({int(curv_n)} edges)")
+    ricci = GraphService.compute_ricci_progress(
+        G_view,
+        sample_edges=curv_n,
+        seed=seed_val,
+        progress_cb=lambda frac: _set(0.18 + 0.32 * float(frac), f"Ricci: {int(round(100 * frac))}%"),
+        status_cb=lambda text: _set(0.18 + 0.32 * 0.999, text),
+    )
+    st.session_state.setdefault("__ricci_cache", {})[ricci_key] = ricci
+
+    _set(0.55, "План: готовлю ZIP для статьи")
+    zip_payload = export_stats_zip_bytes(
+        ctx.graphs,
+        ctx.experiments,
+        min_conf=float(min_conf),
+        min_weight=float(min_weight),
+        analysis_mode=str(analysis_mode),
+        eff_sources_k=int(settings.APPROX_EFFICIENCY_K),
+        seed=int(seed_val),
+        compute_curvature=bool(stats_do_curv),
+        curvature_sample_edges=int(curv_n),
+        graph_ids=export_graph_ids,
+        progress_cb=lambda done, total, label: _set(0.55 + 0.20 * (float(done) / max(1.0, float(total))), f"ZIP: {label}"),
+        lightweight=bool(stats_lightweight),
+    )
+    st.session_state.setdefault("__stats_export_cache", {})[("zip", export_key_base)] = zip_payload
+
+    _set(0.77, "План: готовлю XLSX для статьи")
+    xlsx_payload = export_stats_xlsx_bytes(
+        ctx.graphs,
+        ctx.experiments,
+        min_conf=float(min_conf),
+        min_weight=float(min_weight),
+        analysis_mode=str(analysis_mode),
+        eff_sources_k=int(settings.APPROX_EFFICIENCY_K),
+        seed=int(seed_val),
+        compute_curvature=bool(stats_do_curv),
+        curvature_sample_edges=int(curv_n),
+        graph_ids=export_graph_ids,
+        progress_cb=lambda done, total, label: _set(0.77 + 0.20 * (float(done) / max(1.0, float(total))), f"XLSX: {label}"),
+        lightweight=bool(stats_lightweight),
+    )
+    st.session_state.setdefault("__stats_export_cache", {})[("xlsx", export_key_base)] = xlsx_payload
+    _set(1.0, "План завершён")
+
+
 @st.cache_resource(show_spinner=False)
 def cached_build_graph(
     df_edges: pd.DataFrame,
@@ -729,6 +825,8 @@ with st.sidebar:
     export_graph_ids = _stats_export_selection(stats_scope, cur_gid)
     export_key_base = (
         tuple(export_graph_ids) if export_graph_ids is not None else ("__all__",),
+        str(cur_gid),
+        int(curv_n),
         float(min_conf),
         float(min_weight),
         str(analysis_mode),
@@ -739,6 +837,24 @@ with st.sidebar:
         bool(stats_lightweight),
         len(ctx.experiments),
     )
+
+    if st.button("🧠 Посчитать по плану", use_container_width=True):
+        _run_article_plan(
+            G_view,
+            cur_gid=str(cur_gid),
+            analysis_mode=str(analysis_mode),
+            min_conf=float(min_conf),
+            min_weight=float(min_weight),
+            seed_val=int(seed_val),
+            curv_n=int(curv_n),
+            stats_do_curv=bool(stats_do_curv),
+            stats_lightweight=bool(stats_lightweight),
+            export_graph_ids=export_graph_ids,
+            export_key_base=export_key_base,
+        )
+        st.success("План выполнен: base + Ricci + article exports.")
+
+    st.caption("План считает базовые метрики текущего графа, Ricci и готовит ZIP/XLSX для статьи.")
 
     b_zip, b_xlsx = st.columns(2)
     if b_zip.button("Prepare ZIP", use_container_width=True):
@@ -901,7 +1017,9 @@ if do_ricci:
     msg = st.empty()
 
     def _progress_cb(frac: float) -> None:
-        bar.progress(min(1.0, max(0.0, frac)))
+        frac_ = min(1.0, max(0.0, float(frac)))
+        bar.progress(frac_)
+        msg.caption(f"Ricci progress: {int(round(frac_ * 100))}%")
 
     def _status_cb(text: str) -> None:
         msg.caption(text)
@@ -913,20 +1031,13 @@ if do_ricci:
         progress_cb=_progress_cb,
         status_cb=_status_cb,
     )
-    bar.empty()
-    msg.empty()
     st.session_state["__ricci_cache"][ricci_key] = curv
+    bar.progress(1.0)
+    msg.caption("Ricci завершён")
 
 if ricci_key in st.session_state["__ricci_cache"]:
     curv = st.session_state["__ricci_cache"][ricci_key]
-    met.update(
-        {
-            "kappa_mean": curv.get("kappa_mean"),
-            "kappa_median": curv.get("kappa_median"),
-            "kappa_frac_negative": curv.get("kappa_frac_negative"),
-            "fragility_kappa": curv.get("fragility_kappa"),
-        }
-    )
+    met.update(_normalize_ricci_payload(curv))
 
 
 st.markdown("---")

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Callable
 from pathlib import Path
+from typing import Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
@@ -11,7 +11,6 @@ import pandas as pd
 from .graph_build import build_graph_from_edges, lcc_subgraph
 from .metrics import calculate_metrics
 from .state_models import ExperimentEntry, GraphEntry
-
 
 DEFAULT_TRAJECTORY_META_COLS = {
     "step",
@@ -117,6 +116,17 @@ def build_subject_metrics_table(
             n_edges = graph.number_of_edges()
             large_graph = n_nodes > 300
             huge_graph = n_nodes > 1200 or n_edges > 8000
+
+            def _metric_progress(frac: float, _idx: int = idx, _name: str = entry.name) -> None:
+                """Map inner metric progress to outer per-graph export progress."""
+                if progress_cb is None:
+                    return
+                progress_cb(
+                    (_idx - 1) + min(0.95, max(0.0, float(frac))),
+                    total,
+                    f"{_name} · Ricci {int(round(float(frac) * 100))}%",
+                )
+
             met = calculate_metrics(
                 graph,
                 eff_sources_k=int(eff_sources_k),
@@ -128,6 +138,7 @@ def build_subject_metrics_table(
                 diameter_samples=6 if (lightweight or large_graph) else 16,
                 skip_clustering=bool(lightweight),
                 skip_assortativity=bool(lightweight),
+                progress_cb=_metric_progress if bool(compute_curvature and not lightweight) else None,
             )
             met = _metrics_to_plain_dict(met)
             row = {
@@ -146,6 +157,8 @@ def build_subject_metrics_table(
             }
             row.update(met)
             rows.append(row)
+            if progress_cb is not None:
+                progress_cb(idx, total, f"{entry.name} ✓")
         except Exception as exc:
             # Export should be robust: keep failed rows with error description.
             rows.append(
@@ -165,6 +178,8 @@ def build_subject_metrics_table(
                     "export_error": str(exc),
                 }
             )
+            if progress_cb is not None:
+                progress_cb(idx, total, f"{entry.name} ✗ {type(exc).__name__}")
 
     if progress_cb is not None:
         progress_cb(total, total, "done")
