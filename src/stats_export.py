@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from typing import Callable
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -89,11 +90,22 @@ def build_subject_metrics_table(
     seed: int = 42,
     compute_curvature: bool = True,
     curvature_sample_edges: int = 120,
+    graph_ids: list[str] | None = None,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    lightweight: bool = False,
 ) -> pd.DataFrame:
     """Build one-row-per-subject metrics table for downstream group statistics."""
     rows: list[dict] = []
 
-    for entry in graphs.values():
+    if graph_ids:
+        entries = [graphs[gid] for gid in graph_ids if gid in graphs]
+    else:
+        entries = list(graphs.values())
+
+    total = len(entries)
+    for idx, entry in enumerate(entries, start=1):
+        if progress_cb is not None:
+            progress_cb(idx - 1, total, entry.name)
         try:
             graph = _entry_to_graph(
                 entry,
@@ -101,12 +113,21 @@ def build_subject_metrics_table(
                 min_weight=min_weight,
                 analysis_mode=analysis_mode,
             )
+            n_nodes = graph.number_of_nodes()
+            n_edges = graph.number_of_edges()
+            large_graph = n_nodes > 300
+            huge_graph = n_nodes > 1200 or n_edges > 8000
             met = calculate_metrics(
                 graph,
                 eff_sources_k=int(eff_sources_k),
                 seed=int(seed),
-                compute_curvature=bool(compute_curvature),
+                compute_curvature=bool(compute_curvature and not lightweight),
                 curvature_sample_edges=int(curvature_sample_edges),
+                compute_heavy=not (lightweight or large_graph),
+                skip_spectral=bool(lightweight or huge_graph),
+                diameter_samples=6 if (lightweight or large_graph) else 16,
+                skip_clustering=bool(lightweight),
+                skip_assortativity=bool(lightweight),
             )
             met = _metrics_to_plain_dict(met)
             row = {
@@ -144,6 +165,9 @@ def build_subject_metrics_table(
                     "export_error": str(exc),
                 }
             )
+
+    if progress_cb is not None:
+        progress_cb(total, total, "done")
 
     return pd.DataFrame(rows)
 
@@ -286,6 +310,9 @@ def export_stats_zip_bytes(
     seed: int = 42,
     compute_curvature: bool = True,
     curvature_sample_edges: int = 120,
+    graph_ids: list[str] | None = None,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    lightweight: bool = False,
 ) -> bytes:
     """Export tidy statistical tables as zip with three CSV files."""
     df_subjects = build_subject_metrics_table(
@@ -297,6 +324,9 @@ def export_stats_zip_bytes(
         seed=seed,
         compute_curvature=compute_curvature,
         curvature_sample_edges=curvature_sample_edges,
+        graph_ids=graph_ids,
+        progress_cb=progress_cb,
+        lightweight=lightweight,
     )
     df_mixfrac = build_mixfrac_subjects_table(experiments, graphs)
     df_traj = build_trajectories_long_table(experiments, graphs)
@@ -321,6 +351,9 @@ def export_stats_xlsx_bytes(
     seed: int = 42,
     compute_curvature: bool = True,
     curvature_sample_edges: int = 120,
+    graph_ids: list[str] | None = None,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    lightweight: bool = False,
 ) -> bytes:
     """Export tidy statistical tables as Excel workbook with three sheets."""
     df_subjects = build_subject_metrics_table(
@@ -332,6 +365,9 @@ def export_stats_xlsx_bytes(
         seed=seed,
         compute_curvature=compute_curvature,
         curvature_sample_edges=curvature_sample_edges,
+        graph_ids=graph_ids,
+        progress_cb=progress_cb,
+        lightweight=lightweight,
     )
     df_mixfrac = build_mixfrac_subjects_table(experiments, graphs)
     df_traj = build_trajectories_long_table(experiments, graphs)

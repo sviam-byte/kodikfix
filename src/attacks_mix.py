@@ -102,6 +102,7 @@ def run_mix_attack(
     replace_from: str = "ER",
     fast_mode: bool = False,
     progress_cb=None,
+    row_cb=None,
 ):
 
     # fast_mode пока оставлен для API-совместимости с UI/CLI.
@@ -243,6 +244,8 @@ def run_mix_attack(
             row["l2_lcc"] = np.nan
 
         rows.append(row)
+        if row_cb is not None:
+            row_cb(dict(row), i, len(xs) - 1)
 
     df = pd.DataFrame(rows)
     for col in ["H_tri", "mod", "l2_lcc"]:
