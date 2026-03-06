@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+from joblib import Parallel, delayed
 
 from .core.graph_ops import calculate_metrics
 from .matrix_import import load_matrix, matrix_to_graph
@@ -63,6 +64,9 @@ def run_batch(
     curvature_sample_edges: int = 150,
     seed: int = 42,
     eff_sources_k: int = 20,
+    n_jobs: int = 1,
+    checkpoint_every: int = 0,
+    checkpoint_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """
     Batch-обработка всех матриц в папке.
@@ -90,38 +94,48 @@ def run_batch(
             raise ValueError("meta CSV must have 'filename' column")
 
     rows = []
-    total = len(matrix_files) * len(densities)
-    done = 0
+    jobs = [(matrix_file, density) for matrix_file in matrix_files for density in densities]
+    total = len(jobs)
 
-    for matrix_file in matrix_files:
-        for density in densities:
-            done += 1
-            print(f"[{done}/{total}] {matrix_file.name} @ density={density:.2f}", flush=True)
-            try:
-                metrics = run_single_subject(
-                    matrix_file,
-                    sign_policy=sign_policy,
-                    threshold_mode="density",
-                    threshold_value=density,
-                    compute_curvature=compute_curvature,
-                    curvature_sample_edges=curvature_sample_edges,
-                    seed=seed,
-                    eff_sources_k=eff_sources_k,
-                )
-                row = {"filename": matrix_file.name, "density": density, **metrics}
-            except Exception as error:  # pylint: disable=broad-except
-                print(f"  ERROR: {error}", flush=True)
-                row = {"filename": matrix_file.name, "density": density, "error": str(error)}
+    def _run_job(index: int, matrix_file: Path, density: float) -> dict:
+        print(f"[{index}/{total}] {matrix_file.name} @ density={density:.2f}", flush=True)
+        try:
+            metrics = run_single_subject(
+                matrix_file,
+                sign_policy=sign_policy,
+                threshold_mode="density",
+                threshold_value=density,
+                compute_curvature=compute_curvature,
+                curvature_sample_edges=curvature_sample_edges,
+                seed=seed,
+                eff_sources_k=eff_sources_k,
+            )
+            row = {"filename": matrix_file.name, "density": density, **metrics}
+        except Exception as error:  # pylint: disable=broad-except
+            print(f"  ERROR: {error}", flush=True)
+            row = {"filename": matrix_file.name, "density": density, "error": str(error)}
 
-            # Дополняем метаданными субъекта (если есть запись по filename).
-            if meta is not None:
-                meta_row = meta[meta["filename"] == matrix_file.name]
-                if not meta_row.empty:
-                    for column in meta_row.columns:
-                        if column != "filename":
-                            row[column] = meta_row.iloc[0][column]
+        # Дополняем метаданными субъекта (если есть запись по filename).
+        if meta is not None:
+            meta_row = meta[meta["filename"] == matrix_file.name]
+            if not meta_row.empty:
+                for column in meta_row.columns:
+                    if column != "filename":
+                        row[column] = meta_row.iloc[0][column]
+        return row
 
-            rows.append(row)
+    if int(n_jobs) == 1:
+        for idx, (matrix_file, density) in enumerate(jobs, start=1):
+            rows.append(_run_job(idx, matrix_file, density))
+            if checkpoint_every and checkpoint_path is not None and (idx % int(checkpoint_every) == 0):
+                pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
+    else:
+        rows = Parallel(n_jobs=int(n_jobs))(
+            delayed(_run_job)(idx, matrix_file, density)
+            for idx, (matrix_file, density) in enumerate(jobs, start=1)
+        )
+        if checkpoint_every and checkpoint_path is not None:
+            pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
 
     return pd.DataFrame(rows)
 
@@ -137,6 +151,8 @@ def main() -> None:
     parser.add_argument("--compute-curvature", action="store_true")
     parser.add_argument("--curvature-edges", type=int, default=150)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-jobs", type=int, default=1, help="Parallel workers for subjects/densities")
+    parser.add_argument("--checkpoint-every", type=int, default=0, help="Write checkpoint CSV every N jobs (sequential mode)")
     args = parser.parse_args()
 
     densities = [float(value.strip()) for value in args.densities.split(",")]
@@ -148,6 +164,9 @@ def main() -> None:
         compute_curvature=args.compute_curvature,
         curvature_sample_edges=args.curvature_edges,
         seed=args.seed,
+        n_jobs=args.n_jobs,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_path=args.output.with_suffix(args.output.suffix + ".checkpoint.csv"),
     )
     df.to_csv(args.output, index=False)
     print(f"Saved {len(df)} rows to {args.output}")

@@ -70,12 +70,18 @@ def _replace_edges_from_source(
 
     added = 0
     tries = 0
+    consecutive_fails = 0
     max_tries = max(1000, 20 * k_replace)
+    fail_limit = max(200, 5 * k_replace)
     while added < k_replace and tries < max_tries:
         tries += 1
         u, v = source_edges[int(rng.integers(0, len(source_edges)))]
         if u == v or H.has_edge(u, v):
+            consecutive_fails += 1
+            if consecutive_fails >= fail_limit:
+                break
             continue
+        consecutive_fails = 0
         attrs = _sample_edge_attrs_from_empirical(rng, attrs_pool)
         H.add_edge(u, v, **attrs)
         added += 1

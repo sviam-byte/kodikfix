@@ -282,15 +282,22 @@ def ollivier_ricci_edge(
     cutoff: float = RICCI_CUTOFF,
     scale: int = RICCI_MASS_SCALE,
     missing_cost: float = 1e6,
+    _precomputed_Hw: Optional[nx.Graph] = None,
+    _sp_cache: Optional[Dict] = None,
 ) -> Optional[float]:
     """
     κ(x,y) = 1 - W1(µ_x, µ_y)/d(x,y)
     """
-    H = _normalize_edge_weights(as_simple_undirected(G))
+    # В summary-режиме сюда может приходить уже нормализованный граф + готовые dist.
+    if _precomputed_Hw is not None:
+        H = G
+        Hw = _precomputed_Hw
+    else:
+        H = _normalize_edge_weights(as_simple_undirected(G))
+        Hw = add_dist_attr(H)
     if not H.has_edge(x, y):
         return None
 
-    Hw = add_dist_attr(H)
     mu_x = _one_step_measure(H, x)
     mu_y = _one_step_measure(H, y)
     if not mu_x or not mu_y:
@@ -306,8 +313,12 @@ def ollivier_ricci_edge(
         return None
 
     dist = {}
+    sp_cache = _sp_cache if _sp_cache is not None else {}
     for u in sx:
-        dists = nx.single_source_dijkstra_path_length(Hw, u, cutoff=float(cutoff), weight="dist")
+        dists = sp_cache.get(u)
+        if dists is None:
+            dists = nx.single_source_dijkstra_path_length(Hw, u, cutoff=float(cutoff), weight="dist")
+            sp_cache[u] = dists
         for v in sy:
             if v in dists:
                 dist[(u, v)] = float(dists[v])
@@ -349,6 +360,7 @@ def ollivier_ricci_summary(
 ) -> CurvatureSummary:
     # ЗАМЕТКА: progress_cb нужен только для UI.
     H = _normalize_edge_weights(as_simple_undirected(G))
+    Hw = add_dist_attr(H)
     if H.number_of_edges() == 0:
         return CurvatureSummary(
             0.0, 0.0, 0.0, 0, 0, sampled_edges=0, skipped_frac=0.0
@@ -362,9 +374,19 @@ def ollivier_ricci_summary(
     if (progress_cb is not None) or bool(force_sequential):
         results = []
         total = max(1, len(edges))
+        sp_cache: Dict = {}
         for i, (x, y) in enumerate(edges, start=1):
             results.append(
-                ollivier_ricci_edge(H, x, y, max_support=max_support, cutoff=cutoff, scale=scale)
+                ollivier_ricci_edge(
+                    H,
+                    x,
+                    y,
+                    max_support=max_support,
+                    cutoff=cutoff,
+                    scale=scale,
+                    _precomputed_Hw=Hw,
+                    _sp_cache=sp_cache,
+                )
             )
             if progress_cb is not None:
                 try:
@@ -375,7 +397,13 @@ def ollivier_ricci_summary(
         num_cores = max(1, min(multiprocessing.cpu_count(), len(edges)))
         results = Parallel(n_jobs=num_cores)(
             delayed(ollivier_ricci_edge)(
-                H, x, y, max_support=max_support, cutoff=cutoff, scale=scale
+                H,
+                x,
+                y,
+                max_support=max_support,
+                cutoff=cutoff,
+                scale=scale,
+                _precomputed_Hw=Hw,
             )
             for x, y in edges
         )
