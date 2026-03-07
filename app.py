@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import traceback
+from io import BytesIO
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import networkx as nx
 import numpy as np
@@ -38,8 +41,12 @@ from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
 from src.graph_build import build_graph
 from src.core.graph_ops import calculate_metrics
+from src.core.physics import simulate_energy_flow
 from src.services.graph_service import GraphService
 from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
+from src.exporters import export_energy_tables_xlsx, payload_to_flat_row
+from src.robustness import attack_trajectory_summary, graph_resistance_summary
+from src.cli import _attack_payload_from_graph, _metrics_payload_from_graph
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.mat_packed import bundle_to_edge_frames
@@ -301,6 +308,336 @@ def _normalize_ricci_payload(payload: dict | None) -> dict:
     }
 
 
+
+
+def _research_metric_catalog() -> list[tuple[str, str, str]]:
+    """Available research-level calculations exposed in the dedicated tab."""
+    return [
+        ("basic", "Base graph metrics", "N, E, density, degree, components, beta, LCC"),
+        ("efficiency", "Efficiency", "weighted global efficiency"),
+        ("spectral", "Spectral", "lambda2, lmax, thresholds, modularity, tau"),
+        ("clustering", "Clustering", "average clustering"),
+        ("assortativity", "Assortativity", "degree assortativity"),
+        ("entropy", "Entropy rates", "H_rw and H_evo"),
+        ("curvature", "Ricci curvature", "kappa summary"),
+        ("resistance", "Resistance summary", "connectivity/core/robustness summary"),
+        ("energy", "Energy diffusion", "per-graph energy run + XLSX"),
+        ("attack", "Attack experiment", "trajectory summary + history"),
+    ]
+
+
+def _research_selected_flags() -> dict[str, bool]:
+    """Read research metric checkboxes from Streamlit session state."""
+    flags = {}
+    for key, _label, _help in _research_metric_catalog():
+        flags[key] = bool(st.session_state.get(f"__research_flag_{key}", True))
+    return flags
+
+
+def _bundle_frames_to_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
+    """Serialize research summary tables into a single XLSX payload."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in frames.items():
+            (df.copy() if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=name[:31], index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _bundle_frames_to_zip_bytes(frames: dict[str, pd.DataFrame], extras: dict[str, bytes] | None = None) -> bytes:
+    """Serialize research summary tables and optional artifacts into a ZIP payload."""
+    buf = BytesIO()
+    with ZipFile(buf, mode="w", compression=ZIP_DEFLATED) as zf:
+        for name, df in frames.items():
+            zf.writestr(f"{name}.csv", (df.copy() if df is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8"))
+        for name, payload in (extras or {}).items():
+            zf.writestr(name, payload)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _run_research_workspace_plan(
+    graph_ids: list[str],
+    *,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+    seed_val: int,
+    eff_k: int,
+    curv_n: int,
+    flags: dict[str, bool],
+    attack_family: str,
+    attack_kind: str,
+    attack_frac: float,
+    attack_steps: int,
+    attack_heavy_every: int,
+    attack_fast_mode: bool,
+    energy_steps: int,
+    energy_flow_mode: str,
+    energy_damping: float,
+    energy_phys_injection: float,
+    energy_phys_leak: float,
+    energy_phys_cap_mode: str,
+    energy_rw_impulse: bool,
+) -> tuple[dict[str, pd.DataFrame], dict[str, bytes]]:
+    """Execute the full research batch plan over selected workspace graphs."""
+    results: dict[str, list[dict]] = {
+        "research_metrics": [],
+        "research_resistance": [],
+        "research_attacks": [],
+        "research_energy_runs": [],
+    }
+    extras: dict[str, bytes] = {}
+    total = max(1, len(graph_ids))
+    bar = st.progress(0.0)
+    msg = st.empty()
+
+    for idx, gid in enumerate(graph_ids, start=1):
+        entry = ctx.graphs[gid]
+        msg.caption(f"[{idx}/{total}] {entry.name}")
+        graph = cached_build_graph(
+            entry.edges,
+            entry.src_col,
+            entry.dst_col,
+            min_conf,
+            min_weight,
+            analysis_mode,
+        )
+
+        if any(flags.get(k, False) for k in ["basic", "efficiency", "spectral", "clustering", "assortativity", "entropy", "curvature"]):
+            args_metrics = build_ui_args(
+                seed=int(seed_val),
+                eff_k=int(eff_k),
+                compute_curvature=bool(flags.get("curvature", False)),
+                curvature_sample_edges=int(curv_n),
+                compute_heavy=bool(flags.get("efficiency", False) or flags.get("entropy", False) or flags.get("clustering", False) or flags.get("assortativity", False) or flags.get("spectral", False)),
+                skip_spectral=not bool(flags.get("spectral", False)),
+                diameter_samples=16,
+            )
+            payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
+            row = payload_to_flat_row(payload)
+            row.update({
+                "graph_id": entry.id,
+                "graph_name": entry.name,
+                "source": entry.source,
+                "analysis_mode": str(analysis_mode),
+                "min_conf": float(min_conf),
+                "min_weight": float(min_weight),
+            })
+            if not flags.get("clustering", False) and "clustering" in row:
+                row["clustering"] = np.nan
+            if not flags.get("assortativity", False) and "assortativity" in row:
+                row["assortativity"] = np.nan
+            if not flags.get("entropy", False):
+                for col in ["H_rw", "H_evo", "fragility_H", "fragility_evo"]:
+                    if col in row:
+                        row[col] = np.nan
+            if not flags.get("curvature", False):
+                for col in ["kappa_mean", "kappa_median", "kappa_frac_negative", "kappa_computed_edges", "kappa_skipped_edges", "kappa_var", "kappa_skew", "kappa_entropy", "fragility_kappa"]:
+                    if col in row:
+                        row[col] = np.nan
+            results["research_metrics"].append(row)
+
+        if flags.get("resistance", False):
+            row = graph_resistance_summary(graph)
+            row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
+            results["research_resistance"].append(row)
+
+        if flags.get("attack", False):
+            args_attack = build_ui_args(
+                family=str(attack_family),
+                kind=str(attack_kind),
+                frac=float(attack_frac),
+                steps=int(attack_steps),
+                seed=int(seed_val),
+                eff_k=int(eff_k),
+                heavy_every=int(attack_heavy_every),
+                fast_mode=bool(attack_fast_mode),
+                compute_curvature=bool(flags.get("curvature", False)),
+                curvature_sample_edges=int(curv_n),
+            )
+            attack_payload, history = _attack_payload_from_graph(args_attack, graph, input_label=entry.name)
+            attack_row = attack_trajectory_summary(history, attack_kind=str(attack_kind))
+            attack_row.update({
+                "graph_id": entry.id,
+                "graph_name": entry.name,
+                "source": entry.source,
+                "family": attack_family,
+                "kind": attack_kind,
+                "frac": float(attack_frac),
+                "steps_requested": int(attack_steps),
+            })
+            if isinstance(attack_payload.get("final_row"), dict):
+                for k, v in attack_payload["final_row"].items():
+                    attack_row[f"final__{k}"] = v
+            results["research_attacks"].append(attack_row)
+            extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
+            extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+        if flags.get("energy", False):
+            node_frames, edge_frames = simulate_energy_flow(
+                graph,
+                steps=int(energy_steps),
+                flow_mode=str(energy_flow_mode),
+                damping=float(energy_damping),
+                phys_injection=float(energy_phys_injection),
+                phys_leak=float(energy_phys_leak),
+                phys_cap_mode=str(energy_phys_cap_mode),
+                rw_impulse=bool(energy_rw_impulse),
+            )
+            energy_nodes_long = pd.concat(node_frames, ignore_index=True) if node_frames else pd.DataFrame()
+            energy_edges_long = pd.concat(edge_frames, ignore_index=True) if edge_frames else pd.DataFrame()
+            if not energy_nodes_long.empty and "step" in energy_nodes_long.columns:
+                energy_steps_summary = energy_nodes_long.groupby("step", dropna=False).agg(
+                    total_energy=("energy", "sum"),
+                    mean_energy=("energy", "mean"),
+                    max_energy=("energy", "max"),
+                ).reset_index()
+            else:
+                energy_steps_summary = pd.DataFrame()
+            energy_run_summary = {
+                "graph_id": entry.id,
+                "graph_name": entry.name,
+                "source": entry.source,
+                "flow_mode": str(energy_flow_mode),
+                "steps": int(energy_steps),
+                "n_node_rows": int(len(energy_nodes_long)),
+                "n_edge_rows": int(len(energy_edges_long)),
+                "final_total_energy": float(energy_steps_summary["total_energy"].iloc[-1]) if not energy_steps_summary.empty else np.nan,
+                "peak_node_energy": float(energy_nodes_long["energy"].max()) if not energy_nodes_long.empty else np.nan,
+            }
+            results["research_energy_runs"].append(energy_run_summary)
+            extras[f"energy/{entry.id}__energy.xlsx"] = export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary)
+            extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
+            extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
+
+        bar.progress(float(idx) / float(total))
+
+    msg.caption("Research run complete")
+    frames = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
+    return frames, extras
+
+
+def _render_research_tab(
+    *,
+    cur_gid: str,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+    seed_val: int,
+    curv_n: int,
+) -> None:
+    """Render UI for the standalone research workspace batch calculations."""
+    st.subheader("🧠 Research calc")
+    st.caption("Отдельная вкладка для полного исследовательского расчёта по активному графу или по всему workspace.")
+
+    g1, g2 = st.columns([1.2, 1.8])
+    with g1:
+        st.markdown("**Что считать**")
+        for key, label, help_text in _research_metric_catalog():
+            st.checkbox(label, value=st.session_state.get(f"__research_flag_{key}", True), key=f"__research_flag_{key}", help=help_text)
+        research_eff_k = int(st.number_input("Research eff_k", min_value=4, max_value=512, value=int(st.session_state.get("__research_eff_k", 32)), step=4, key="__research_eff_k"))
+        scope = st.radio("Область расчёта", ["Активный граф", "Все графы workspace"], horizontal=False, key="__research_scope")
+
+    with g2:
+        st.markdown("**Параметры атак и энергии**")
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            attack_family = st.selectbox("Attack family", ["node", "edge", "mix"], key="__research_attack_family")
+            if attack_family == "node":
+                attack_kind = st.selectbox("Attack kind", ["random", "degree", "betweenness", "kcore", "richclub_top", "low_degree", "weak_strength"], key="__research_attack_kind_node")
+            elif attack_family == "edge":
+                attack_kind = st.selectbox("Attack kind", ["weak_edges_by_weight", "weak_edges_by_confidence", "strong_edges_by_weight", "strong_edges_by_confidence", "ricci_most_negative", "ricci_most_positive", "ricci_abs_max", "flux_high_rw", "flux_high_evo", "flux_high_rw_x_neg_ricci"], key="__research_attack_kind_edge")
+            else:
+                attack_kind = st.selectbox("Attack kind", ["hrish_mix", "mix_degree_preserving", "mix_weightconf_preserving"], key="__research_attack_kind_mix")
+        with a2:
+            attack_frac = float(st.number_input("Attack frac", min_value=0.0, max_value=1.0, value=float(st.session_state.get("__research_attack_frac", 0.5)), step=0.05, key="__research_attack_frac"))
+            attack_steps = int(st.number_input("Attack steps", min_value=1, value=int(st.session_state.get("__research_attack_steps", 30)), step=1, key="__research_attack_steps"))
+            attack_heavy_every = int(st.number_input("Attack heavy_every", min_value=1, value=int(st.session_state.get("__research_attack_heavy_every", 5)), step=1, key="__research_attack_heavy_every"))
+        with a3:
+            attack_fast_mode = st.checkbox("Attack fast mode", value=st.session_state.get("__research_attack_fast_mode", True), key="__research_attack_fast_mode")
+            energy_steps = int(st.number_input("Energy steps", min_value=1, value=int(st.session_state.get("__research_energy_steps", 50)), step=1, key="__research_energy_steps"))
+            energy_flow_mode = st.selectbox("Energy flow mode", ["rw", "evo", "phys"], key="__research_energy_flow_mode")
+
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            energy_damping = float(st.number_input("Energy damping", min_value=0.0, max_value=1.0, value=float(st.session_state.get("__research_energy_damping", 1.0)), step=0.05, key="__research_energy_damping"))
+        with e2:
+            energy_phys_injection = float(st.number_input("Phys injection", min_value=0.0, value=float(st.session_state.get("__research_energy_phys_injection", 0.15)), step=0.05, key="__research_energy_phys_injection"))
+            energy_phys_leak = float(st.number_input("Phys leak", min_value=0.0, value=float(st.session_state.get("__research_energy_phys_leak", 0.02)), step=0.01, key="__research_energy_phys_leak"))
+        with e3:
+            energy_phys_cap_mode = st.selectbox("Phys cap mode", ["strength", "degree"], key="__research_energy_phys_cap_mode")
+            energy_rw_impulse = st.checkbox("RW impulse", value=st.session_state.get("__research_energy_rw_impulse", True), key="__research_energy_rw_impulse")
+
+    flags = _research_selected_flags()
+    graph_ids = [cur_gid] if scope == "Активный граф" else list(ctx.graphs.keys())
+
+    c_run1, c_run2 = st.columns(2)
+    run_active = c_run1.button("Посчитать всё", type="primary", use_container_width=True)
+    run_all = c_run2.button("Посчитать всё для всех графов", use_container_width=True)
+    if run_active:
+        graph_ids = [cur_gid]
+    if run_all:
+        graph_ids = list(ctx.graphs.keys())
+
+    if run_active or run_all:
+        frames, extras = _run_research_workspace_plan(
+            graph_ids,
+            min_conf=float(min_conf),
+            min_weight=float(min_weight),
+            analysis_mode=str(analysis_mode),
+            seed_val=int(seed_val),
+            eff_k=int(research_eff_k),
+            curv_n=int(curv_n),
+            flags=flags,
+            attack_family=str(attack_family),
+            attack_kind=str(attack_kind),
+            attack_frac=float(attack_frac),
+            attack_steps=int(attack_steps),
+            attack_heavy_every=int(attack_heavy_every),
+            attack_fast_mode=bool(attack_fast_mode),
+            energy_steps=int(energy_steps),
+            energy_flow_mode=str(energy_flow_mode),
+            energy_damping=float(energy_damping),
+            energy_phys_injection=float(energy_phys_injection),
+            energy_phys_leak=float(energy_phys_leak),
+            energy_phys_cap_mode=str(energy_phys_cap_mode),
+            energy_rw_impulse=bool(energy_rw_impulse),
+        )
+        cache_key = (
+            tuple(graph_ids),
+            float(min_conf),
+            float(min_weight),
+            str(analysis_mode),
+            int(seed_val),
+            int(research_eff_k),
+            int(curv_n),
+            json.dumps(flags, sort_keys=True),
+            str(attack_family),
+            str(attack_kind),
+            float(attack_frac),
+            int(attack_steps),
+            int(energy_steps),
+            str(energy_flow_mode),
+        )
+        st.session_state["__research_results"] = {
+            "key": cache_key,
+            "frames": frames,
+            "extras": extras,
+            "xlsx": _bundle_frames_to_xlsx_bytes(frames),
+            "zip": _bundle_frames_to_zip_bytes(frames, extras=extras),
+        }
+        st.success(f"Готово: рассчитано {len(graph_ids)} граф(ов).")
+
+    cached = st.session_state.get("__research_results")
+    if cached:
+        d1, d2 = st.columns(2)
+        d1.download_button("Скачать research_summary.xlsx", data=cached["xlsx"], file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        d2.download_button("Скачать research_bundle.zip", data=cached["zip"], file_name="research_bundle.zip", mime="application/zip", use_container_width=True)
+        for name, df in cached.get("frames", {}).items():
+            st.markdown(f"**{name}**")
+            st.dataframe(df, use_container_width=True, height=min(420, 44 + 36 * min(len(df), 8)))
+
 def _run_article_plan(
     G_view: nx.Graph,
     *,
@@ -310,6 +647,7 @@ def _run_article_plan(
     min_weight: float,
     seed_val: int,
     curv_n: int,
+    stats_eff_k: int,
     stats_do_curv: bool,
     stats_lightweight: bool,
     export_graph_ids: list[str] | None,
@@ -333,7 +671,19 @@ def _run_article_plan(
     ricci_key = (cur_gid, analysis_mode, float(min_conf), float(min_weight), int(seed_val), int(curv_n))
 
     _set(0.02, "План: базовые метрики")
-    base = cached_calculate_metrics(G_view, int(seed_val), int(settings.RICCI_SAMPLE_EDGES))
+    # Здесь считаем полный набор базовых метрик для текущего графа, а не UI-light версию.
+    base = calculate_metrics(
+        G_view,
+        eff_sources_k=int(stats_eff_k),
+        seed=int(seed_val),
+        compute_curvature=False,
+        curvature_sample_edges=int(curv_n),
+        compute_heavy=True,
+        skip_spectral=False,
+        diameter_samples=16,
+        skip_clustering=False,
+        skip_assortativity=False,
+    )
     st.session_state.setdefault("__base_metrics_cache", {})[metrics_key] = base
 
     _set(0.18, f"План: Ricci ({int(curv_n)} edges)")
@@ -353,7 +703,7 @@ def _run_article_plan(
         min_conf=float(min_conf),
         min_weight=float(min_weight),
         analysis_mode=str(analysis_mode),
-        eff_sources_k=int(settings.APPROX_EFFICIENCY_K),
+        eff_sources_k=int(stats_eff_k),
         seed=int(seed_val),
         compute_curvature=bool(stats_do_curv),
         curvature_sample_edges=int(curv_n),
@@ -370,7 +720,7 @@ def _run_article_plan(
         min_conf=float(min_conf),
         min_weight=float(min_weight),
         analysis_mode=str(analysis_mode),
-        eff_sources_k=int(settings.APPROX_EFFICIENCY_K),
+        eff_sources_k=int(stats_eff_k),
         seed=int(seed_val),
         compute_curvature=bool(stats_do_curv),
         curvature_sample_edges=int(curv_n),
@@ -1087,6 +1437,7 @@ with st.sidebar:
             min_weight=float(min_weight),
             seed_val=int(seed_val),
             curv_n=int(curv_n),
+            stats_eff_k=int(stats_eff_k),
             stats_do_curv=bool(stats_do_curv),
             stats_lightweight=bool(stats_lightweight),
             export_graph_ids=export_graph_ids,
@@ -1094,7 +1445,7 @@ with st.sidebar:
         )
         st.success("План выполнен: base + Ricci + article exports.")
 
-    st.caption("План считает базовые метрики текущего графа, Ricci и готовит ZIP/XLSX для статьи.")
+    st.caption("План считает полный набор метрик текущего графа, Ricci и готовит ZIP/XLSX для статьи. Для batch-атак/энергии используй отдельную вкладку Research calc.")
 
     b_zip, b_xlsx = st.columns(2)
     if b_zip.button("Prepare ZIP", use_container_width=True):
@@ -1287,13 +1638,23 @@ st.markdown("---")
 # ============================================================
 active_tab = st.radio(
     "Раздел",
-    ["📊 Дэшборд", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"],
+    ["📊 Дэшборд", "🧠 Research", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"],
     horizontal=True,
     key="main_active_tab",
 )
 
 if active_tab == "📊 Дэшборд":
     tab_dashboard.render(G_view, met, active_entry)
+
+elif active_tab == "🧠 Research":
+    _render_research_tab(
+        cur_gid=str(cur_gid),
+        min_conf=float(min_conf),
+        min_weight=float(min_weight),
+        analysis_mode=str(analysis_mode),
+        seed_val=int(seed_val),
+        curv_n=int(curv_n),
+    )
 
 elif active_tab == "⚡ Energy":
     tab_energy.render(

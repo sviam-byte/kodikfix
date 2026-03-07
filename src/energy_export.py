@@ -61,6 +61,34 @@ def _top_share(arr: np.ndarray, k: int) -> float:
     return float(vals[-max(1, int(k)):].sum() / s)
 
 
+def _trapz_compat(y, x=None, dx: float = 1.0) -> float:
+    """Compat trapezoidal integration across NumPy versions.
+
+    Newer NumPy provides ``np.trapezoid`` and older releases expose ``np.trapz``.
+    This wrapper keeps behavior stable and includes a small local fallback for
+    rare environments where neither helper is available.
+    """
+    if hasattr(np, "trapezoid"):
+        if x is None:
+            return float(np.trapezoid(y, dx=dx))
+        return float(np.trapezoid(y, x=x))
+    if hasattr(np, "trapz"):
+        if x is None:
+            return float(np.trapz(y, dx=dx))
+        return float(np.trapz(y, x=x))
+
+    y = np.asarray(y, dtype=float)
+    if y.size < 2:
+        return float(y.sum())
+    if x is None:
+        return float(dx * (0.5 * y[0] + y[1:-1].sum() + 0.5 * y[-1]))
+
+    x = np.asarray(x, dtype=float)
+    if x.size != y.size:
+        raise ValueError("x and y must have the same length")
+    return float(np.sum((x[1:] - x[:-1]) * (y[1:] + y[:-1]) * 0.5))
+
+
 def _time_to_frac(active_counts: np.ndarray, target: float, n_nodes: int) -> float:
     if n_nodes <= 0:
         return float("nan")
@@ -209,9 +237,9 @@ def energy_run_summary_dict(
         "final_gini": _gini(final_vals),
         "final_top1_share": _top_share(final_vals, 1),
         "final_top5_share": _top_share(final_vals, 5),
-        "auc_active_nodes": float(np.trapz(active_nodes, dx=1.0)) if active_nodes.size >= 2 else float(active_nodes.sum()),
-        "auc_total_energy": float(np.trapz(total_energy, dx=1.0)) if total_energy.size >= 2 else float(total_energy.sum()),
-        "auc_entropy": float(np.trapz(entropy, dx=1.0)) if entropy.size >= 2 else float(entropy.sum()),
-        "auc_gini": float(np.trapz(gini, dx=1.0)) if gini.size >= 2 else float(gini.sum()),
+        "auc_active_nodes": _trapz_compat(active_nodes, dx=1.0) if active_nodes.size >= 2 else float(active_nodes.sum()),
+        "auc_total_energy": _trapz_compat(total_energy, dx=1.0) if total_energy.size >= 2 else float(total_energy.sum()),
+        "auc_entropy": _trapz_compat(entropy, dx=1.0) if entropy.size >= 2 else float(entropy.sum()),
+        "auc_gini": _trapz_compat(gini, dx=1.0) if gini.size >= 2 else float(gini.sum()),
         "final_diffusion_radius": _diffusion_radius(G, final_frame, sources),
     }
