@@ -36,6 +36,46 @@ from .robustness import graph_resistance_summary
 ProgressCb = Callable[[int, int, str], None]
 
 
+def _iter_jobs_stream(files: Iterable[Path], args, *, input_dir: Path):
+    """Yield expanded graph jobs lazily without materializing the whole batch."""
+    for path in files:
+        yield from _iter_expanded_graph_jobs(Path(path), args, input_dir=input_dir)
+
+
+def _estimate_total_jobs(files: Iterable[Path]) -> int:
+    """Estimate expanded job count for progress reporting."""
+    total = 0
+    for path in files:
+        try:
+            total += int(inspect_batch_file(Path(path)).get("expanded_graphs") or 1)
+        except Exception:
+            total += 1
+    return total
+
+
+def _chunk_size_from_args(args) -> int:
+    """Return chunk size for intermediate flushes; 0 disables chunk flushing."""
+    try:
+        value = int(getattr(args, "batch_chunk_size", 10))
+    except Exception:
+        value = 10
+    return max(0, value)
+
+
+def _flush_chunk_tables(out_dir: Path, *, mode_name: str, chunk_idx: int, rows_chunk: list[dict], manifest_chunk: list[dict]) -> None:
+    """Persist one chunk summary to disk so large batch runs can be exported incrementally."""
+    if not rows_chunk and not manifest_chunk:
+        return
+    chunks_dir = Path(out_dir) / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{mode_name}_chunk_{int(chunk_idx):04d}"
+    df_rows = pd.DataFrame(rows_chunk)
+    df_rows.to_csv(chunks_dir / f"{stem}.csv", index=False)
+    with pd.ExcelWriter(chunks_dir / f"{stem}.xlsx", engine="openpyxl") as writer:
+        df_rows.to_excel(writer, sheet_name=(f"{mode_name}_chunk")[:31], index=False)
+        pd.DataFrame(manifest_chunk).to_excel(writer, sheet_name="manifest", index=False)
+
+
 def _metrics_payload_xlsx_bytes(payload: dict) -> bytes:
     """Serialize one metrics payload to XLSX bytes.
 
@@ -309,14 +349,16 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
         pattern=str(args.pattern),
         limit=int(args.limit),
     )
-    jobs = []
-    for path in files:
-        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
-    total = len(jobs)
+    files = [Path(p) for p in files]
+    total = _estimate_total_jobs(files)
     rows: list[dict] = []
     manifest_rows: list[dict] = []
+    rows_chunk: list[dict] = []
+    manifest_chunk: list[dict] = []
+    chunk_size = _chunk_size_from_args(args)
+    chunk_idx = 0
 
-    for idx, job in enumerate(jobs, start=1):
+    for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
         if progress_cb:
             label = job.get("subject_name") or path.name
@@ -363,19 +405,17 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
             xlsx_path = per_item_dir / f"{item_name}.xlsx"
             xlsx_path.write_bytes(export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary))
             xlsx_abs = str(xlsx_path.resolve())
-            rows.append({**energy_run_summary, "xlsx_path": xlsx_abs})
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "energy"),
-                    "status": "ok",
-                    "error": "",
-                    "xlsx_path": xlsx_abs,
-                    "json_path": "",
-                    "history_csv_path": "",
-                }
-            )
+            row = {**energy_run_summary, "xlsx_path": xlsx_abs}
+            manifest_item = {
+                **_base_manifest_row(job, idx, "energy"),
+                "status": "ok",
+                "error": "",
+                "xlsx_path": xlsx_abs,
+                "json_path": "",
+                "history_csv_path": "",
+            }
         except Exception as exc:
-            err_row = {
+            row = {
                 "mode": "energy",
                 "batch_index": idx,
                 "input": str(path),
@@ -388,17 +428,27 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-            rows.append(err_row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "energy"),
-                    "status": "error",
-                    "error": err_row["error"],
-                    "xlsx_path": "",
-                    "json_path": "",
-                    "history_csv_path": "",
-                }
-            )
+            manifest_item = {
+                **_base_manifest_row(job, idx, "energy"),
+                "status": "error",
+                "error": row["error"],
+                "xlsx_path": "",
+                "json_path": "",
+                "history_csv_path": "",
+            }
+        rows.append(row)
+        manifest_rows.append(manifest_item)
+        rows_chunk.append(row)
+        manifest_chunk.append(manifest_item)
+        if chunk_size and len(rows_chunk) >= chunk_size:
+            chunk_idx += 1
+            _flush_chunk_tables(out_dir, mode_name="energy", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+            rows_chunk = []
+            manifest_chunk = []
+
+    if rows_chunk or manifest_chunk:
+        chunk_idx += 1
+        _flush_chunk_tables(out_dir, mode_name="energy", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
 
     df = pd.DataFrame(rows)
     manifest_df = pd.DataFrame(manifest_rows)
@@ -432,13 +482,15 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
         pattern=str(args.pattern),
         limit=int(args.limit),
     )
-    jobs = []
-    for path in files:
-        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
-    total = len(jobs)
+    files = [Path(p) for p in files]
+    total = _estimate_total_jobs(files)
     rows: list[dict] = []
     manifest_rows: list[dict] = []
-    for idx, job in enumerate(jobs, start=1):
+    rows_chunk: list[dict] = []
+    manifest_chunk: list[dict] = []
+    chunk_size = _chunk_size_from_args(args)
+    chunk_idx = 0
+    for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
         if progress_cb:
             label = job.get("subject_name") or path.name
@@ -468,19 +520,16 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
             xlsx_path.write_bytes(_single_row_xlsx_bytes(row, sheet_name="resistance"))
             xlsx_abs = str(xlsx_path.resolve())
             row["xlsx_path"] = xlsx_abs
-            rows.append(row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "resistance"),
-                    "status": "ok",
-                    "error": "",
-                    "xlsx_path": xlsx_abs,
-                    "json_path": "",
-                    "history_csv_path": "",
-                }
-            )
+            manifest_item = {
+                **_base_manifest_row(job, idx, "resistance"),
+                "status": "ok",
+                "error": "",
+                "xlsx_path": xlsx_abs,
+                "json_path": "",
+                "history_csv_path": "",
+            }
         except Exception as exc:
-            err_row = {
+            row = {
                 "mode": "resistance",
                 "batch_index": idx,
                 "input": str(path),
@@ -493,17 +542,26 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-            rows.append(err_row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "resistance"),
-                    "status": "error",
-                    "error": err_row["error"],
-                    "xlsx_path": "",
-                    "json_path": "",
-                    "history_csv_path": "",
-                }
-            )
+            manifest_item = {
+                **_base_manifest_row(job, idx, "resistance"),
+                "status": "error",
+                "error": row["error"],
+                "xlsx_path": "",
+                "json_path": "",
+                "history_csv_path": "",
+            }
+        rows.append(row)
+        manifest_rows.append(manifest_item)
+        rows_chunk.append(row)
+        manifest_chunk.append(manifest_item)
+        if chunk_size and len(rows_chunk) >= chunk_size:
+            chunk_idx += 1
+            _flush_chunk_tables(out_dir, mode_name="resistance", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+            rows_chunk = []
+            manifest_chunk = []
+    if rows_chunk or manifest_chunk:
+        chunk_idx += 1
+        _flush_chunk_tables(out_dir, mode_name="resistance", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
     df = pd.DataFrame(rows)
     manifest_df = pd.DataFrame(manifest_rows)
     summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "resistance_summary.csv"
@@ -590,10 +648,13 @@ def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path
     _write_manifest_tables(out_dir, combined_manifest_df, prefix="batch_plan_manifest")
 
     bundle_zip = out_dir / "batch_plan_bundle.zip"
-    zip_tree_to_file(out_dir, bundle_zip)
+    saved_label = combined_xlsx.name
+    if bool(getattr(args, "write_full_bundle", False)):
+        zip_tree_to_file(out_dir, bundle_zip)
+        saved_label = bundle_zip.name
 
     if progress_cb is not None:
-        progress_cb(total_modes, total_modes, f"saved -> {bundle_zip.name}")
+        progress_cb(total_modes, total_modes, f"saved -> {saved_label}")
     return out_dir, result_frames
 
 
@@ -682,6 +743,8 @@ def build_ui_args(**kwargs):
         energy_rw_impulse=True,
         source_mode="local_folder",
         selected_files=None,
+        batch_chunk_size=10,
+        write_full_bundle=False,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -701,14 +764,16 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
         pattern=str(args.pattern),
         limit=int(args.limit),
     )
-    jobs = []
-    for path in files:
-        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
-    total = len(jobs)
+    files = [Path(p) for p in files]
+    total = _estimate_total_jobs(files)
     rows: list[dict] = []
     manifest_rows: list[dict] = []
+    rows_chunk: list[dict] = []
+    manifest_chunk: list[dict] = []
+    chunk_size = _chunk_size_from_args(args)
+    chunk_idx = 0
 
-    for idx, job in enumerate(jobs, start=1):
+    for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
         if progress_cb:
             label = job.get("subject_name") or path.name
@@ -737,34 +802,29 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
             xlsx_abs = str(xlsx_path.resolve())
 
             row = payload_to_flat_row(payload)
-            row.update(
-                {
-                    "batch_index": idx,
-                    "input_file": path.name,
-                    "input_stem": path.stem,
-                    "input_suffix": path.suffix.lower(),
-                    "relative_input": str(job["relative_input"]),
-                    "subject_name": str(job.get("subject_name") or ""),
-                    "subject_index": job.get("subject_index"),
-                    "json_path": json_abs,
-                    "xlsx_path": xlsx_abs,
-                    "status": "ok",
-                    "error": "",
-                }
-            )
-            rows.append(row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "metrics"),
-                    "status": "ok",
-                    "error": "",
-                    "xlsx_path": xlsx_abs,
-                    "json_path": json_abs,
-                    "history_csv_path": "",
-                }
-            )
+            row.update({
+                "batch_index": idx,
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "json_path": json_abs,
+                "xlsx_path": xlsx_abs,
+                "status": "ok",
+                "error": "",
+            })
+            manifest_item = {
+                **_base_manifest_row(job, idx, "metrics"),
+                "status": "ok",
+                "error": "",
+                "xlsx_path": xlsx_abs,
+                "json_path": json_abs,
+                "history_csv_path": "",
+            }
         except Exception as exc:  # pylint: disable=broad-except
-            err_row = {
+            row = {
                 "mode": "metrics",
                 "batch_index": idx,
                 "input": str(path),
@@ -777,17 +837,27 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-            rows.append(err_row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "metrics"),
-                    "status": "error",
-                    "error": err_row["error"],
-                    "xlsx_path": "",
-                    "json_path": "",
-                    "history_csv_path": "",
-                }
-            )
+            manifest_item = {
+                **_base_manifest_row(job, idx, "metrics"),
+                "status": "error",
+                "error": row["error"],
+                "xlsx_path": "",
+                "json_path": "",
+                "history_csv_path": "",
+            }
+        rows.append(row)
+        manifest_rows.append(manifest_item)
+        rows_chunk.append(row)
+        manifest_chunk.append(manifest_item)
+        if chunk_size and len(rows_chunk) >= chunk_size:
+            chunk_idx += 1
+            _flush_chunk_tables(out_dir, mode_name="metrics", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+            rows_chunk = []
+            manifest_chunk = []
+
+    if rows_chunk or manifest_chunk:
+        chunk_idx += 1
+        _flush_chunk_tables(out_dir, mode_name="metrics", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
 
     df = pd.DataFrame(rows)
     manifest_df = pd.DataFrame(manifest_rows)
@@ -829,14 +899,16 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
         pattern=str(args.pattern),
         limit=int(args.limit),
     )
-    jobs = []
-    for path in files:
-        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
-    total = len(jobs)
+    files = [Path(p) for p in files]
+    total = _estimate_total_jobs(files)
     rows: list[dict] = []
     manifest_rows: list[dict] = []
+    rows_chunk: list[dict] = []
+    manifest_chunk: list[dict] = []
+    chunk_size = _chunk_size_from_args(args)
+    chunk_idx = 0
 
-    for idx, job in enumerate(jobs, start=1):
+    for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
         if progress_cb:
             label = job.get("subject_name") or path.name
@@ -887,19 +959,16 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 **payload.get("summary", {}),
                 **{f"final__{k}": v for k, v in payload.get("final_row", {}).items()},
             }
-            rows.append(row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "attack"),
-                    "status": "ok",
-                    "error": "",
-                    "xlsx_path": xlsx_abs,
-                    "json_path": json_abs,
-                    "history_csv_path": hist_abs,
-                }
-            )
+            manifest_item = {
+                **_base_manifest_row(job, idx, "attack"),
+                "status": "ok",
+                "error": "",
+                "xlsx_path": xlsx_abs,
+                "json_path": json_abs,
+                "history_csv_path": hist_abs,
+            }
         except Exception as exc:  # pylint: disable=broad-except
-            err_row = {
+            row = {
                 "mode": "attack",
                 "batch_index": idx,
                 "input": str(path),
@@ -914,17 +983,27 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
-            rows.append(err_row)
-            manifest_rows.append(
-                {
-                    **_base_manifest_row(job, idx, "attack"),
-                    "status": "error",
-                    "error": err_row["error"],
-                    "xlsx_path": "",
-                    "json_path": "",
-                    "history_csv_path": "",
-                }
-            )
+            manifest_item = {
+                **_base_manifest_row(job, idx, "attack"),
+                "status": "error",
+                "error": row["error"],
+                "xlsx_path": "",
+                "json_path": "",
+                "history_csv_path": "",
+            }
+        rows.append(row)
+        manifest_rows.append(manifest_item)
+        rows_chunk.append(row)
+        manifest_chunk.append(manifest_item)
+        if chunk_size and len(rows_chunk) >= chunk_size:
+            chunk_idx += 1
+            _flush_chunk_tables(out_dir, mode_name="attack", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+            rows_chunk = []
+            manifest_chunk = []
+
+    if rows_chunk or manifest_chunk:
+        chunk_idx += 1
+        _flush_chunk_tables(out_dir, mode_name="attack", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
 
     df = pd.DataFrame(rows)
     manifest_df = pd.DataFrame(manifest_rows)
