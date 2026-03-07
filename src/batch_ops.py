@@ -4,8 +4,8 @@ import json
 import re
 import shutil
 import tempfile
-from io import BytesIO
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Iterable
