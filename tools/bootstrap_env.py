@@ -27,11 +27,23 @@ def _run(cmd: list[str], *, check: bool = True) -> int:
     return proc.returncode
 
 
-def _venv_python() -> Path:
-    """Return expected interpreter path inside virtualenv for current OS."""
+def _venv_python_candidates() -> list[Path]:
+    """Return interpreter candidates inside virtualenv for mixed shell setups.
+
+    Some environments run Windows Python from Unix-like shells (or vice versa),
+    so we probe both conventional layouts while still preferring native OS order.
+    """
     if os.name == "nt":
-        return VENV_DIR / "Scripts" / "python.exe"
-    return VENV_DIR / "bin" / "python"
+        return [VENV_DIR / "Scripts" / "python.exe", VENV_DIR / "bin" / "python"]
+    return [VENV_DIR / "bin" / "python", VENV_DIR / "Scripts" / "python.exe"]
+
+
+def _find_existing_venv_python() -> Path | None:
+    """Return first existing venv interpreter path, if any."""
+    for candidate in _venv_python_candidates():
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _have_module(mod: str) -> bool:
@@ -77,8 +89,8 @@ def _try_virtualenv() -> bool:
 
 def ensure_venv() -> Path:
     """Create or reuse project virtualenv and return its Python path."""
-    py = _venv_python()
-    if py.exists():
+    py = _find_existing_venv_python()
+    if py is not None:
         print(f"[INFO] Reusing existing virtual environment: {py}", flush=True)
         return py
 
@@ -90,15 +102,15 @@ def ensure_venv() -> Path:
     print(f"[INFO] Bootstrap interpreter: {sys.executable}", flush=True)
     print(f"[INFO] Python version: {sys.version.split()[0]}", flush=True)
 
-    if _try_stdlib_venv() and py.exists():
+    if _try_stdlib_venv() and (py := _find_existing_venv_python()) is not None:
         return py
 
     print("[WARN] stdlib venv failed.", flush=True)
     _try_ensurepip()
-    if _try_stdlib_venv() and py.exists():
+    if _try_stdlib_venv() and (py := _find_existing_venv_python()) is not None:
         return py
 
-    if _try_virtualenv() and py.exists():
+    if _try_virtualenv() and (py := _find_existing_venv_python()) is not None:
         return py
 
     raise SystemExit(
