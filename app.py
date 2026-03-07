@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import logging
@@ -408,121 +409,130 @@ def _run_research_workspace_plan(
     for idx, gid in enumerate(graph_ids, start=1):
         entry = ctx.graphs[gid]
         msg.caption(f"[{idx}/{total}] {entry.name}")
-        graph = cached_build_graph(
-            entry.edges,
-            entry.src_col,
-            entry.dst_col,
-            min_conf,
-            min_weight,
-            analysis_mode,
-        )
-
-        if any(flags.get(k, False) for k in ["basic", "efficiency", "spectral", "clustering", "assortativity", "entropy", "curvature"]):
-            args_metrics = build_ui_args(
-                seed=int(seed_val),
-                eff_k=int(eff_k),
-                compute_curvature=bool(flags.get("curvature", False)),
-                curvature_sample_edges=int(curv_n),
-                compute_heavy=bool(flags.get("efficiency", False) or flags.get("entropy", False) or flags.get("clustering", False) or flags.get("assortativity", False) or flags.get("spectral", False)),
-                skip_spectral=not bool(flags.get("spectral", False)),
-                diameter_samples=16,
+        try:
+            graph = cached_build_graph(
+                entry.edges,
+                entry.src_col,
+                entry.dst_col,
+                min_conf,
+                min_weight,
+                analysis_mode,
             )
-            payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
-            row = payload_to_flat_row(payload)
-            row.update({
-                "graph_id": entry.id,
-                "graph_name": entry.name,
-                "source": entry.source,
-                "analysis_mode": str(analysis_mode),
-                "min_conf": float(min_conf),
-                "min_weight": float(min_weight),
-            })
-            if not flags.get("clustering", False) and "clustering" in row:
-                row["clustering"] = np.nan
-            if not flags.get("assortativity", False) and "assortativity" in row:
-                row["assortativity"] = np.nan
-            if not flags.get("entropy", False):
-                for col in ["H_rw", "H_evo", "fragility_H", "fragility_evo"]:
-                    if col in row:
-                        row[col] = np.nan
-            if not flags.get("curvature", False):
-                for col in ["kappa_mean", "kappa_median", "kappa_frac_negative", "kappa_computed_edges", "kappa_skipped_edges", "kappa_var", "kappa_skew", "kappa_entropy", "fragility_kappa"]:
-                    if col in row:
-                        row[col] = np.nan
-            results["research_metrics"].append(row)
 
-        if flags.get("resistance", False):
-            row = graph_resistance_summary(graph)
-            row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
-            results["research_resistance"].append(row)
+            if any(flags.get(k, False) for k in ["basic", "efficiency", "spectral", "clustering", "assortativity", "entropy", "curvature"]):
+                args_metrics = build_ui_args(
+                    seed=int(seed_val),
+                    eff_k=int(eff_k),
+                    compute_curvature=bool(flags.get("curvature", False)),
+                    curvature_sample_edges=int(curv_n),
+                    compute_heavy=bool(flags.get("efficiency", False) or flags.get("entropy", False) or flags.get("clustering", False) or flags.get("assortativity", False) or flags.get("spectral", False)),
+                    skip_spectral=not bool(flags.get("spectral", False)),
+                    diameter_samples=16,
+                    n_jobs=1,
+                )
+                payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
+                row = payload_to_flat_row(payload)
+                row.update({
+                    "graph_id": entry.id,
+                    "graph_name": entry.name,
+                    "source": entry.source,
+                    "analysis_mode": str(analysis_mode),
+                    "min_conf": float(min_conf),
+                    "min_weight": float(min_weight),
+                })
+                if not flags.get("clustering", False) and "clustering" in row:
+                    row["clustering"] = np.nan
+                if not flags.get("assortativity", False) and "assortativity" in row:
+                    row["assortativity"] = np.nan
+                if not flags.get("entropy", False):
+                    for col in ["H_rw", "H_evo", "fragility_H", "fragility_evo"]:
+                        if col in row:
+                            row[col] = np.nan
+                if not flags.get("curvature", False):
+                    for col in ["kappa_mean", "kappa_median", "kappa_frac_negative", "kappa_computed_edges", "kappa_skipped_edges", "kappa_var", "kappa_skew", "kappa_entropy", "fragility_kappa"]:
+                        if col in row:
+                            row[col] = np.nan
+                results["research_metrics"].append(row)
 
-        if flags.get("attack", False):
-            args_attack = build_ui_args(
-                family=str(attack_family),
-                kind=str(attack_kind),
-                frac=float(attack_frac),
-                steps=int(attack_steps),
-                seed=int(seed_val),
-                eff_k=int(eff_k),
-                heavy_every=int(attack_heavy_every),
-                fast_mode=bool(attack_fast_mode),
-                compute_curvature=bool(flags.get("curvature", False)),
-                curvature_sample_edges=int(curv_n),
-            )
-            attack_payload, history = _attack_payload_from_graph(args_attack, graph, input_label=entry.name)
-            attack_row = attack_trajectory_summary(history, attack_kind=str(attack_kind))
-            attack_row.update({
-                "graph_id": entry.id,
-                "graph_name": entry.name,
-                "source": entry.source,
-                "family": attack_family,
-                "kind": attack_kind,
-                "frac": float(attack_frac),
-                "steps_requested": int(attack_steps),
-            })
-            if isinstance(attack_payload.get("final_row"), dict):
-                for k, v in attack_payload["final_row"].items():
-                    attack_row[f"final__{k}"] = v
-            results["research_attacks"].append(attack_row)
-            extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
-            extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+            if flags.get("resistance", False):
+                row = graph_resistance_summary(graph)
+                row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
+                results["research_resistance"].append(row)
 
-        if flags.get("energy", False):
-            node_frames, edge_frames = simulate_energy_flow(
-                graph,
-                steps=int(energy_steps),
-                flow_mode=str(energy_flow_mode),
-                damping=float(energy_damping),
-                phys_injection=float(energy_phys_injection),
-                phys_leak=float(energy_phys_leak),
-                phys_cap_mode=str(energy_phys_cap_mode),
-                rw_impulse=bool(energy_rw_impulse),
-            )
-            # Keep tab-level energy outputs aligned with batch/service exporters.
-            energy_nodes_long = frames_to_energy_nodes_long(graph, node_frames, sources=None)
-            energy_steps_summary = frames_to_energy_steps_summary(graph, node_frames, edge_frames, sources=None)
-            energy_run_summary = energy_run_summary_dict(
-                graph,
-                node_frames,
-                edge_frames,
-                sources=None,
-                flow_mode=str(energy_flow_mode),
-            )
-            energy_edges_long = pd.DataFrame(edge_frames or [])
-            energy_run_summary.update({
-                "graph_id": entry.id,
-                "graph_name": entry.name,
-                "source": entry.source,
-                "steps_requested": int(energy_steps),
-                "n_node_rows": int(len(energy_nodes_long)),
-                "n_edge_rows": int(len(energy_edges_long)),
-            })
-            results["research_energy_runs"].append(energy_run_summary)
-            extras[f"energy/{entry.id}__energy.xlsx"] = export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary)
-            extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
-            extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
-            extras[f"energy/{entry.id}__steps_summary.csv"] = energy_steps_summary.to_csv(index=False).encode("utf-8")
-            extras[f"energy/{entry.id}__run_summary.json"] = json.dumps(energy_run_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+            if flags.get("attack", False):
+                args_attack = build_ui_args(
+                    family=str(attack_family),
+                    kind=str(attack_kind),
+                    frac=float(attack_frac),
+                    steps=int(attack_steps),
+                    seed=int(seed_val),
+                    eff_k=int(eff_k),
+                    heavy_every=int(attack_heavy_every),
+                    fast_mode=bool(attack_fast_mode),
+                    compute_curvature=bool(flags.get("curvature", False)),
+                    curvature_sample_edges=int(curv_n),
+                    n_jobs=1,
+                )
+                attack_payload, history = _attack_payload_from_graph(args_attack, graph, input_label=entry.name)
+                attack_row = attack_trajectory_summary(history, attack_kind=str(attack_kind))
+                attack_row.update({
+                    "graph_id": entry.id,
+                    "graph_name": entry.name,
+                    "source": entry.source,
+                    "family": attack_family,
+                    "kind": attack_kind,
+                    "frac": float(attack_frac),
+                    "steps_requested": int(attack_steps),
+                })
+                if isinstance(attack_payload.get("final_row"), dict):
+                    for k, v in attack_payload["final_row"].items():
+                        attack_row[f"final__{k}"] = v
+                results["research_attacks"].append(attack_row)
+                extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
+                extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+            if flags.get("energy", False):
+                node_frames, edge_frames = simulate_energy_flow(
+                    graph,
+                    steps=int(energy_steps),
+                    flow_mode=str(energy_flow_mode),
+                    damping=float(energy_damping),
+                    phys_injection=float(energy_phys_injection),
+                    phys_leak=float(energy_phys_leak),
+                    phys_cap_mode=str(energy_phys_cap_mode),
+                    rw_impulse=bool(energy_rw_impulse),
+                )
+                # Keep tab-level energy outputs aligned with batch/service exporters.
+                energy_nodes_long = frames_to_energy_nodes_long(graph, node_frames, sources=None)
+                energy_steps_summary = frames_to_energy_steps_summary(graph, node_frames, edge_frames, sources=None)
+                energy_run_summary = energy_run_summary_dict(
+                    graph,
+                    node_frames,
+                    edge_frames,
+                    sources=None,
+                    flow_mode=str(energy_flow_mode),
+                )
+                energy_edges_long = pd.DataFrame(edge_frames or [])
+                energy_run_summary.update({
+                    "graph_id": entry.id,
+                    "graph_name": entry.name,
+                    "source": entry.source,
+                    "steps_requested": int(energy_steps),
+                    "n_node_rows": int(len(energy_nodes_long)),
+                    "n_edge_rows": int(len(energy_edges_long)),
+                })
+                results["research_energy_runs"].append(energy_run_summary)
+                extras[f"energy/{entry.id}__energy.xlsx"] = export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary)
+                extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
+                extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
+                extras[f"energy/{entry.id}__steps_summary.csv"] = energy_steps_summary.to_csv(index=False).encode("utf-8")
+                extras[f"energy/{entry.id}__run_summary.json"] = json.dumps(energy_run_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                # Free heavy intermediate objects to reduce peak memory in long runs.
+                del node_frames, edge_frames, energy_nodes_long, energy_edges_long, energy_steps_summary
+                gc.collect()
+        except Exception:
+            logger.exception("Research run failed for graph %s (%s)", gid, entry.name)
+            msg.warning(f"⚠️ Ошибка при обработке {entry.name}: {traceback.format_exc()[-300:]}")
 
         bar.progress(float(idx) / float(total))
 

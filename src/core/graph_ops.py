@@ -329,6 +329,7 @@ def calculate_metrics(
             cutoff=curvature_cutoff,
             progress_cb=_progress_cb if progress_cb is not None else None,
             n_jobs=ricci_n_jobs,
+            force_sequential=(ricci_n_jobs == 1),
         )
         kappa_mean = float(curv.kappa_mean)
         kappa_median = float(curv.kappa_median)
