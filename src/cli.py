@@ -186,6 +186,37 @@ def _add_common_graph_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--shift", type=float, default=0.0, help="Shift added to matrix weights when sign-policy=shift")
 
 
+def _metrics_payload_from_graph(args, graph, *, input_label: str) -> dict:
+    """Build metrics payload from an already constructed graph."""
+    met = calculate_metrics(
+        graph,
+        int(args.eff_k),
+        int(args.seed),
+        bool(args.compute_curvature),
+        curvature_sample_edges=int(args.curvature_sample_edges),
+        compute_heavy=bool(getattr(args, "compute_heavy", True)),
+        skip_spectral=bool(getattr(args, "skip_spectral", False)),
+        diameter_samples=int(getattr(args, "diameter_samples", 16)),
+    )
+    return {
+        "mode": "metrics",
+        "input": str(input_label),
+        "summary": graph_summary(graph),
+        "settings": {
+            "seed": int(args.seed),
+            "weight_policy": settings.WEIGHT_POLICY,
+            "weight_eps": settings.WEIGHT_EPS,
+            "compute_curvature": bool(args.compute_curvature),
+            "curvature_sample_edges": int(args.curvature_sample_edges),
+            "compute_heavy": bool(getattr(args, "compute_heavy", True)),
+            "skip_spectral": bool(getattr(args, "skip_spectral", False)),
+        },
+        "metrics": met,
+    }
+
+
+
+
 def _build_metrics_payload(args, path: Path) -> dict:
     """Build metrics payload for one input graph without writing to disk."""
     graph = _build_graph_from_cli(
@@ -203,51 +234,11 @@ def _build_metrics_payload(args, path: Path) -> dict:
         threshold_value=float(getattr(args, "threshold_value", 0.15)),
         shift=float(getattr(args, "shift", 0.0)),
     )
-    met = calculate_metrics(
-        graph,
-        int(args.eff_k),
-        int(args.seed),
-        bool(args.compute_curvature),
-        curvature_sample_edges=int(args.curvature_sample_edges),
-        compute_heavy=bool(getattr(args, "compute_heavy", True)),
-        skip_spectral=bool(getattr(args, "skip_spectral", False)),
-        diameter_samples=int(getattr(args, "diameter_samples", 16)),
-    )
-    return {
-        "mode": "metrics",
-        "input": str(path),
-        "summary": graph_summary(graph),
-        "settings": {
-            "seed": int(args.seed),
-            "weight_policy": settings.WEIGHT_POLICY,
-            "weight_eps": settings.WEIGHT_EPS,
-            "compute_curvature": bool(args.compute_curvature),
-            "curvature_sample_edges": int(args.curvature_sample_edges),
-            "compute_heavy": bool(getattr(args, "compute_heavy", True)),
-            "skip_spectral": bool(getattr(args, "skip_spectral", False)),
-        },
-        "metrics": met,
-    }
+    return _metrics_payload_from_graph(args, graph, input_label=str(path))
 
 
-def _run_attack_payload(args, path: Path) -> tuple[dict, pd.DataFrame]:
-    """Execute one attack experiment and return payload + full history frame."""
-    graph = _build_graph_from_cli(
-        path,
-        fixed=bool(args.fixed),
-        src=str(args.src),
-        dst=str(args.dst),
-        min_conf=float(args.min_conf),
-        min_weight=float(args.min_weight),
-        lcc=bool(args.lcc),
-        input_kind=str(getattr(args, "input_kind", "auto")),
-        mat_key=str(getattr(args, "mat_key", "")),
-        sign_policy=str(getattr(args, "sign_policy", "abs")),
-        threshold_mode=str(getattr(args, "threshold_mode", "density")),
-        threshold_value=float(getattr(args, "threshold_value", 0.15)),
-        shift=float(getattr(args, "shift", 0.0)),
-    )
-
+def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, pd.DataFrame]:
+    """Execute one attack experiment for an already constructed graph."""
     family = str(args.family)
     if family == "node":
         history, aux = run_attack(
@@ -291,7 +282,7 @@ def _run_attack_payload(args, path: Path) -> tuple[dict, pd.DataFrame]:
         "mode": "attack",
         "family": family,
         "kind": str(args.kind),
-        "input": str(path),
+        "input": str(input_label),
         "summary": graph_summary(graph),
         "params": {
             "seed": int(args.seed),
@@ -308,6 +299,26 @@ def _run_attack_payload(args, path: Path) -> tuple[dict, pd.DataFrame]:
         "final_row": history.iloc[-1].to_dict() if not history.empty else {},
     }
     return payload, history
+
+
+def _run_attack_payload(args, path: Path) -> tuple[dict, pd.DataFrame]:
+    """Execute one attack experiment and return payload + full history frame."""
+    graph = _build_graph_from_cli(
+        path,
+        fixed=bool(args.fixed),
+        src=str(args.src),
+        dst=str(args.dst),
+        min_conf=float(args.min_conf),
+        min_weight=float(args.min_weight),
+        lcc=bool(args.lcc),
+        input_kind=str(getattr(args, "input_kind", "auto")),
+        mat_key=str(getattr(args, "mat_key", "")),
+        sign_policy=str(getattr(args, "sign_policy", "abs")),
+        threshold_mode=str(getattr(args, "threshold_mode", "density")),
+        threshold_value=float(getattr(args, "threshold_value", 0.15)),
+        shift=float(getattr(args, "shift", 0.0)),
+    )
+    return _attack_payload_from_graph(args, graph, input_label=str(path))
 
 
 def _cmd_metrics(args) -> int:

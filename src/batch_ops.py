@@ -13,12 +13,16 @@ from zipfile import ZipFile
 import pandas as pd
 
 from .cli import (
+    _attack_payload_from_graph,
     _build_metrics_payload,
     _iter_input_files,
     _json_default,
+    _metrics_payload_from_graph,
     _run_attack_payload,
 )
 from .exporters import export_metrics_payload, payload_to_flat_row
+from .mat_packed import load_packed_mat_bundle, packed_row_to_matrix
+from .matrix_import import matrix_to_graph
 
 # Колбэк прогресса: done, total, label
 ProgressCb = Callable[[int, int, str], None]
@@ -79,6 +83,82 @@ def stage_batch_inputs(
 
     _cleanup()
     raise ValueError(f"Неизвестный source_mode: {source_mode}")
+
+
+def discover_batch_files(
+    *,
+    source_mode: str,
+    pattern: str,
+    recursive: bool,
+    limit: int = 0,
+    input_dir: str | Path | None = None,
+    uploaded_files: list | None = None,
+    uploaded_zip_name: str = "",
+    uploaded_zip_bytes: bytes | None = None,
+) -> tuple[Path, list[Path], Callable[[], None]]:
+    """Stage inputs if needed and return the concrete file list for batch UI."""
+    staged_root, _, cleanup_cb = stage_batch_inputs(
+        source_mode=source_mode,
+        input_dir=input_dir,
+        uploaded_files=uploaded_files,
+        uploaded_zip_name=uploaded_zip_name,
+        uploaded_zip_bytes=uploaded_zip_bytes,
+    )
+    files = _iter_input_files(
+        Path(staged_root),
+        recursive=bool(recursive),
+        pattern=str(pattern),
+        limit=int(limit),
+    )
+    return Path(staged_root), files, cleanup_cb
+
+
+def _build_graph_from_packed_subject(args, packed_row, n_nodes: int):
+    """Restore one subject from a packed MAT row and apply normal matrix policies."""
+    corr = packed_row_to_matrix(packed_row, int(n_nodes))
+    return matrix_to_graph(
+        corr,
+        sign_policy=str(getattr(args, "sign_policy", "abs")),
+        threshold_mode=str(getattr(args, "threshold_mode", "density")),
+        threshold_value=float(getattr(args, "threshold_value", 0.15)),
+        shift=float(getattr(args, "shift", 0.0)),
+        labels=None,
+        use_lcc=bool(getattr(args, "lcc", False)),
+    )
+
+
+def _iter_expanded_graph_jobs(path: Path, args, *, input_dir: Path):
+    """Yield one or many graph jobs for a file; packed MAT bundles expand per subject."""
+    rel = str(path.relative_to(input_dir))
+    suffix = path.suffix.lower()
+    use_matrix = str(getattr(args, "input_kind", "auto")) == "matrix" or (
+        str(getattr(args, "input_kind", "auto")) == "auto" and suffix == ".mat"
+    )
+    if suffix == ".mat" and use_matrix:
+        try:
+            bundle = load_packed_mat_bundle(path.read_bytes())
+            for subj in bundle.subjects:
+                input_label = f"{path}::{subj.subject_name}"
+                yield {
+                    "path": path,
+                    "input": input_label,
+                    "relative_input": rel,
+                    "subject_name": str(subj.subject_name),
+                    "subject_index": int(subj.index),
+                    "graph": _build_graph_from_packed_subject(args, subj.packed_edges, bundle.n_nodes),
+                }
+            return
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    yield {
+        "path": path,
+        "input": str(path),
+        "relative_input": rel,
+        "subject_name": "",
+        "subject_index": None,
+        "graph": None,
+    }
 
 
 def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, dict[str, pd.DataFrame]]:
@@ -205,6 +285,7 @@ def build_ui_args(**kwargs):
         run_metrics=True,
         run_attack=False,
         source_mode="local_folder",
+        selected_files=None,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -217,27 +298,39 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
     per_item_dir = out_dir / "per_item"
     per_item_dir.mkdir(parents=True, exist_ok=True)
 
-    files = _iter_input_files(
+    explicit_files = [Path(p) for p in getattr(args, "selected_files", []) or []]
+    files = explicit_files or _iter_input_files(
         input_dir,
         recursive=bool(args.recursive),
         pattern=str(args.pattern),
         limit=int(args.limit),
     )
-    total = len(files)
+    jobs = []
+    for path in files:
+        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
+    total = len(jobs)
     rows: list[dict] = []
 
-    for idx, path in enumerate(files, start=1):
+    for idx, job in enumerate(jobs, start=1):
+        path = Path(job["path"])
         if progress_cb:
-            progress_cb(idx - 1, total, f"metrics :: {path.name}")
-        item_name = f"{idx:04d}__{safe_stem(path.stem)}"
+            label = job.get("subject_name") or path.name
+            progress_cb(idx - 1, total, f"metrics :: {label}")
+        item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
+        item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
         try:
-            payload = _build_metrics_payload(args, path)
+            if job.get("graph") is not None:
+                payload = _metrics_payload_from_graph(args, job["graph"], input_label=str(job["input"]))
+            else:
+                payload = _build_metrics_payload(args, path)
             payload["batch"] = {
                 "index": idx,
                 "input_file": path.name,
                 "input_stem": path.stem,
                 "input_suffix": path.suffix.lower(),
-                "relative_input": str(path.relative_to(input_dir)),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
             }
             json_path = per_item_dir / f"{item_name}.json"
             export_metrics_payload(payload, str(json_path), "json")
@@ -249,7 +342,9 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
                     "input_file": path.name,
                     "input_stem": path.stem,
                     "input_suffix": path.suffix.lower(),
-                    "relative_input": str(path.relative_to(input_dir)),
+                    "relative_input": str(job["relative_input"]),
+                    "subject_name": str(job.get("subject_name") or ""),
+                    "subject_index": job.get("subject_index"),
                     "json_path": str(json_path.resolve()),
                     "status": "ok",
                     "error": "",
@@ -265,7 +360,9 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
                     "input_file": path.name,
                     "input_stem": path.stem,
                     "input_suffix": path.suffix.lower(),
-                    "relative_input": str(path.relative_to(input_dir)),
+                    "relative_input": str(job["relative_input"]),
+                    "subject_name": str(job.get("subject_name") or ""),
+                    "subject_index": job.get("subject_index"),
                     "status": "error",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
@@ -300,27 +397,39 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     json_dir.mkdir(parents=True, exist_ok=True)
     hist_dir.mkdir(parents=True, exist_ok=True)
 
-    files = _iter_input_files(
+    explicit_files = [Path(p) for p in getattr(args, "selected_files", []) or []]
+    files = explicit_files or _iter_input_files(
         input_dir,
         recursive=bool(args.recursive),
         pattern=str(args.pattern),
         limit=int(args.limit),
     )
-    total = len(files)
+    jobs = []
+    for path in files:
+        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
+    total = len(jobs)
     rows: list[dict] = []
 
-    for idx, path in enumerate(files, start=1):
+    for idx, job in enumerate(jobs, start=1):
+        path = Path(job["path"])
         if progress_cb:
-            progress_cb(idx - 1, total, f"attack :: {path.name}")
-        item_name = f"{idx:04d}__{safe_stem(path.stem)}"
+            label = job.get("subject_name") or path.name
+            progress_cb(idx - 1, total, f"attack :: {label}")
+        item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
+        item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
         try:
-            payload, history = _run_attack_payload(args, path)
+            if job.get("graph") is not None:
+                payload, history = _attack_payload_from_graph(args, job["graph"], input_label=str(job["input"]))
+            else:
+                payload, history = _run_attack_payload(args, path)
             payload["batch"] = {
                 "index": idx,
                 "input_file": path.name,
                 "input_stem": path.stem,
                 "input_suffix": path.suffix.lower(),
-                "relative_input": str(path.relative_to(input_dir)),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
             }
             payload_json_path = json_dir / f"{item_name}.json"
             export_metrics_payload(payload, str(payload_json_path), "json")
@@ -334,7 +443,9 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "input_file": path.name,
                 "input_stem": path.stem,
                 "input_suffix": path.suffix.lower(),
-                "relative_input": str(path.relative_to(input_dir)),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
                 "family": payload.get("family"),
                 "kind": payload.get("kind"),
                 "payload_json_path": str(payload_json_path.resolve()),
@@ -354,7 +465,9 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                     "input_file": path.name,
                     "input_stem": path.stem,
                     "input_suffix": path.suffix.lower(),
-                    "relative_input": str(path.relative_to(input_dir)),
+                    "relative_input": str(job["relative_input"]),
+                    "subject_name": str(job.get("subject_name") or ""),
+                    "subject_index": job.get("subject_index"),
                     "family": str(args.family),
                     "kind": str(args.kind),
                     "status": "error",
