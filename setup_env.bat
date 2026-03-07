@@ -35,66 +35,13 @@ if not defined BOOTSTRAP_CMD (
 )
 
 echo [INFO] Bootstrap interpreter: %BOOTSTRAP_CMD%
-
-if not exist ".venv\Scripts\python.exe" (
-    echo [STEP] Creating virtual environment...
-    %BOOTSTRAP_CMD% -m venv .venv
-    if errorlevel 1 (
-        rem Fallback path for broken stdlib venv/ensurepip installations.
-        echo [WARN] stdlib venv failed, trying virtualenv fallback...
-        %BOOTSTRAP_CMD% -m pip install --upgrade pip virtualenv
-        if errorlevel 1 (
-            echo [ERROR] Failed to prepare virtualenv fallback.
-            pause
-            exit /b 1
-        )
-        %BOOTSTRAP_CMD% -m virtualenv .venv
-        if errorlevel 1 (
-            echo [ERROR] Failed to create virtual environment.
-            echo [HINT] Your Python installation may be incomplete.
-            pause
-            exit /b 1
-        )
-    )
-)
-
-if not exist ".venv\Scripts\python.exe" (
-    echo [ERROR] .venv was not created correctly.
-    pause
-    exit /b 1
-)
-
-echo [STEP] Upgrading pip/setuptools/wheel...
-".venv\Scripts\python.exe" -m pip install --upgrade pip
+%BOOTSTRAP_CMD% tools\bootstrap_env.py
 if errorlevel 1 (
-    echo [ERROR] Failed to upgrade pip
+    echo.
+    echo [ERROR] Environment setup failed.
     pause
     exit /b 1
 )
 
-".venv\Scripts\python.exe" -m pip install --upgrade setuptools wheel
-if errorlevel 1 (
-    echo [ERROR] Failed to install setuptools/wheel
-    pause
-    exit /b 1
-)
-
-if exist "requirements.txt" (
-    echo [STEP] Installing requirements...
-    ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo [ERROR] Failed to install requirements
-        pause
-        exit /b 1
-    )
-) else (
-    echo [WARN] requirements.txt not found, skipping install.
-)
-
-echo.
-echo [OK] Environment is ready.
-echo Use:
-echo   run_ui.bat
-echo   run_cli.bat metrics data.csv --src src --dst dst
 pause
 endlocal
