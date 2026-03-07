@@ -20,9 +20,16 @@ from .cli import (
     _metrics_payload_from_graph,
     _run_attack_payload,
 )
-from .exporters import export_metrics_payload, payload_to_flat_row
+from .core.physics import simulate_energy_flow
+from .energy_export import (
+    energy_run_summary_dict,
+    frames_to_energy_nodes_long,
+    frames_to_energy_steps_summary,
+)
+from .exporters import export_energy_tables_xlsx, export_metrics_payload, payload_to_flat_row
 from .mat_packed import load_packed_mat_bundle, packed_row_to_matrix
 from .matrix_import import matrix_to_graph
+from .robustness import graph_resistance_summary
 
 # Колбэк прогресса: done, total, label
 ProgressCb = Callable[[int, int, str], None]
@@ -161,8 +168,179 @@ def _iter_expanded_graph_jobs(path: Path, args, *, input_dir: Path):
     }
 
 
+
+def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, pd.DataFrame]:
+    """Run energy diffusion batch and return output dir and summary DataFrame."""
+    input_dir = Path(args.input_dir)
+    out_dir = Path(args.out_dir)
+    per_item_dir = out_dir / "per_item"
+    per_item_dir.mkdir(parents=True, exist_ok=True)
+
+    explicit_files = [Path(p) for p in getattr(args, "selected_files", []) or []]
+    files = explicit_files or _iter_input_files(
+        input_dir,
+        recursive=bool(args.recursive),
+        pattern=str(args.pattern),
+        limit=int(args.limit),
+    )
+    jobs = []
+    for path in files:
+        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
+    total = len(jobs)
+    rows: list[dict] = []
+
+    for idx, job in enumerate(jobs, start=1):
+        path = Path(job["path"])
+        if progress_cb:
+            label = job.get("subject_name") or path.name
+            progress_cb(idx - 1, total, f"energy :: {label}")
+        item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
+        item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
+        try:
+            if job.get("graph") is None:
+                raise ValueError("Energy batch currently supports matrix/MAT inputs expanded to graphs")
+            graph = job["graph"]
+            srcs = []
+            if graph.number_of_nodes() > 0:
+                deg = dict(graph.degree(weight="weight"))
+                srcs = [max(deg, key=deg.get)] if deg else []
+            node_frames, edge_frames = simulate_energy_flow(
+                graph,
+                steps=int(getattr(args, "energy_steps", 50)),
+                flow_mode=str(getattr(args, "energy_flow_mode", "rw")),
+                damping=float(getattr(args, "energy_damping", 1.0)),
+                sources=srcs or None,
+                phys_injection=float(getattr(args, "energy_phys_injection", 0.15)),
+                phys_leak=float(getattr(args, "energy_phys_leak", 0.02)),
+                phys_cap_mode=str(getattr(args, "energy_phys_cap_mode", "strength")),
+                rw_impulse=bool(getattr(args, "energy_rw_impulse", True)),
+            )
+            energy_nodes_long = frames_to_energy_nodes_long(graph, node_frames, sources=srcs)
+            energy_steps_summary = frames_to_energy_steps_summary(graph, node_frames, edge_frames, sources=srcs)
+            energy_run_summary = energy_run_summary_dict(
+                graph, node_frames, edge_frames, sources=srcs, flow_mode=str(getattr(args, "energy_flow_mode", "rw"))
+            )
+            energy_run_summary.update({
+                "mode": "energy",
+                "batch_index": idx,
+                "input": str(job["input"]),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "status": "ok",
+                "error": "",
+            })
+            xlsx_path = per_item_dir / f"{item_name}.xlsx"
+            xlsx_path.write_bytes(export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary))
+            rows.append({**energy_run_summary, "xlsx_path": str(xlsx_path.resolve())})
+        except Exception as exc:
+            rows.append({
+                "mode": "energy",
+                "batch_index": idx,
+                "input": str(path),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    df = pd.DataFrame(rows)
+    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "energy_summary.csv"
+    summary_xlsx = out_dir / "energy_summary.xlsx"
+    manifest_path = out_dir / "manifest.json"
+    summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(summary_csv, index=False)
+    with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="energy_runs", index=False)
+    manifest_path.write_text(
+        json.dumps(build_batch_manifest(files=files, args=args, mode="batch-energy"), ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    if progress_cb:
+        progress_cb(total, total, f"saved -> {summary_csv.name}")
+    return out_dir, df
+
+
+def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, pd.DataFrame]:
+    """Run structural resistance batch and return output dir and summary DataFrame."""
+    input_dir = Path(args.input_dir)
+    out_dir = Path(args.out_dir)
+    explicit_files = [Path(p) for p in getattr(args, "selected_files", []) or []]
+    files = explicit_files or _iter_input_files(
+        input_dir,
+        recursive=bool(args.recursive),
+        pattern=str(args.pattern),
+        limit=int(args.limit),
+    )
+    jobs = []
+    for path in files:
+        jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
+    total = len(jobs)
+    rows: list[dict] = []
+    for idx, job in enumerate(jobs, start=1):
+        path = Path(job["path"])
+        if progress_cb:
+            label = job.get("subject_name") or path.name
+            progress_cb(idx - 1, total, f"resistance :: {label}")
+        try:
+            if job.get("graph") is None:
+                raise ValueError("Resistance batch currently supports matrix/MAT inputs expanded to graphs")
+            graph = job["graph"]
+            res = graph_resistance_summary(graph)
+            rows.append({
+                "mode": "resistance",
+                "batch_index": idx,
+                "input": str(job["input"]),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "status": "ok",
+                "error": "",
+                **res,
+            })
+        except Exception as exc:
+            rows.append({
+                "mode": "resistance",
+                "batch_index": idx,
+                "input": str(path),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    df = pd.DataFrame(rows)
+    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "resistance_summary.csv"
+    summary_xlsx = out_dir / "resistance_summary.xlsx"
+    manifest_path = out_dir / "manifest.json"
+    summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(summary_csv, index=False)
+    with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="robustness_summary", index=False)
+    manifest_path.write_text(
+        json.dumps(build_batch_manifest(files=files, args=args, mode="batch-resistance"), ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    if progress_cb:
+        progress_cb(total, total, f"saved -> {summary_csv.name}")
+    return out_dir, df
+
+
 def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, dict[str, pd.DataFrame]]:
-    """Run selected batch tasks (metrics/attack) and return per-mode DataFrames."""
+    """Run selected batch tasks (metrics/attack/energy/resistance) and return per-mode DataFrames."""
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -171,6 +349,10 @@ def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path
         modes.append("metrics")
     if bool(getattr(args, "run_attack", False)):
         modes.append("attack")
+    if bool(getattr(args, "run_energy", False)):
+        modes.append("energy")
+    if bool(getattr(args, "run_resistance", False)):
+        modes.append("resistance")
     if not modes:
         raise ValueError("Не выбрано ни одного расчёта")
 
@@ -196,8 +378,12 @@ def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path
         mode_args.out_dir = str(mode_out_dir)
         if mode_name == "metrics":
             _, df_mode = run_batch_metrics(mode_args, progress_cb=_wrap_progress(mode_idx, "metrics"))
-        else:
+        elif mode_name == "attack":
             _, df_mode = run_batch_attack(mode_args, progress_cb=_wrap_progress(mode_idx, "attack"))
+        elif mode_name == "energy":
+            _, df_mode = run_batch_energy(mode_args, progress_cb=_wrap_progress(mode_idx, "energy"))
+        else:
+            _, df_mode = run_batch_resistance(mode_args, progress_cb=_wrap_progress(mode_idx, "resistance"))
         result_frames[mode_name] = df_mode
 
     combined_xlsx = out_dir / "batch_plan_summary.xlsx"
@@ -284,6 +470,15 @@ def build_ui_args(**kwargs):
         replace_from="CFG",
         run_metrics=True,
         run_attack=False,
+        run_energy=False,
+        run_resistance=False,
+        energy_steps=50,
+        energy_flow_mode="rw",
+        energy_damping=1.0,
+        energy_phys_injection=0.15,
+        energy_phys_leak=0.02,
+        energy_phys_cap_mode="strength",
+        energy_rw_impulse=True,
         source_mode="local_folder",
         selected_files=None,
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import textwrap
 import time
+import json
 
 import networkx as nx
 import numpy as np
@@ -21,6 +22,7 @@ from src.metrics import calculate_metrics
 from src.mix_frac_estimator import estimate_mix_frac_star
 from src.plotting import fig_metrics_over_steps, fig_compare_attacks
 from src.services.graph_service import GraphService
+from src.robustness import attack_trajectory_summary, graph_resistance_summary
 from src.state_models import GraphEntry
 from src.ui.plots.charts import (
     AUC_TRAP,
@@ -668,6 +670,43 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     st.metric("AUC", f"{auc_val:.6f}")
                 else:
                     st.info("Недостаточно точек для AUC.")
+
+            st.markdown("#### Resistance summary")
+            base_res = graph_resistance_summary(G_view)
+            attack_sum = attack_trajectory_summary(df_res, attack_kind=str(last_exp.attack_kind))
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rc1.metric("Giant comp frac", f"{float(base_res.get('giant_component_frac', 0.0)):.3f}")
+            rc2.metric("Algebraic conn.", f"{float(base_res.get('algebraic_connectivity', float('nan'))):.3f}" if pd.notna(base_res.get('algebraic_connectivity')) else "—")
+            rc3.metric("Final LCC frac", f"{float(attack_sum.get('final_lcc_frac', 0.0)):.3f}" if pd.notna(attack_sum.get('final_lcc_frac')) else "—")
+            rc4.metric("Collapse 50%", f"{float(attack_sum.get('collapse_step_50', float('nan'))):.3f}" if pd.notna(attack_sum.get('collapse_step_50')) else "—")
+            rc5, rc6, rc7, rc8 = st.columns(4)
+            rc5.metric("Edge conn.", f"{float(base_res.get('edge_connectivity', float('nan'))):.3f}" if pd.notna(base_res.get('edge_connectivity')) else "—")
+            rc6.metric("Node conn.", f"{float(base_res.get('node_connectivity', float('nan'))):.3f}" if pd.notna(base_res.get('node_connectivity')) else "—")
+            rc7.metric("AUC LCC", f"{float(attack_sum.get('auc_lcc_frac', 0.0)):.3f}" if pd.notna(attack_sum.get('auc_lcc_frac')) else "—")
+            rc8.metric("AUC eff", f"{float(attack_sum.get('auc_eff_w', 0.0)):.3f}" if pd.notna(attack_sum.get('auc_eff_w')) else "—")
+
+            exp1, exp2, exp3 = st.columns(3)
+            exp1.download_button(
+                "Скачать trajectory (.csv)",
+                df_res.to_csv(index=False).encode("utf-8"),
+                file_name=f"{active_entry.name}_{last_exp.attack_kind}_trajectory.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            exp2.download_button(
+                "Скачать attack summary (.json)",
+                json.dumps(attack_sum, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{active_entry.name}_{last_exp.attack_kind}_attack_summary.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+            exp3.download_button(
+                "Скачать graph resistance (.json)",
+                json.dumps(base_res, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{active_entry.name}_graph_resistance.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
             with st.expander("❓ Что на этих графиках", expanded=False):
                 txt = """
