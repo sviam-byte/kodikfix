@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import json
 import re
 import shutil
 import tempfile
+import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -129,6 +131,161 @@ def _single_row_xlsx_bytes(row: dict, *, sheet_name: str = "summary") -> bytes:
         pd.DataFrame([row or {}]).to_excel(writer, sheet_name=sheet_name[:31], index=False)
     buf.seek(0)
     return buf.getvalue()
+
+
+def _append_row_csv(csv_path: Path, row: dict) -> None:
+    """Append one row immediately so partial results survive crashes."""
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([row or {}]).to_csv(csv_path, mode="a", header=not csv_path.exists(), index=False)
+
+
+def _read_csv_maybe(csv_path: Path) -> pd.DataFrame:
+    """Read CSV if it exists and has data, otherwise return an empty DataFrame."""
+    csv_path = Path(csv_path)
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return pd.DataFrame()
+    return pd.read_csv(csv_path)
+
+
+def _rewrite_summary_xlsx(xlsx_path: Path, df: pd.DataFrame, *, sheet_name: str) -> Path:
+    """Rewrite summary workbook from an already materialized DataFrame."""
+    xlsx_path = Path(xlsx_path)
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        (df.copy() if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    return xlsx_path
+
+
+def _gc_collect() -> None:
+    """Force GC between items to limit memory growth on long batch runs."""
+    gc.collect()
+
+
+def _progress_log_path(out_dir: Path) -> Path:
+    """Return path to a per-run text progress log."""
+    return Path(out_dir) / "progress.log"
+
+
+def _append_progress_log(out_dir: Path, message: str) -> None:
+    """Append one timestamped line to the batch progress log."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_path = _progress_log_path(out_dir)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as fh:
+        fh.write(f"[{ts}] {message}\n")
+
+
+def _pause_if_requested(
+    out_dir: Path,
+    *,
+    progress_cb: ProgressCb | None = None,
+    idx: int = 0,
+    total: int = 0,
+    label: str = "",
+) -> None:
+    """Pause batch processing while pause marker files exist in output directory."""
+    pause_files = [Path(out_dir) / ".pause", Path(out_dir) / "PAUSE"]
+    logged = False
+    while any(p.exists() for p in pause_files):
+        if not logged:
+            _append_progress_log(out_dir, f"PAUSED at {idx}/{total} :: {label}")
+            if progress_cb:
+                progress_cb(idx, total, f"paused :: {label}")
+            logged = True
+        time.sleep(2.0)
+    if logged:
+        _append_progress_log(out_dir, f"RESUMED at {idx}/{total} :: {label}")
+
+
+def _expected_paths_for_item(mode: str, *, out_dir: Path, item_name: str) -> dict[str, Path]:
+    """Return expected artifact paths for one batch item in a given mode."""
+    out_dir = Path(out_dir)
+    if mode == "metrics":
+        return {
+            "json_path": out_dir / "per_item" / f"{item_name}.json",
+            "xlsx_path": out_dir / "per_item" / f"{item_name}.xlsx",
+        }
+    if mode == "attack":
+        return {
+            "json_path": out_dir / "payloads" / f"{item_name}.json",
+            "history_csv_path": out_dir / "histories" / f"{item_name}.csv",
+            "xlsx_path": out_dir / "per_item" / f"{item_name}.xlsx",
+        }
+    return {"xlsx_path": out_dir / "per_item" / f"{item_name}.xlsx"}
+
+
+def _item_already_done(mode: str, *, out_dir: Path, item_name: str) -> tuple[bool, dict[str, str]]:
+    """Check whether all expected artifacts already exist for one batch item."""
+    paths = _expected_paths_for_item(mode, out_dir=out_dir, item_name=item_name)
+    done = bool(paths) and all(p.exists() and p.stat().st_size > 0 for p in paths.values())
+    return done, {k: str(v.resolve()) for k, v in paths.items()}
+
+
+def _skipped_existing_row(
+    job: dict,
+    idx: int,
+    mode: str,
+    resolved_paths: dict[str, str],
+    *,
+    extra: dict | None = None,
+) -> tuple[dict, dict]:
+    """Build summary and manifest rows for items skipped due to existing artifacts."""
+    path = Path(job["path"])
+    row = {
+        "mode": mode,
+        "batch_index": idx,
+        "input": str(job.get("input", path)),
+        "input_file": path.name,
+        "input_stem": path.stem,
+        "input_suffix": path.suffix.lower(),
+        "relative_input": str(job.get("relative_input", "")),
+        "subject_name": str(job.get("subject_name") or ""),
+        "subject_index": job.get("subject_index"),
+        "status": "skipped_existing",
+        "error": "",
+        **(extra or {}),
+        **resolved_paths,
+    }
+    manifest_item = {
+        **_base_manifest_row(job, idx, mode),
+        "status": "skipped_existing",
+        "error": "",
+        "xlsx_path": resolved_paths.get("xlsx_path", ""),
+        "json_path": resolved_paths.get("json_path", ""),
+        "history_csv_path": resolved_paths.get("history_csv_path", ""),
+    }
+    return row, manifest_item
+
+
+def _finalize_batch_outputs(
+    out_dir: Path,
+    *,
+    summary_csv: Path,
+    summary_xlsx: Path,
+    summary_sheet: str,
+    manifest_path: Path,
+    files: list[Path],
+    args,
+    mode: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Finalize summary/manifest artifacts and return loaded DataFrames."""
+    summary_csv = Path(summary_csv)
+    manifest_csv = Path(out_dir) / "manifest.csv"
+    summary_csv.parent.mkdir(parents=True, exist_ok=True)
+    if not summary_csv.exists():
+        pd.DataFrame().to_csv(summary_csv, index=False)
+    if not manifest_csv.exists():
+        pd.DataFrame().to_csv(manifest_csv, index=False)
+    df = _read_csv_maybe(summary_csv)
+    manifest_df = _read_csv_maybe(manifest_csv)
+    _rewrite_summary_xlsx(summary_xlsx, df, sheet_name=summary_sheet)
+    _rewrite_summary_xlsx(Path(out_dir) / "manifest.xlsx", manifest_df, sheet_name="manifest")
+    manifest_path.write_text(
+        json.dumps(build_batch_manifest(files=files, args=args, mode=mode), ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    return df, manifest_df
 
 
 def _write_manifest_tables(out_dir: Path, df: pd.DataFrame, *, prefix: str = "manifest") -> tuple[Path, Path]:
@@ -351,20 +508,42 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     )
     files = [Path(p) for p in files]
     total = _estimate_total_jobs(files)
-    rows: list[dict] = []
-    manifest_rows: list[dict] = []
     rows_chunk: list[dict] = []
     manifest_chunk: list[dict] = []
     chunk_size = _chunk_size_from_args(args)
     chunk_idx = 0
+    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "energy_summary.csv"
+    manifest_csv = out_dir / "manifest.csv"
+    if summary_csv.exists():
+        summary_csv.unlink()
+    if manifest_csv.exists():
+        manifest_csv.unlink()
+    _append_progress_log(out_dir, f"START energy total={total}")
 
     for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
+        label = job.get("subject_name") or path.name
+        _pause_if_requested(out_dir, progress_cb=progress_cb, idx=idx - 1, total=total, label=str(label))
         if progress_cb:
-            label = job.get("subject_name") or path.name
             progress_cb(idx - 1, total, f"energy :: {label}")
         item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
         item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
+        done, resolved_paths = _item_already_done("energy", out_dir=out_dir, item_name=item_name)
+        if bool(getattr(args, "skip_existing", True)) and done:
+            row, manifest_item = _skipped_existing_row(job, idx, "energy", resolved_paths)
+            _append_row_csv(summary_csv, row)
+            _append_row_csv(manifest_csv, manifest_item)
+            rows_chunk.append(row)
+            manifest_chunk.append(manifest_item)
+            _append_progress_log(out_dir, f"[{idx}/{total}] SKIP existing :: {label}")
+            del row, manifest_item
+            _gc_collect()
+            if chunk_size and len(rows_chunk) >= chunk_size:
+                chunk_idx += 1
+                _flush_chunk_tables(out_dir, mode_name="energy", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+                rows_chunk = []
+                manifest_chunk = []
+            continue
         try:
             if job.get("graph") is None:
                 raise ValueError("Energy batch currently supports matrix/MAT inputs expanded to graphs")
@@ -436,10 +615,13 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "json_path": "",
                 "history_csv_path": "",
             }
-        rows.append(row)
-        manifest_rows.append(manifest_item)
+        _append_row_csv(summary_csv, row)
+        _append_row_csv(manifest_csv, manifest_item)
         rows_chunk.append(row)
         manifest_chunk.append(manifest_item)
+        _append_progress_log(out_dir, f"[{idx}/{total}] DONE energy :: {label} :: {row.get('status', 'ok')}")
+        del row, manifest_item
+        _gc_collect()
         if chunk_size and len(rows_chunk) >= chunk_size:
             chunk_idx += 1
             _flush_chunk_tables(out_dir, mode_name="energy", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
@@ -450,24 +632,22 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
         chunk_idx += 1
         _flush_chunk_tables(out_dir, mode_name="energy", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
 
-    df = pd.DataFrame(rows)
-    manifest_df = pd.DataFrame(manifest_rows)
-    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "energy_summary.csv"
     summary_xlsx = out_dir / "energy_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
-    summary_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(summary_csv, index=False)
-    with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="energy_runs", index=False)
-    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
-    manifest_path.write_text(
-        json.dumps(build_batch_manifest(files=files, args=args, mode="batch-energy"), ensure_ascii=False, indent=2, default=_json_default),
-        encoding="utf-8",
+    df, _ = _finalize_batch_outputs(
+        out_dir,
+        summary_csv=summary_csv,
+        summary_xlsx=summary_xlsx,
+        summary_sheet="energy_runs",
+        manifest_path=manifest_path,
+        files=files,
+        args=args,
+        mode="batch-energy",
     )
+    _append_progress_log(out_dir, f"FINISH energy rows={len(df)}")
     if progress_cb:
         progress_cb(total, total, f"saved -> {summary_csv.name}")
     return out_dir, df
-
 
 def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, pd.DataFrame]:
     """Run structural resistance batch and return output dir and summary DataFrame."""
@@ -484,19 +664,42 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
     )
     files = [Path(p) for p in files]
     total = _estimate_total_jobs(files)
-    rows: list[dict] = []
-    manifest_rows: list[dict] = []
     rows_chunk: list[dict] = []
     manifest_chunk: list[dict] = []
     chunk_size = _chunk_size_from_args(args)
     chunk_idx = 0
+    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "resistance_summary.csv"
+    manifest_csv = out_dir / "manifest.csv"
+    if summary_csv.exists():
+        summary_csv.unlink()
+    if manifest_csv.exists():
+        manifest_csv.unlink()
+    _append_progress_log(out_dir, f"START resistance total={total}")
+
     for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
+        label = job.get("subject_name") or path.name
+        _pause_if_requested(out_dir, progress_cb=progress_cb, idx=idx - 1, total=total, label=str(label))
         if progress_cb:
-            label = job.get("subject_name") or path.name
             progress_cb(idx - 1, total, f"resistance :: {label}")
         item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
         item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
+        done, resolved_paths = _item_already_done("resistance", out_dir=out_dir, item_name=item_name)
+        if bool(getattr(args, "skip_existing", True)) and done:
+            row, manifest_item = _skipped_existing_row(job, idx, "resistance", resolved_paths)
+            _append_row_csv(summary_csv, row)
+            _append_row_csv(manifest_csv, manifest_item)
+            rows_chunk.append(row)
+            manifest_chunk.append(manifest_item)
+            _append_progress_log(out_dir, f"[{idx}/{total}] SKIP existing :: {label}")
+            del row, manifest_item
+            _gc_collect()
+            if chunk_size and len(rows_chunk) >= chunk_size:
+                chunk_idx += 1
+                _flush_chunk_tables(out_dir, mode_name="resistance", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+                rows_chunk = []
+                manifest_chunk = []
+            continue
         try:
             if job.get("graph") is None:
                 raise ValueError("Resistance batch currently supports matrix/MAT inputs expanded to graphs")
@@ -550,10 +753,13 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
                 "json_path": "",
                 "history_csv_path": "",
             }
-        rows.append(row)
-        manifest_rows.append(manifest_item)
+        _append_row_csv(summary_csv, row)
+        _append_row_csv(manifest_csv, manifest_item)
         rows_chunk.append(row)
         manifest_chunk.append(manifest_item)
+        _append_progress_log(out_dir, f"[{idx}/{total}] DONE resistance :: {label} :: {row.get('status', 'ok')}")
+        del row, manifest_item
+        _gc_collect()
         if chunk_size and len(rows_chunk) >= chunk_size:
             chunk_idx += 1
             _flush_chunk_tables(out_dir, mode_name="resistance", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
@@ -562,24 +768,23 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
     if rows_chunk or manifest_chunk:
         chunk_idx += 1
         _flush_chunk_tables(out_dir, mode_name="resistance", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
-    df = pd.DataFrame(rows)
-    manifest_df = pd.DataFrame(manifest_rows)
-    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "resistance_summary.csv"
+
     summary_xlsx = out_dir / "resistance_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
-    summary_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(summary_csv, index=False)
-    with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="robustness_summary", index=False)
-    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
-    manifest_path.write_text(
-        json.dumps(build_batch_manifest(files=files, args=args, mode="batch-resistance"), ensure_ascii=False, indent=2, default=_json_default),
-        encoding="utf-8",
+    df, _ = _finalize_batch_outputs(
+        out_dir,
+        summary_csv=summary_csv,
+        summary_xlsx=summary_xlsx,
+        summary_sheet="robustness_summary",
+        manifest_path=manifest_path,
+        files=files,
+        args=args,
+        mode="batch-resistance",
     )
+    _append_progress_log(out_dir, f"FINISH resistance rows={len(df)}")
     if progress_cb:
         progress_cb(total, total, f"saved -> {summary_csv.name}")
     return out_dir, df
-
 
 def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, dict[str, pd.DataFrame]]:
     """Run selected batch tasks (metrics/attack/energy/resistance) and return per-mode DataFrames."""
@@ -766,20 +971,42 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
     )
     files = [Path(p) for p in files]
     total = _estimate_total_jobs(files)
-    rows: list[dict] = []
-    manifest_rows: list[dict] = []
     rows_chunk: list[dict] = []
     manifest_chunk: list[dict] = []
     chunk_size = _chunk_size_from_args(args)
     chunk_idx = 0
+    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "metrics_summary.csv"
+    manifest_csv = out_dir / "manifest.csv"
+    if summary_csv.exists():
+        summary_csv.unlink()
+    if manifest_csv.exists():
+        manifest_csv.unlink()
+    _append_progress_log(out_dir, f"START metrics total={total}")
 
     for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
+        label = job.get("subject_name") or path.name
+        _pause_if_requested(out_dir, progress_cb=progress_cb, idx=idx - 1, total=total, label=str(label))
         if progress_cb:
-            label = job.get("subject_name") or path.name
             progress_cb(idx - 1, total, f"metrics :: {label}")
         item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
         item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
+        done, resolved_paths = _item_already_done("metrics", out_dir=out_dir, item_name=item_name)
+        if bool(getattr(args, "skip_existing", True)) and done:
+            row, manifest_item = _skipped_existing_row(job, idx, "metrics", resolved_paths)
+            _append_row_csv(summary_csv, row)
+            _append_row_csv(manifest_csv, manifest_item)
+            rows_chunk.append(row)
+            manifest_chunk.append(manifest_item)
+            _append_progress_log(out_dir, f"[{idx}/{total}] SKIP existing :: {label}")
+            del row, manifest_item
+            _gc_collect()
+            if chunk_size and len(rows_chunk) >= chunk_size:
+                chunk_idx += 1
+                _flush_chunk_tables(out_dir, mode_name="metrics", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+                rows_chunk = []
+                manifest_chunk = []
+            continue
         try:
             if job.get("graph") is not None:
                 payload = _metrics_payload_from_graph(args, job["graph"], input_label=str(job["input"]))
@@ -845,10 +1072,13 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
                 "json_path": "",
                 "history_csv_path": "",
             }
-        rows.append(row)
-        manifest_rows.append(manifest_item)
+        _append_row_csv(summary_csv, row)
+        _append_row_csv(manifest_csv, manifest_item)
         rows_chunk.append(row)
         manifest_chunk.append(manifest_item)
+        _append_progress_log(out_dir, f"[{idx}/{total}] DONE metrics :: {label} :: {row.get('status', 'ok')}")
+        del row, manifest_item
+        _gc_collect()
         if chunk_size and len(rows_chunk) >= chunk_size:
             chunk_idx += 1
             _flush_chunk_tables(out_dir, mode_name="metrics", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
@@ -859,27 +1089,23 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
         chunk_idx += 1
         _flush_chunk_tables(out_dir, mode_name="metrics", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
 
-    df = pd.DataFrame(rows)
-    manifest_df = pd.DataFrame(manifest_rows)
-    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "metrics_summary.csv"
     summary_xlsx = out_dir / "metrics_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
-
-    summary_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(summary_csv, index=False)
-    with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="metrics", index=False)
-    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
-
-    manifest_path.write_text(
-        json.dumps(build_batch_manifest(files=files, args=args, mode="batch-metrics"), ensure_ascii=False, indent=2, default=_json_default),
-        encoding="utf-8",
+    df, _ = _finalize_batch_outputs(
+        out_dir,
+        summary_csv=summary_csv,
+        summary_xlsx=summary_xlsx,
+        summary_sheet="metrics",
+        manifest_path=manifest_path,
+        files=files,
+        args=args,
+        mode="batch-metrics",
     )
+    _append_progress_log(out_dir, f"FINISH metrics rows={len(df)}")
 
     if progress_cb:
         progress_cb(total, total, f"saved -> {summary_csv.name}")
     return out_dir, df
-
 
 def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, pd.DataFrame]:
     """Run attack batch and return output dir and summary DataFrame."""
@@ -901,20 +1127,48 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     )
     files = [Path(p) for p in files]
     total = _estimate_total_jobs(files)
-    rows: list[dict] = []
-    manifest_rows: list[dict] = []
     rows_chunk: list[dict] = []
     manifest_chunk: list[dict] = []
     chunk_size = _chunk_size_from_args(args)
     chunk_idx = 0
+    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "attack_summary.csv"
+    manifest_csv = out_dir / "manifest.csv"
+    if summary_csv.exists():
+        summary_csv.unlink()
+    if manifest_csv.exists():
+        manifest_csv.unlink()
+    _append_progress_log(out_dir, f"START attack total={total}")
 
     for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
+        label = job.get("subject_name") or path.name
+        _pause_if_requested(out_dir, progress_cb=progress_cb, idx=idx - 1, total=total, label=str(label))
         if progress_cb:
-            label = job.get("subject_name") or path.name
             progress_cb(idx - 1, total, f"attack :: {label}")
         item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
         item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
+        done, resolved_paths = _item_already_done("attack", out_dir=out_dir, item_name=item_name)
+        if bool(getattr(args, "skip_existing", True)) and done:
+            row, manifest_item = _skipped_existing_row(
+                job,
+                idx,
+                "attack",
+                resolved_paths,
+                extra={"family": str(args.family), "kind": str(args.kind)},
+            )
+            _append_row_csv(summary_csv, row)
+            _append_row_csv(manifest_csv, manifest_item)
+            rows_chunk.append(row)
+            manifest_chunk.append(manifest_item)
+            _append_progress_log(out_dir, f"[{idx}/{total}] SKIP existing :: {label}")
+            del row, manifest_item
+            _gc_collect()
+            if chunk_size and len(rows_chunk) >= chunk_size:
+                chunk_idx += 1
+                _flush_chunk_tables(out_dir, mode_name="attack", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
+                rows_chunk = []
+                manifest_chunk = []
+            continue
         try:
             if job.get("graph") is not None:
                 payload, history = _attack_payload_from_graph(args, job["graph"], input_label=str(job["input"]))
@@ -991,10 +1245,13 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "json_path": "",
                 "history_csv_path": "",
             }
-        rows.append(row)
-        manifest_rows.append(manifest_item)
+        _append_row_csv(summary_csv, row)
+        _append_row_csv(manifest_csv, manifest_item)
         rows_chunk.append(row)
         manifest_chunk.append(manifest_item)
+        _append_progress_log(out_dir, f"[{idx}/{total}] DONE attack :: {label} :: {row.get('status', 'ok')}")
+        del row, manifest_item
+        _gc_collect()
         if chunk_size and len(rows_chunk) >= chunk_size:
             chunk_idx += 1
             _flush_chunk_tables(out_dir, mode_name="attack", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
@@ -1005,23 +1262,21 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
         chunk_idx += 1
         _flush_chunk_tables(out_dir, mode_name="attack", chunk_idx=chunk_idx, rows_chunk=rows_chunk, manifest_chunk=manifest_chunk)
 
-    df = pd.DataFrame(rows)
-    manifest_df = pd.DataFrame(manifest_rows)
-    summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "attack_summary.csv"
     summary_xlsx = out_dir / "attack_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
-
-    summary_csv.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(summary_csv, index=False)
-    with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="attacks", index=False)
-    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
-
-    manifest_path.write_text(
-        json.dumps(build_batch_manifest(files=files, args=args, mode="batch-attack"), ensure_ascii=False, indent=2, default=_json_default),
-        encoding="utf-8",
+    df, _ = _finalize_batch_outputs(
+        out_dir,
+        summary_csv=summary_csv,
+        summary_xlsx=summary_xlsx,
+        summary_sheet="attacks",
+        manifest_path=manifest_path,
+        files=files,
+        args=args,
+        mode="batch-attack",
     )
+    _append_progress_log(out_dir, f"FINISH attack rows={len(df)}")
 
     if progress_cb:
         progress_cb(total, total, f"saved -> {summary_csv.name}")
     return out_dir, df
+
