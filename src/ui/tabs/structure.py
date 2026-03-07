@@ -168,7 +168,7 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
             )
             st.plotly_chart(
                 fig_3d,
-                use_container_width=True,
+                width="stretch",
                 key=f"plot_struct_3d_{active_entry.id}_{ui_epoch}",
             )
         else:
@@ -180,6 +180,6 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         adj = nx.adjacency_matrix(as_simple_undirected(G_view), weight="weight").todense()
         fig_hm = px.imshow(adj, title="Adjacency Heatmap", color_continuous_scale="Viridis")
         fig_hm.update_layout(template="plotly_dark", height=760, width=760)
-        st.plotly_chart(fig_hm, use_container_width=False, key="plot_adj_heatmap")
+        st.plotly_chart(fig_hm, width="content", key="plot_adj_heatmap")
     else:
         st.info("Матрица слишком большая для отображения (N >= 1000) или граф пуст.")

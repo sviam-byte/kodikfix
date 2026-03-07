@@ -573,8 +573,8 @@ def _render_research_tab(
     graph_ids = [cur_gid] if scope == "Активный граф" else list(ctx.graphs.keys())
 
     c_run1, c_run2 = st.columns(2)
-    run_active = c_run1.button("Посчитать всё", type="primary", use_container_width=True)
-    run_all = c_run2.button("Посчитать всё для всех графов", use_container_width=True)
+    run_active = c_run1.button("Посчитать всё", type="primary", width="stretch")
+    run_all = c_run2.button("Посчитать всё для всех графов", width="stretch")
     if run_active:
         graph_ids = [cur_gid]
     if run_all:
@@ -632,11 +632,11 @@ def _render_research_tab(
     cached = st.session_state.get("__research_results")
     if cached:
         d1, d2 = st.columns(2)
-        d1.download_button("Скачать research_summary.xlsx", data=cached["xlsx"], file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        d2.download_button("Скачать research_bundle.zip", data=cached["zip"], file_name="research_bundle.zip", mime="application/zip", use_container_width=True)
+        d1.download_button("Скачать research_summary.xlsx", data=cached["xlsx"], file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+        d2.download_button("Скачать research_bundle.zip", data=cached["zip"], file_name="research_bundle.zip", mime="application/zip", width="stretch")
         for name, df in cached.get("frames", {}).items():
             st.markdown(f"**{name}**")
-            st.dataframe(df, use_container_width=True, height=min(420, 44 + 36 * min(len(df), 8)))
+            st.dataframe(df, width="stretch", height=min(420, 44 + 36 * min(len(df), 8)))
 
 def _run_article_plan(
     G_view: nx.Graph,
@@ -894,7 +894,7 @@ with st.sidebar:
                     "subject": mat_subjects[: int(preview_n)],
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             height=220,
         )
 
@@ -906,7 +906,7 @@ with st.sidebar:
         )
 
         b1, b2, b3 = st.columns(3)
-        if b1.button("Import selected", use_container_width=True):
+        if b1.button("Import selected", width="stretch"):
             selected_set = set(selected_subjects)
             idx = [i for i, s in enumerate(mat_subjects) if s in selected_set]
             if not idx:
@@ -916,12 +916,12 @@ with st.sidebar:
                 st.session_state["__upload_status"] = f"Импортировано {len(added_ids)} выбранных графов из {mat_name}."
                 _clear_pending_upload_state()
                 st.rerun()
-        if b2.button("Import all", use_container_width=True):
+        if b2.button("Import all", width="stretch"):
             added_ids = _import_staged_mat_graphs(None)
             st.session_state["__upload_status"] = f"Импортировано {len(added_ids)} графов из {mat_name}."
             _clear_pending_upload_state()
             st.rerun()
-        if b3.button("Cancel", use_container_width=True):
+        if b3.button("Cancel", width="stretch"):
             _clear_pending_upload_state()
             st.info("MAT staging очищен.")
             st.rerun()
@@ -958,7 +958,7 @@ with st.sidebar:
 
                 show_preview = st.checkbox("Показать первые строки", value=False)
                 if show_preview:
-                    st.dataframe(df_raw.head(30), use_container_width=True)
+                    st.dataframe(df_raw.head(30), width="stretch")
 
                 if st.button("Загрузить с этим маппингом", type="primary"):
                     tmp_df = pd.DataFrame(
@@ -1222,7 +1222,7 @@ if page_mode == "Batch-план":
             key="__batch_pick_mode_page",
         )
         st.caption(f"Найдено файлов: {len(display_files)}")
-        st.dataframe(pd.DataFrame({"file": display_files}), use_container_width=True, height=260)
+        st.dataframe(pd.DataFrame({"file": display_files}), width="stretch", height=260)
         if pick_mode == "Только выбранных":
             selected_display = st.multiselect(
                 "Выбери файлы",
@@ -1238,7 +1238,7 @@ if page_mode == "Batch-план":
         run_label = "всех" if pick_mode == "Всех найденных" else f"выбранных ({len(selected_files_abs)})"
         batch_status = st.empty()
         batch_prog = st.progress(0.0)
-        run_batch_btn = st.button(f"Посчитать для {run_label}", type="primary", use_container_width=True)
+        run_batch_btn = st.button(f"Посчитать для {run_label}", type="primary", width="stretch")
 
         if run_batch_btn:
             cleanup_cb_run = None
@@ -1420,7 +1420,7 @@ with st.sidebar:
         len(ctx.experiments),
     )
 
-    if st.button("🧠 Посчитать по плану", use_container_width=True):
+    if st.button("🧠 Посчитать по плану", width="stretch"):
         _run_article_plan(
             # Собираем граф локально, чтобы не зависеть от инициализации G_view ниже по файлу.
             cached_build_graph(
@@ -1448,7 +1448,7 @@ with st.sidebar:
     st.caption("План считает полный набор метрик текущего графа, Ricci и готовит ZIP/XLSX для статьи. Для batch-атак/энергии используй отдельную вкладку Research calc.")
 
     b_zip, b_xlsx = st.columns(2)
-    if b_zip.button("Prepare ZIP", use_container_width=True):
+    if b_zip.button("Prepare ZIP", width="stretch"):
         bar, msg, cb = _export_progress_ui("ZIP")
         try:
             payload = export_stats_zip_bytes(
@@ -1470,7 +1470,7 @@ with st.sidebar:
             bar.empty()
             msg.empty()
 
-    if b_xlsx.button("Prepare XLSX", use_container_width=True):
+    if b_xlsx.button("Prepare XLSX", width="stretch"):
         bar, msg, cb = _export_progress_ui("XLSX")
         try:
             payload = export_stats_xlsx_bytes(
@@ -1499,7 +1499,7 @@ with st.sidebar:
             data=zip_payload,
             file_name="stats_tables.zip",
             mime="application/zip",
-            use_container_width=True,
+            width="stretch",
         )
 
     xlsx_payload = st.session_state["__stats_export_cache"].get(("xlsx", export_key_base))
@@ -1509,7 +1509,7 @@ with st.sidebar:
             data=xlsx_payload,
             file_name="stats_tables.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
 
     # DEBUG: если совсем странно

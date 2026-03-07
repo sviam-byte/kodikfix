@@ -90,7 +90,7 @@ def render(G_view: nx.Graph | None, met: dict, active_entry: GraphEntry) -> None
     st.markdown("---")
     st.subheader("Все рассчитанные метрики")
     df_full = _full_metrics_df(met)
-    st.dataframe(df_full, use_container_width=True, height=420)
+    st.dataframe(df_full, width="stretch", height=420)
     st.download_button(
         "⬇️ Скачать current_subject_metrics.csv",
         data=df_full.to_csv(index=False).encode("utf-8"),

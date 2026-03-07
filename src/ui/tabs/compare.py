@@ -104,8 +104,8 @@ def render(
             df_cmp = pd.DataFrame(rows)
             fig_bar = px.bar(df_cmp, x="Name", y=scalar_metric, title=f"Comparison: {scalar_metric}", color="Name")
             fig_bar.update_layout(template="plotly_dark", height=780)
-            st.plotly_chart(fig_bar, use_container_width=True, key="plot_compare_bar")
-            st.dataframe(df_cmp, use_container_width=True)
+            st.plotly_chart(fig_bar, width="stretch", key="plot_compare_bar")
+            st.dataframe(df_cmp, width="stretch")
         else:
             st.info("Выбери графы.")
 
@@ -155,7 +155,7 @@ def render(
                 fig_lines.update_layout(template="plotly_dark")
                 all_y = pd.concat([pd.to_numeric(df[y_axis], errors="coerce") for _, df in curves if y_axis in df.columns], ignore_index=True)
                 fig_lines = _apply_plot_defaults(fig_lines, height=st.session_state["plot_height"], y_range=_auto_y_range(all_y))
-                st.plotly_chart(fig_lines, use_container_width=True, key="plot_compare_lines")
+                st.plotly_chart(fig_lines, width="stretch", key="plot_compare_lines")
 
                 st.markdown("#### Robustness (AUC)")
                 auc_rows = []
@@ -169,6 +169,6 @@ def render(
                             auc_rows.append({"Experiment": name, "AUC": auc})
 
                 if auc_rows:
-                    st.dataframe(pd.DataFrame(auc_rows).sort_values("AUC", ascending=False), use_container_width=True)
+                    st.dataframe(pd.DataFrame(auc_rows).sort_values("AUC", ascending=False), width="stretch")
             else:
                 st.info("Выбери эксперименты.")

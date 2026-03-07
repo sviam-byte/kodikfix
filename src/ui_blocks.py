@@ -139,7 +139,7 @@ def render_dashboard_charts(G_view, apply_plot_defaults) -> None:
             )
             fig_deg.update_layout(template="plotly_dark")
             apply_plot_defaults(fig_deg, height=620)
-            st.plotly_chart(fig_deg, use_container_width=True, key="plot_deg_hist")
+            st.plotly_chart(fig_deg, width="stretch", key="plot_deg_hist")
         else:
             st.info("Граф пуст: degree distribution не построить.")
 
@@ -155,6 +155,6 @@ def render_dashboard_charts(G_view, apply_plot_defaults) -> None:
             )
             fig_w.update_layout(template="plotly_dark")
             apply_plot_defaults(fig_w, height=620)
-            st.plotly_chart(fig_w, use_container_width=True, key="plot_w_hist")
+            st.plotly_chart(fig_w, width="stretch", key="plot_w_hist")
         else:
             st.info("Нет валидных весов для histogram.")

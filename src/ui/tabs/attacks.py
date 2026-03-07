@@ -181,7 +181,7 @@ def _live_history_preview(max_rows: int = 12):
         _ = (i, total)  # kept for signature compatibility with attack callbacks
         rows.append(dict(row))
         df = pd.DataFrame(rows[-max_rows:])
-        holder.dataframe(df, use_container_width=True, height=260)
+        holder.dataframe(df, width="stretch", height=260)
 
     return holder, _row_cb
 
@@ -302,7 +302,7 @@ def render_null_models(G_view: nx.Graph | None, G_full: nx.Graph | None, met: di
             "Active Graph": [met_light.get("avg_degree", np.nan), met_light.get("density", np.nan), met_light.get("clustering", np.nan), met_light.get("mod", np.nan)],
             "ER Expected": [met_light.get("avg_degree", np.nan), er_density, er_clustering, "~0.0"],
         })
-        st.dataframe(cmp_df, use_container_width=True)
+        st.dataframe(cmp_df, width="stretch")
 
 def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src_col: str, dst_col: str, min_conf: float, min_weight: float, analysis_mode: str, save_experiment_callback) -> None:
     """Render the Attack Lab tab."""
@@ -413,7 +413,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                 swaps_per_edge = st.slider("swaps_per_edge", 0.0, 3.0, 0.5, 0.1)
                 st.caption("Ось X здесь: mix_frac (0..1), а не removed_frac.")
 
-            if st.button("🚀 RUN", type="primary", use_container_width=True):
+            if st.button("🚀 RUN", type="primary", width="stretch"):
                 if family.startswith("Mix/Entropy"):
                     with st.spinner(f"Mix attack: {kind}"):
                         bar = st.progress(0.0)
@@ -650,7 +650,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             fig.update_traces(mode="lines+markers")
             fig.update_traces(line_width=3)
             fig = _apply_plot_defaults(fig, height=st.session_state["plot_height"])
-            st.plotly_chart(fig, use_container_width=True, key="plot_attack_metrics")
+            st.plotly_chart(fig, width="stretch", key="plot_attack_metrics")
 
             st.markdown("#### AUC (robustness) по выбранной метрике")
             y_axis = st.selectbox(
@@ -691,21 +691,21 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                 df_res.to_csv(index=False).encode("utf-8"),
                 file_name=f"{active_entry.name}_{last_exp.attack_kind}_trajectory.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width="stretch",
             )
             exp2.download_button(
                 "Скачать attack summary (.json)",
                 json.dumps(attack_sum, ensure_ascii=False, indent=2).encode("utf-8"),
                 file_name=f"{active_entry.name}_{last_exp.attack_kind}_attack_summary.json",
                 mime="application/json",
-                use_container_width=True,
+                width="stretch",
             )
             exp3.download_button(
                 "Скачать graph resistance (.json)",
                 json.dumps(base_res, ensure_ascii=False, indent=2).encode("utf-8"),
                 file_name=f"{active_entry.name}_graph_resistance.json",
                 mime="application/json",
-                use_container_width=True,
+                width="stretch",
             )
 
             with st.expander("❓ Что на этих графиках", expanded=False):
@@ -728,7 +728,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                 fig_lcc = px.line(df_res, x=xcol, y="lcc_frac", title="Order parameter: LCC fraction vs removed fraction")
                 fig_lcc.update_layout(template="plotly_dark")
                 fig_lcc = _apply_plot_defaults(fig_lcc, height=780, y_range=_auto_y_range(df_res["lcc_frac"]))
-                st.plotly_chart(fig_lcc, use_container_width=True, key="plot_phase_lcc")
+                st.plotly_chart(fig_lcc, width="stretch", key="plot_phase_lcc")
 
             if xcol in df_res.columns and "lcc_frac" in df_res.columns:
                 dfp = df_res.sort_values(xcol).copy()
@@ -738,7 +738,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                 fig_s = px.line(dfp, x=xcol, y="suscep", title="Susceptibility proxy: d(LCC)/dx")
                 fig_s.update_layout(template="plotly_dark")
                 fig_s = _apply_plot_defaults(fig_s, height=780, y_range=_auto_y_range(dfp["suscep"]))
-                st.plotly_chart(fig_s, use_container_width=True, key="plot_phase_suscep")
+                st.plotly_chart(fig_s, width="stretch", key="plot_phase_suscep")
 
             if "mod" in df_res.columns and "l2_lcc" in df_res.columns:
                 dfp2 = df_res.copy()
@@ -749,7 +749,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     fig_phase = px.line(dfp2, x="l2_lcc", y="mod", title="Phase portrait (trajectory): Q vs λ₂")
                     fig_phase.update_layout(template="plotly_dark")
                     fig_phase = _apply_plot_defaults(fig_phase, height=780)
-                    st.plotly_chart(fig_phase, use_container_width=True, key="plot_phase_portrait")
+                    st.plotly_chart(fig_phase, width="stretch", key="plot_phase_portrait")
 
         elif selected_attack_tab == attack_tabs[2]:
             edge_overlay_ui = st.selectbox(
@@ -829,7 +829,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         fig = go.Figure(data=[*edge_traces, node_trace])
                         fig.update_layout(template="plotly_dark", height=860, showlegend=False)
                         fig.update_layout(title=f"Node removal | step={step_val}/{max_steps} | removed~{k_remove} | frac={frac_here:.3f}")
-                        st.plotly_chart(fig, use_container_width=True, key="plot_attack_3d_node_step")
+                        st.plotly_chart(fig, width="stretch", key="plot_attack_3d_node_step")
                     else:
                         st.info("На этом шаге граф пуст.")
 
@@ -882,7 +882,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         fig = go.Figure(data=[*edge_traces, node_trace])
                         fig.update_layout(template="plotly_dark", height=860, showlegend=False)
                         fig.update_layout(title=f"Edge removal | step={step_val}/{max_steps} | removed~{k_remove} edges | frac={frac_here:.3f}")
-                        st.plotly_chart(fig, use_container_width=True, key="plot_attack_3d_edge_step")
+                        st.plotly_chart(fig, width="stretch", key="plot_attack_3d_edge_step")
                     else:
                         st.info("На этом шаге граф пуст.")
 
@@ -962,12 +962,12 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             run_mixfrac = mf_btn1.button(
                 "🧭 Estimate",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 key="mixfrac_run",
             )
             save_mixfrac = mf_btn2.button(
                 "💾 Save result",
-                use_container_width=True,
+                width="stretch",
                 key="mixfrac_save",
             )
 
@@ -1007,7 +1007,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         "distance": dists[: len(vals)] if dists else [np.nan] * len(vals),
                     }
                 )
-                st.dataframe(df_show, use_container_width=True)
+                st.dataframe(df_show, width="stretch")
 
                 fig_vals = px.histogram(
                     df_show,
@@ -1016,7 +1016,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     title="Distribution of mix_frac values",
                 )
                 fig_vals.update_layout(template="plotly_dark")
-                st.plotly_chart(fig_vals, use_container_width=True, key="mixfrac_hist_vals")
+                st.plotly_chart(fig_vals, width="stretch", key="mixfrac_hist_vals")
 
                 if np.isfinite(df_show["distance"]).any():
                     fig_dist = px.histogram(
@@ -1026,7 +1026,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         title="Distribution of matching distances",
                     )
                     fig_dist.update_layout(template="plotly_dark")
-                    st.plotly_chart(fig_dist, use_container_width=True, key="mixfrac_hist_dist")
+                    st.plotly_chart(fig_dist, width="stretch", key="mixfrac_hist_dist")
         else:
             st.info("Выбери healthy-графы и запусти оценку.")
 
@@ -1154,7 +1154,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             heavy_b = st.slider("Heavy every N", 1, 10, 2, key="batch_heavy")
             tag_b = st.text_input("Тег batch", "", key="batch_tag")
 
-        if st.button("🚀 RUN PRESET SUITE", type="primary", use_container_width=True, key="run_suite"):
+        if st.button("🚀 RUN PRESET SUITE", type="primary", width="stretch", key="run_suite"):
             with st.spinner(f"Running preset: {preset_name}"):
                 if batch_family.startswith("Node"):
                     curves = run_node_attack_suite(
@@ -1191,7 +1191,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             fig.update_layout(template="plotly_dark")
             all_y = pd.concat([pd.to_numeric(df[y_axis], errors="coerce") for _, df in curves if y_axis in df.columns], ignore_index=True)
             fig = _apply_plot_defaults(fig, height=st.session_state["plot_height"], y_range=_auto_y_range(all_y))
-            st.plotly_chart(fig, use_container_width=True, key="plot_suite_compare")
+            st.plotly_chart(fig, width="stretch", key="plot_suite_compare")
 
             st.markdown("#### AUC ranking")
             rows = []
@@ -1204,7 +1204,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                         rows.append({"run": name, "AUC": float(AUC_TRAP(ys[mask].to_numpy(), xs[mask].to_numpy()))})
             if rows:
                 df_auc = pd.DataFrame(rows).sort_values("AUC", ascending=False)
-                st.dataframe(df_auc, use_container_width=True)
+                st.dataframe(df_auc, width="stretch")
         else:
             st.info("Запусти suite слева, чтобы увидеть сравнение.")
 
@@ -1253,7 +1253,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             mg_heavy = st.slider("Heavy every N", 1, 10, 2, key="mg_heavy")
             mg_tag = st.text_input("Тег multi", "", key="mg_tag")
 
-        if st.button("🚀 RUN MULTI-GRAPH SUITE", type="primary", use_container_width=True, key="run_mg"):
+        if st.button("🚀 RUN MULTI-GRAPH SUITE", type="primary", width="stretch", key="run_mg"):
             if not sel_gids:
                 st.error("Выбери хотя бы один граф.")
             else:
@@ -1311,6 +1311,6 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             fig.update_layout(template="plotly_dark")
             all_y = pd.concat([pd.to_numeric(df[y], errors="coerce") for _, df in multi_curves if y in df.columns], ignore_index=True)
             fig = _apply_plot_defaults(fig, height=st.session_state["plot_height"], y_range=_auto_y_range(all_y))
-            st.plotly_chart(fig, use_container_width=True, key="plot_multi_compare")
+            st.plotly_chart(fig, width="stretch", key="plot_multi_compare")
         else:
             st.info("Запусти multi suite слева, чтобы увидеть сравнение.")
