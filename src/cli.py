@@ -197,6 +197,7 @@ def _metrics_payload_from_graph(args, graph, *, input_label: str) -> dict:
         compute_heavy=bool(getattr(args, "compute_heavy", True)),
         skip_spectral=bool(getattr(args, "skip_spectral", False)),
         diameter_samples=int(getattr(args, "diameter_samples", 16)),
+        ricci_n_jobs=int(getattr(args, "n_jobs", 0)) or None,
     )
     return {
         "mode": "metrics",
