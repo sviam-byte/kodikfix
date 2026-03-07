@@ -300,7 +300,7 @@ def render_null_models(G_view: nx.Graph | None, G_full: nx.Graph | None, met: di
         cmp_df = pd.DataFrame({
             "Metric": ["Avg Degree", "Density", "Clustering (C)", "Modularity (примерно)"],
             "Active Graph": [met_light.get("avg_degree", np.nan), met_light.get("density", np.nan), met_light.get("clustering", np.nan), met_light.get("mod", np.nan)],
-            "ER Expected": [met_light.get("avg_degree", np.nan), er_density, er_clustering, "~0.0"],
+            "ER Expected": [met_light.get("avg_degree", np.nan), er_density, er_clustering, 0.0],
         })
         st.dataframe(cmp_df, width="stretch")
 

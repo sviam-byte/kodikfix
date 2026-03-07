@@ -45,6 +45,11 @@ from src.core.physics import simulate_energy_flow
 from src.services.graph_service import GraphService
 from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
 from src.exporters import export_energy_tables_xlsx, payload_to_flat_row
+from src.energy_export import (
+    energy_run_summary_dict,
+    frames_to_energy_nodes_long,
+    frames_to_energy_steps_summary,
+)
 from src.robustness import attack_trajectory_summary, graph_resistance_summary
 from src.cli import _attack_payload_from_graph, _metrics_payload_from_graph
 from src.state.session import ctx
@@ -485,31 +490,31 @@ def _run_research_workspace_plan(
                 phys_cap_mode=str(energy_phys_cap_mode),
                 rw_impulse=bool(energy_rw_impulse),
             )
-            energy_nodes_long = pd.concat(node_frames, ignore_index=True) if node_frames else pd.DataFrame()
-            energy_edges_long = pd.concat(edge_frames, ignore_index=True) if edge_frames else pd.DataFrame()
-            if not energy_nodes_long.empty and "step" in energy_nodes_long.columns:
-                energy_steps_summary = energy_nodes_long.groupby("step", dropna=False).agg(
-                    total_energy=("energy", "sum"),
-                    mean_energy=("energy", "mean"),
-                    max_energy=("energy", "max"),
-                ).reset_index()
-            else:
-                energy_steps_summary = pd.DataFrame()
-            energy_run_summary = {
+            # Keep tab-level energy outputs aligned with batch/service exporters.
+            energy_nodes_long = frames_to_energy_nodes_long(graph, node_frames, sources=None)
+            energy_steps_summary = frames_to_energy_steps_summary(graph, node_frames, edge_frames, sources=None)
+            energy_run_summary = energy_run_summary_dict(
+                graph,
+                node_frames,
+                edge_frames,
+                sources=None,
+                flow_mode=str(energy_flow_mode),
+            )
+            energy_edges_long = pd.DataFrame(edge_frames or [])
+            energy_run_summary.update({
                 "graph_id": entry.id,
                 "graph_name": entry.name,
                 "source": entry.source,
-                "flow_mode": str(energy_flow_mode),
-                "steps": int(energy_steps),
+                "steps_requested": int(energy_steps),
                 "n_node_rows": int(len(energy_nodes_long)),
                 "n_edge_rows": int(len(energy_edges_long)),
-                "final_total_energy": float(energy_steps_summary["total_energy"].iloc[-1]) if not energy_steps_summary.empty else np.nan,
-                "peak_node_energy": float(energy_nodes_long["energy"].max()) if not energy_nodes_long.empty else np.nan,
-            }
+            })
             results["research_energy_runs"].append(energy_run_summary)
             extras[f"energy/{entry.id}__energy.xlsx"] = export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary)
             extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
             extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
+            extras[f"energy/{entry.id}__steps_summary.csv"] = energy_steps_summary.to_csv(index=False).encode("utf-8")
+            extras[f"energy/{entry.id}__run_summary.json"] = json.dumps(energy_run_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
         bar.progress(float(idx) / float(total))
 
