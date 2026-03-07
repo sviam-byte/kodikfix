@@ -5,6 +5,29 @@ import numpy as np
 import pandas as pd
 
 
+def _trapz_compat(y, x=None, dx: float = 1.0) -> float:
+    """Compat trapezoidal integration across NumPy versions."""
+    if hasattr(np, "trapezoid"):
+        if x is None:
+            return float(np.trapezoid(y, dx=dx))
+        return float(np.trapezoid(y, x=x))
+    if hasattr(np, "trapz"):
+        if x is None:
+            return float(np.trapz(y, dx=dx))
+        return float(np.trapz(y, x=x))
+
+    y = np.asarray(y, dtype=float)
+    if y.size < 2:
+        return float(y.sum())
+    if x is None:
+        return float(dx * (0.5 * y[0] + y[1:-1].sum() + 0.5 * y[-1]))
+
+    x = np.asarray(x, dtype=float)
+    if x.size != y.size:
+        raise ValueError("x and y must have the same length")
+    return float(np.sum((x[1:] - x[:-1]) * (y[1:] + y[:-1]) * 0.5))
+
+
 def _safe_float(x, default: float = float("nan")) -> float:
     try:
         v = float(x)
@@ -90,7 +113,7 @@ def attack_trajectory_summary(df_hist: pd.DataFrame, *, attack_kind: str = "") -
             yv = ys[mask]
             xv = xs[mask]
             out["final_lcc_frac"] = float(yv[-1])
-            out["auc_lcc_frac"] = float(np.trapz(yv, xv)) if yv.size >= 2 else float(yv.sum())
+            out["auc_lcc_frac"] = _trapz_compat(yv, x=xv) if yv.size >= 2 else float(yv.sum())
             hits50 = np.where(yv <= 0.5)[0]
             hits10 = np.where(yv <= 0.1)[0]
             out["collapse_step_50"] = float(xv[hits50[0]]) if hits50.size else float("nan")
@@ -102,5 +125,5 @@ def attack_trajectory_summary(df_hist: pd.DataFrame, *, attack_kind: str = "") -
             yv = ys[mask]
             xv = xs[mask]
             out["final_eff_w"] = float(yv[-1])
-            out["auc_eff_w"] = float(np.trapz(yv, xv)) if yv.size >= 2 else float(yv.sum())
+            out["auc_eff_w"] = _trapz_compat(yv, x=xv) if yv.size >= 2 else float(yv.sum())
     return out
