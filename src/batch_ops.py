@@ -20,12 +20,16 @@ from .cli import (
     _metrics_payload_from_graph,
     _run_attack_payload,
 )
-from .exporters import export_energy_tables_xlsx, export_metrics_payload, payload_to_flat_row
-from .energy_export import energy_run_summary_dict, frames_to_energy_nodes_long, frames_to_energy_steps_summary
 from .core.physics import simulate_energy_flow
+from .energy_export import (
+    energy_run_summary_dict,
+    frames_to_energy_nodes_long,
+    frames_to_energy_steps_summary,
+)
+from .exporters import export_energy_tables_xlsx, export_metrics_payload, payload_to_flat_row
 from .mat_packed import load_packed_mat_bundle, packed_row_to_matrix
-from .robustness import graph_resistance_summary
 from .matrix_import import matrix_to_graph
+from .robustness import graph_resistance_summary
 
 # Колбэк прогресса: done, total, label
 ProgressCb = Callable[[int, int, str], None]

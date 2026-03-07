@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
-from zipfile import ZIP_DEFLATED, ZipFile
 from pathlib import Path
 from typing import Any
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 import pandas as pd
