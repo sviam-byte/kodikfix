@@ -102,16 +102,22 @@ def ensure_venv() -> Path:
     print(f"[INFO] Bootstrap interpreter: {sys.executable}", flush=True)
     print(f"[INFO] Python version: {sys.version.split()[0]}", flush=True)
 
-    if _try_stdlib_venv() and (py := _find_existing_venv_python()) is not None:
-        return py
+    if _try_stdlib_venv():
+        py = _find_existing_venv_python()
+        if py is not None:
+            return py
 
     print("[WARN] stdlib venv failed.", flush=True)
     _try_ensurepip()
-    if _try_stdlib_venv() and (py := _find_existing_venv_python()) is not None:
-        return py
+    if _try_stdlib_venv():
+        py = _find_existing_venv_python()
+        if py is not None:
+            return py
 
-    if _try_virtualenv() and (py := _find_existing_venv_python()) is not None:
-        return py
+    if _try_virtualenv():
+        py = _find_existing_venv_python()
+        if py is not None:
+            return py
 
     raise SystemExit(
         "[ERROR] Failed to create virtual environment.\n"
