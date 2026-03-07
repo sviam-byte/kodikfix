@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import platform
 import re
 import shutil
 import tempfile
@@ -36,6 +37,70 @@ from .robustness import graph_resistance_summary
 
 # Колбэк прогресса: done, total, label
 ProgressCb = Callable[[int, int, str], None]
+
+
+def _run_info_txt(out_dir: Path) -> Path:
+    """Return path to a human-readable run info file."""
+    return Path(out_dir) / "RUN_INFO.txt"
+
+
+def _run_info_json(out_dir: Path) -> Path:
+    """Return path to a machine-readable run info file."""
+    return Path(out_dir) / "run_info.json"
+
+
+def _latest_run_pointer_path(base_dir: Path) -> Path:
+    """Return path to a small pointer file with the latest batch run directory."""
+    return Path(base_dir) / "LAST_BATCH_RUN.txt"
+
+
+def write_run_metadata(
+    out_dir: Path,
+    *,
+    base_dir: str | Path | None = None,
+    run_label: str = "",
+    seed: int | None = None,
+    mode: str = "",
+    status: str = "created",
+    extra: dict | None = None,
+) -> dict:
+    """Persist explicit run-location metadata so users can always find outputs."""
+    out_dir = Path(out_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base_path = Path(base_dir).expanduser().resolve() if base_dir is not None else out_dir.parent.resolve()
+    info = {
+        "status": str(status),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "run_dir": str(out_dir),
+        "base_dir": str(base_path),
+        "run_label": str(run_label or ""),
+        "seed": None if seed is None else int(seed),
+        "mode": str(mode or ""),
+        "platform": platform.platform(),
+        "cwd": str(Path.cwd().resolve()),
+    }
+    if extra:
+        info.update(extra)
+
+    _run_info_json(out_dir).write_text(
+        json.dumps(info, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+    txt_lines = [
+        f"status: {info['status']}",
+        f"created_at: {info['created_at']}",
+        f"run_dir: {info['run_dir']}",
+        f"base_dir: {info['base_dir']}",
+        f"run_label: {info['run_label']}",
+        f"seed: {info['seed']}",
+        f"mode: {info['mode']}",
+        f"cwd: {info['cwd']}",
+    ]
+    for key, value in sorted((extra or {}).items()):
+        txt_lines.append(f"{key}: {value}")
+    _run_info_txt(out_dir).write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
+    _latest_run_pointer_path(base_path).write_text(str(out_dir) + "\n", encoding="utf-8")
+    return info
 
 
 def _iter_jobs_stream(files: Iterable[Path], args, *, input_dir: Path):
@@ -788,8 +853,20 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
 
 def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, dict[str, pd.DataFrame]]:
     """Run selected batch tasks (metrics/attack/energy/resistance) and return per-mode DataFrames."""
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    write_run_metadata(
+        out_dir,
+        base_dir=out_dir.parent,
+        run_label=Path(out_dir).name,
+        seed=getattr(args, "seed", None),
+        mode="batch_plan",
+        status="running",
+        extra={
+            "input_dir": str(Path(getattr(args, "input_dir", ".")).expanduser().resolve()),
+            "selected_files_count": len(list(getattr(args, "selected_files", []) or [])),
+        },
+    )
 
     modes: list[str] = []
     if bool(getattr(args, "run_metrics", False)):
@@ -858,6 +935,19 @@ def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path
         zip_tree_to_file(out_dir, bundle_zip)
         saved_label = bundle_zip.name
 
+    write_run_metadata(
+        out_dir,
+        base_dir=out_dir.parent,
+        run_label=Path(out_dir).name,
+        seed=getattr(args, "seed", None),
+        mode="batch_plan",
+        status="finished",
+        extra={
+            "saved_label": saved_label,
+            "modes": ",".join(modes),
+            "result_frames": ",".join(sorted(result_frames.keys())),
+        },
+    )
     if progress_cb is not None:
         progress_cb(total_modes, total_modes, f"saved -> {saved_label}")
     return out_dir, result_frames
@@ -871,12 +961,13 @@ def safe_stem(value: str) -> str:
 
 
 def make_run_dir(base_dir: str | Path, *, mode: str, seed: int, run_label: str = "") -> Path:
-    """Create a timestamped run directory under ``base_dir``."""
+    """Create a timestamped run directory under ``base_dir`` and persist run-location metadata."""
     base = Path(base_dir).expanduser().resolve()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     label = safe_stem(run_label) if str(run_label).strip() else mode
     run_dir = base / f"{label}__seed_{int(seed)}__{ts}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    write_run_metadata(run_dir, base_dir=base, run_label=label, seed=int(seed), mode=str(mode), status="created")
     return run_dir
 
 
@@ -1279,4 +1370,3 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     if progress_cb:
         progress_cb(total, total, f"saved -> {summary_csv.name}")
     return out_dir, df
-
