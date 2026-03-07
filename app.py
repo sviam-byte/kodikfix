@@ -1354,8 +1354,16 @@ if not ctx.graphs:
     st.warning("Workspace пуст. Загрузите файл или создайте демо-граф в сайдбаре.")
     st.stop()
 
-cur_gids = list(ctx.graphs.keys())
+# Защита от рассинхрона session_state во время rerun:
+# даже если выше уже была проверка, здесь нельзя полагаться на то,
+# что ctx.graphs точно словарь и точно не пустой.
+cur_gids = list(ctx.graphs.keys()) if isinstance(ctx.graphs, dict) else []
 cur_gid = ctx.active_graph_id
+
+if not cur_gids:
+    st.warning("Workspace пуст. Загрузите файл или создайте демо-граф в сайдбаре.")
+    st.stop()
+
 if cur_gid not in cur_gids:
     cur_gid = cur_gids[0]
     ctx.set_active_graph(cur_gid)
