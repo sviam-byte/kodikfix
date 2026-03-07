@@ -1,0 +1,15 @@
+[server]
+headless = true
+runOnSave = false
+fileWatcherType = "none"
+maxUploadSize = 1024
+maxMessageSize = 512
+enableWebsocketCompression = false
+websocketPingInterval = 30
+disconnectedSessionTTL = 600
+
+[browser]
+gatherUsageStats = false
+
+[client]
+showErrorDetails = "full"

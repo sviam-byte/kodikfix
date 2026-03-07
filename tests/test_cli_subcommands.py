@@ -94,3 +94,31 @@ def test_cli_metrics_out_format_csv(tmp_path: Path):
     df = pd.read_csv(out)
     assert "summary" in df.columns or "summary__N" in df.columns
     assert "settings__seed" in df.columns
+
+
+def test_cli_batch_metrics_and_no_compute_heavy(tmp_path: Path):
+    in_dir = tmp_path / "inputs"
+    in_dir.mkdir()
+    _write_edges(in_dir / "g1.csv")
+    _write_edges(in_dir / "g2.csv")
+
+    out_dir = tmp_path / "batch_out"
+    code = cli.main(
+        [
+            "batch-metrics",
+            "--input-dir",
+            str(in_dir),
+            "--out-dir",
+            str(out_dir),
+            "--pattern",
+            "*.csv",
+            "--no-compute-heavy",
+        ]
+    )
+
+    assert code == 0
+    summary_csv = out_dir / "metrics_summary.csv"
+    assert summary_csv.exists()
+    df = pd.read_csv(summary_csv)
+    assert len(df) == 2
+    assert set(df["status"].tolist()) == {"ok"}
