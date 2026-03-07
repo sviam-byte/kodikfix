@@ -402,12 +402,59 @@ def _run_research_workspace_plan(
         "research_energy_runs": [],
     }
     extras: dict[str, bytes] = {}
-    total = max(1, len(graph_ids))
+
+    # Validate incoming IDs against current workspace state to guard against
+    # stale selections after graph deletion, trim_memory(), rerun/switch/import.
+    existing_graph_ids = list(ctx.graphs.keys()) if isinstance(ctx.graphs, dict) else []
+    requested_graph_ids = [str(gid) for gid in graph_ids]
+    missing_graph_ids = [gid for gid in requested_graph_ids if gid not in ctx.graphs]
+    valid_graph_ids = [gid for gid in requested_graph_ids if gid in ctx.graphs]
+
+    if missing_graph_ids:
+        logger.warning("Research plan skipped missing graphs: %s", missing_graph_ids)
+        results["research_metrics"].extend(
+            {
+                "graph_id": gid,
+                "graph_name": "<missing>",
+                "source": "<missing>",
+                "analysis_mode": str(analysis_mode),
+                "min_conf": float(min_conf),
+                "min_weight": float(min_weight),
+                "status": "missing_graph",
+                "error_type": "KeyError",
+                "error": f"Graph id not found in workspace: {gid}",
+                "available_graph_ids": "|".join(existing_graph_ids),
+            }
+            for gid in missing_graph_ids
+        )
+
+    total = max(1, len(valid_graph_ids))
     bar = st.progress(0.0)
     msg = st.empty()
 
-    for idx, gid in enumerate(graph_ids, start=1):
-        entry = ctx.graphs[gid]
+    if not valid_graph_ids:
+        msg.caption("Нет доступных графов для расчёта")
+        bar.progress(1.0)
+        frames = {name: pd.DataFrame(rows) for name, rows in results.items()}
+        return frames, extras
+
+    for idx, gid in enumerate(valid_graph_ids, start=1):
+        entry = ctx.graphs.get(gid)
+        if entry is None:
+            logger.warning("Research plan lost graph during run: %s", gid)
+            results["research_metrics"].append({
+                "graph_id": gid,
+                "graph_name": "<missing>",
+                "source": "<missing>",
+                "analysis_mode": str(analysis_mode),
+                "min_conf": float(min_conf),
+                "min_weight": float(min_weight),
+                "status": "missing_graph",
+                "error_type": "KeyError",
+                "error": f"Graph disappeared during run: {gid}",
+            })
+            bar.progress(idx / total)
+            continue
         msg.caption(f"[{idx}/{total}] {entry.name}")
         try:
             graph = cached_build_graph(
@@ -598,6 +645,7 @@ def _render_research_tab(
 
     flags = _research_selected_flags()
     graph_ids = [cur_gid] if scope == "Активный граф" else list(ctx.graphs.keys())
+    graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
 
     c_run1, c_run2 = st.columns(2)
     run_active = c_run1.button("Посчитать всё", type="primary", width="stretch")
@@ -608,6 +656,10 @@ def _render_research_tab(
         graph_ids = list(ctx.graphs.keys())
 
     if run_active or run_all:
+        graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
+        if not graph_ids:
+            st.error("В workspace нет доступных графов для расчёта. Возможно, список устарел после удаления или trim_memory.")
+            return
         frames, extras = _run_research_workspace_plan(
             graph_ids,
             min_conf=float(min_conf),
