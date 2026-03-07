@@ -82,7 +82,7 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         max_edges_viz = st.slider("Макс. кол-во ребер", 100, 5000, 1500)
         max_nodes_viz = st.slider("Макс. узлов", 500, 20000, 6000, step=500)
 
-    if st.button("🔥 ЗАПУСТИТЬ СИМУЛЯЦИЮ", type="primary", use_container_width=True):
+    if st.button("🔥 ЗАПУСТИТЬ СИМУЛЯЦИЮ", type="primary", width="stretch"):
         bar = st.progress(0.0)
         stage = st.empty()
         with st.spinner("Моделирование физики..."):
@@ -183,7 +183,7 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
         st.session_state[f"energy_run_summary__{active_entry.id}"] = energy_run_summary
         bar.progress(1.0)
         bar.empty(); stage.empty()
-        st.plotly_chart(fig_flow, use_container_width=True, key=f"plot_energy_flow_{active_entry.id}_{ui_epoch}")
+        st.plotly_chart(fig_flow, width="stretch", key=f"plot_energy_flow_{active_entry.id}_{ui_epoch}")
 
     energy_nodes_long = st.session_state.get(f"energy_nodes_long__{active_entry.id}")
     energy_steps_summary = st.session_state.get(f"energy_steps_summary__{active_entry.id}")
@@ -208,32 +208,32 @@ def render(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src
             pd.DataFrame([energy_run_summary]).to_csv(index=False).encode("utf-8"),
             file_name=f"{active_entry.name}_energy_run_summary.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         ex2.download_button(
             "Скачать energy nodes long (.csv)",
             (energy_nodes_long if energy_nodes_long is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
             file_name=f"{active_entry.name}_energy_nodes_long.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         ex3.download_button(
             "Скачать energy export (.xlsx)",
             export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary),
             file_name=f"{active_entry.name}_energy_export.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
         st.download_button(
             "Скачать все energy tables (.zip)",
             export_energy_tables_csv_zip(energy_nodes_long, energy_steps_summary, energy_run_summary),
             file_name=f"{active_entry.name}_energy_export.zip",
             mime="application/zip",
-            use_container_width=True,
+            width="stretch",
         )
 
         if st.checkbox("Показать численные таблицы", key=f"show_energy_tables_{active_entry.id}"):
             st.markdown("#### Energy steps summary")
-            st.dataframe(energy_steps_summary, use_container_width=True, height=260)
+            st.dataframe(energy_steps_summary, width="stretch", height=260)
             st.markdown("#### Energy nodes long")
-            st.dataframe(energy_nodes_long, use_container_width=True, height=320)
+            st.dataframe(energy_nodes_long, width="stretch", height=320)
