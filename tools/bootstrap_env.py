@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """Bootstrap project virtual environment with robust cross-platform fallbacks.
 
 This script centralizes environment setup so Windows batch wrappers stay small and
 portable while setup logic remains testable and easier to maintain.
 """
+
+from __future__ import annotations
 
 import os
 import shutil
