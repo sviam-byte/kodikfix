@@ -79,7 +79,7 @@ from src.ui.tabs import compare as tab_compare
 from src.ui.tabs import dashboard as tab_dashboard
 from src.ui.tabs import energy as tab_energy
 from src.ui.tabs import structure as tab_structure
-from src.batch_ops import build_ui_args, make_run_dir, run_batch_attack, run_batch_metrics
+from src.batch_ops import build_ui_args, make_run_dir, run_batch_plan, stage_batch_inputs
 
 inject_custom_css()
 ctx.ensure_initialized()
@@ -527,11 +527,42 @@ with st.sidebar:
                     )
 
     with st.expander("🗂 Batch runner", expanded=False):
-        batch_input_dir = st.text_input(
-            "Папка с входными файлами",
-            value=st.session_state.get("__batch_input_dir", os.getcwd()),
-            key="__batch_input_dir",
+        batch_source_mode = st.selectbox(
+            "Источник данных",
+            ["local_folder", "uploaded_files", "uploaded_zip"],
+            index=0,
+            format_func=lambda x: {
+                "local_folder": "Локальная папка",
+                "uploaded_files": "Загруженные файлы",
+                "uploaded_zip": "ZIP-архив",
+            }.get(x, x),
+            key="__batch_source_mode",
         )
+
+        batch_input_dir = ""
+        batch_uploaded_files = []
+        batch_uploaded_zip = None
+        if batch_source_mode == "local_folder":
+            batch_input_dir = st.text_input(
+                "Папка с входными файлами",
+                value=st.session_state.get("__batch_input_dir", os.getcwd()),
+                key="__batch_input_dir",
+            )
+        elif batch_source_mode == "uploaded_files":
+            batch_uploaded_files = st.file_uploader(
+                "Загрузи набор файлов для batch",
+                type=["mat", "csv", "tsv", "txt", "xlsx", "xls", "npy", "npz"],
+                accept_multiple_files=True,
+                key="__batch_uploaded_files",
+            ) or []
+        else:
+            batch_uploaded_zip = st.file_uploader(
+                "Загрузи ZIP с файлами для batch",
+                type=["zip"],
+                accept_multiple_files=False,
+                key="__batch_uploaded_zip",
+            )
+
         c1, c2 = st.columns(2)
         with c1:
             batch_pattern = st.text_input("Pattern", value=st.session_state.get("__batch_pattern", "*.mat"), key="__batch_pattern")
@@ -543,7 +574,11 @@ with st.sidebar:
                 step=1,
                 key="__batch_limit",
             )
-            batch_mode = st.selectbox("Что считать", ["metrics", "attack"], index=0, key="__batch_mode")
+            p1, p2 = st.columns(2)
+            with p1:
+                batch_run_metrics = st.checkbox("Metrics", value=st.session_state.get("__batch_run_metrics", True), key="__batch_run_metrics")
+            with p2:
+                batch_run_attack = st.checkbox("Attack", value=st.session_state.get("__batch_run_attack", False), key="__batch_run_attack")
             batch_run_label = st.text_input(
                 "Имя запуска (опционально)",
                 value=st.session_state.get("__batch_run_label", "mat_batch"),
@@ -598,7 +633,7 @@ with st.sidebar:
 
         attack_box = st.container(border=True)
         with attack_box:
-            st.caption("Параметры атаки используются только если выбран mode = attack")
+            st.caption("Параметры атаки используются только если включён Attack")
             a1, a2, a3 = st.columns(3)
             with a1:
                 batch_family = st.selectbox("Family", ["node", "edge", "mix"], index=0, key="__batch_family")
@@ -625,46 +660,84 @@ with st.sidebar:
 
         in_dir_path = Path(_norm_path_str(batch_input_dir)) if str(batch_input_dir).strip() else None
         out_root_path = Path(_norm_path_str(batch_output_root)) if str(batch_output_root).strip() else None
-        if in_dir_path and in_dir_path.exists():
-            try:
-                candidates = sorted([
+
+        preview_files = []
+        preview_root = None
+        preview_cleanup = None
+        try:
+            if batch_source_mode == "local_folder":
+                if in_dir_path and in_dir_path.exists():
+                    preview_root = in_dir_path
+                    preview_files = sorted([
+                        p
+                        for p in (in_dir_path.rglob(batch_pattern) if batch_recursive else in_dir_path.glob(batch_pattern))
+                        if p.is_file() and p.suffix.lower() in {".mat", ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".npy", ".npz"}
+                    ])
+                else:
+                    st.caption("Укажи существующую папку с файлами.")
+            elif batch_source_mode == "uploaded_files":
+                preview_files = [Path(f.name) for f in batch_uploaded_files]
+            elif batch_uploaded_zip is not None:
+                preview_root, _, preview_cleanup = stage_batch_inputs(
+                    source_mode="uploaded_zip",
+                    uploaded_zip_name=batch_uploaded_zip.name,
+                    uploaded_zip_bytes=batch_uploaded_zip.getvalue(),
+                )
+                preview_files = sorted([
                     p
-                    for p in (in_dir_path.rglob(batch_pattern) if batch_recursive else in_dir_path.glob(batch_pattern))
+                    for p in (preview_root.rglob(batch_pattern) if batch_recursive else preview_root.glob(batch_pattern))
                     if p.is_file() and p.suffix.lower() in {".mat", ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".npy", ".npz"}
                 ])
-                shown = candidates[:10]
-                st.caption(f"Найдено файлов: {len(candidates)}")
-                if shown:
-                    st.dataframe(
-                        pd.DataFrame({"file": [str(p.relative_to(in_dir_path)) for p in shown]}),
-                        use_container_width=True,
-                        height=180,
-                    )
-            except Exception as e:  # pylint: disable=broad-except
-                st.warning(f"Не удалось просканировать папку: {type(e).__name__}: {e}")
-        else:
-            st.caption("Укажи существующую папку с файлами.")
+
+            if preview_files:
+                shown = preview_files[:10]
+                st.caption(f"Найдено файлов: {len(preview_files)}")
+                rels = []
+                for p in shown:
+                    if preview_root is not None:
+                        try:
+                            rels.append(str(p.relative_to(preview_root)))
+                        except Exception:
+                            rels.append(str(p))
+                    else:
+                        rels.append(str(p))
+                st.dataframe(pd.DataFrame({"file": rels}), use_container_width=True, height=180)
+        except Exception as e:  # pylint: disable=broad-except
+            st.warning(f"Не удалось подготовить batch-вход: {type(e).__name__}: {e}")
+        finally:
+            if preview_cleanup is not None:
+                preview_cleanup()
 
         batch_status = st.empty()
         batch_prog = st.progress(0.0)
-        run_batch_btn = st.button("Run batch", type="primary", use_container_width=True)
+        run_batch_btn = st.button("Посчитать по плану", type="primary", use_container_width=True)
 
         if run_batch_btn:
+            cleanup_cb = None
             try:
-                if not in_dir_path or not in_dir_path.exists():
-                    raise FileNotFoundError("Папка с входными файлами не найдена")
                 if not out_root_path:
                     raise ValueError("Не указана корневая папка для результатов")
+                if not batch_run_metrics and not batch_run_attack:
+                    raise ValueError("Отметь хотя бы один расчёт")
 
+                staged_input_dir, _, cleanup_cb = stage_batch_inputs(
+                    source_mode=batch_source_mode,
+                    input_dir=str(in_dir_path) if in_dir_path else "",
+                    uploaded_files=batch_uploaded_files,
+                    uploaded_zip_name=batch_uploaded_zip.name if batch_uploaded_zip is not None else "",
+                    uploaded_zip_bytes=batch_uploaded_zip.getvalue() if batch_uploaded_zip is not None else None,
+                )
+
+                mode_label = "metrics_attack" if (batch_run_metrics and batch_run_attack) else ("metrics" if batch_run_metrics else "attack")
                 planned_dir = make_run_dir(
                     out_root_path,
-                    mode=f"batch_{batch_mode}",
+                    mode=f"batch_{mode_label}",
                     seed=int(batch_seed),
                     run_label=str(batch_run_label).strip(),
                 )
 
                 args = build_ui_args(
-                    input_dir=str(in_dir_path),
+                    input_dir=str(staged_input_dir),
                     out_dir=str(planned_dir),
                     pattern=str(batch_pattern),
                     recursive=bool(batch_recursive),
@@ -684,27 +757,35 @@ with st.sidebar:
                     family=str(batch_family),
                     kind=str(batch_kind),
                     frac=float(batch_frac),
+                    alpha_rewire=float(batch_alpha_rewire),
+                    beta_replace=float(batch_beta_replace),
+                    swaps_per_edge=float(batch_swaps_per_edge),
+                    replace_from=str(batch_replace_from),
                     steps=int(batch_steps),
                     heavy_every=int(batch_heavy_every),
                     fast_mode=bool(batch_fast_mode),
+                    run_metrics=bool(batch_run_metrics),
+                    run_attack=bool(batch_run_attack),
+                    source_mode=str(batch_source_mode),
                 )
 
                 def _ui_progress(done: int, total: int, label: str):
                     frac = 1.0 if total <= 0 else min(1.0, max(0.0, float(done) / float(total)))
                     batch_prog.progress(frac)
-                    batch_status.info(f"[{done}/{total}] {label}")
+                    batch_status.info(f"[{done:.2f}/{total}] {label}")
 
-                if batch_mode == "metrics":
-                    run_dir, df_batch = run_batch_metrics(args, progress_cb=_ui_progress)
+                run_dir, result_frames = run_batch_plan(args, progress_cb=_ui_progress)
+                summary_parts = []
+                for mode_name, df_batch in result_frames.items():
                     ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
-                    batch_status.success(f"Готово: metrics batch, ok={ok_n}/{len(df_batch)}\n{run_dir}")
-                else:
-                    run_dir, df_batch = run_batch_attack(args, progress_cb=_ui_progress)
-                    ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
-                    batch_status.success(f"Готово: attack batch, ok={ok_n}/{len(df_batch)}\n{run_dir}")
+                    summary_parts.append(f"{mode_name}: ok={ok_n}/{len(df_batch)}")
+                batch_status.success(f"Готово: {'; '.join(summary_parts)}\n{run_dir}")
                 batch_prog.progress(1.0)
             except Exception as e:  # pylint: disable=broad-except
                 batch_status.error(f"Batch run error: {type(e).__name__}: {e}")
+            finally:
+                if cleanup_cb is not None:
+                    cleanup_cb()
 
     st.markdown("---")
     st.subheader("📂 Данные")

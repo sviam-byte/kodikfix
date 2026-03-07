@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Iterable
+from zipfile import ZipFile
 
 import pandas as pd
 
@@ -19,6 +22,112 @@ from .exporters import export_metrics_payload, payload_to_flat_row
 
 # Колбэк прогресса: done, total, label
 ProgressCb = Callable[[int, int, str], None]
+
+
+def stage_batch_inputs(
+    *,
+    source_mode: str,
+    input_dir: str | Path | None = None,
+    uploaded_files: list | None = None,
+    uploaded_zip_name: str = "",
+    uploaded_zip_bytes: bytes | None = None,
+) -> tuple[Path, list[Path], Callable[[], None]]:
+    """Stage batch inputs into a local directory for folder/upload/multi-upload modes."""
+    mode = str(source_mode).strip().lower() or "local_folder"
+
+    if mode == "local_folder":
+        if input_dir is None or not str(input_dir).strip():
+            raise ValueError("Не указана входная папка")
+        base = Path(str(input_dir)).expanduser().resolve()
+        if not base.exists() or not base.is_dir():
+            raise FileNotFoundError(f"Папка не найдена: {base}")
+        return base, [], (lambda: None)
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="kodik_batch_"))
+
+    def _cleanup() -> None:
+        """Remove staged temporary directory for upload-based modes."""
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    if mode == "uploaded_files":
+        files = list(uploaded_files or [])
+        if not files:
+            _cleanup()
+            raise ValueError("Не загружены файлы для batch-режима")
+        staged: list[Path] = []
+        for idx, up in enumerate(files, start=1):
+            name = Path(getattr(up, "name", f"upload_{idx:04d}")).name
+            dst = tmpdir / name
+            dst.write_bytes(up.getvalue())
+            staged.append(dst)
+        return tmpdir, staged, _cleanup
+
+    if mode == "uploaded_zip":
+        if not uploaded_zip_bytes:
+            _cleanup()
+            raise ValueError("Не загружен zip-архив для batch-режима")
+        archive_name = Path(uploaded_zip_name or "batch_upload.zip").name
+        archive_path = tmpdir / archive_name
+        archive_path.write_bytes(uploaded_zip_bytes)
+        with ZipFile(archive_path, "r") as zf:
+            bad = [n for n in zf.namelist() if Path(n).is_absolute() or ".." in Path(n).parts]
+            if bad:
+                _cleanup()
+                raise ValueError("Zip содержит небезопасные пути")
+            zf.extractall(tmpdir / "unzipped")
+        return tmpdir / "unzipped", [], _cleanup
+
+    _cleanup()
+    raise ValueError(f"Неизвестный source_mode: {source_mode}")
+
+
+def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path, dict[str, pd.DataFrame]]:
+    """Run selected batch tasks (metrics/attack) and return per-mode DataFrames."""
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    modes: list[str] = []
+    if bool(getattr(args, "run_metrics", False)):
+        modes.append("metrics")
+    if bool(getattr(args, "run_attack", False)):
+        modes.append("attack")
+    if not modes:
+        raise ValueError("Не выбрано ни одного расчёта")
+
+    total_modes = len(modes)
+    result_frames: dict[str, pd.DataFrame] = {}
+
+    def _wrap_progress(mode_idx: int, mode_name: str):
+        """Map per-mode progress into one global progress stream for UI."""
+
+        def _cb(done: int, total: int, label: str) -> None:
+            if progress_cb is None:
+                return
+            total_ = max(1, int(total))
+            frac_local = min(1.0, max(0.0, float(done) / float(total_)))
+            done_global = (mode_idx - 1) + frac_local
+            progress_cb(done_global, total_modes, f"{mode_name}: {label}")
+
+        return _cb
+
+    for mode_idx, mode_name in enumerate(modes, start=1):
+        mode_out_dir = out_dir / mode_name
+        mode_args = build_ui_args(**vars(args))
+        mode_args.out_dir = str(mode_out_dir)
+        if mode_name == "metrics":
+            _, df_mode = run_batch_metrics(mode_args, progress_cb=_wrap_progress(mode_idx, "metrics"))
+        else:
+            _, df_mode = run_batch_attack(mode_args, progress_cb=_wrap_progress(mode_idx, "attack"))
+        result_frames[mode_name] = df_mode
+
+    combined_xlsx = out_dir / "batch_plan_summary.xlsx"
+    with pd.ExcelWriter(combined_xlsx, engine="openpyxl") as writer:
+        for mode_name, df_mode in result_frames.items():
+            df_mode.to_excel(writer, sheet_name=mode_name[:31], index=False)
+
+    if progress_cb is not None:
+        progress_cb(total_modes, total_modes, f"saved -> {combined_xlsx.name}")
+    return out_dir, result_frames
 
 
 def safe_stem(value: str) -> str:
@@ -93,6 +202,9 @@ def build_ui_args(**kwargs):
         beta_replace=0.4,
         swaps_per_edge=0.5,
         replace_from="CFG",
+        run_metrics=True,
+        run_attack=False,
+        source_mode="local_folder",
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
