@@ -1233,7 +1233,7 @@ if page_mode == "Batch-план":
             key="__batch_shift_page",
         )
 
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     with d1:
         batch_seed = st.number_input("Seed", min_value=0, value=int(st.session_state.get("__batch_seed_page", int(settings.DEFAULT_SEED))), step=1, key="__batch_seed_page")
         batch_lcc = st.checkbox("LCC only", value=st.session_state.get("__batch_lcc_page", True), key="__batch_lcc_page")
@@ -1243,6 +1243,9 @@ if page_mode == "Batch-план":
     with d3:
         batch_eff_k = st.number_input("eff_k", min_value=1, value=int(st.session_state.get("__batch_eff_k_page", 32)), step=1, key="__batch_eff_k_page")
         batch_skip_spectral = st.checkbox("Skip spectral", value=st.session_state.get("__batch_skip_spectral_page", False), key="__batch_skip_spectral_page")
+    with d4:
+        batch_chunk_size = st.number_input("Chunk size", min_value=1, value=int(st.session_state.get("__batch_chunk_size_page", 10)), step=1, key="__batch_chunk_size_page")
+        batch_write_full_bundle = st.checkbox("Full bundle zip", value=st.session_state.get("__batch_write_full_bundle_page", False), key="__batch_write_full_bundle_page")
 
     energy_box = st.container(border=True)
     with energy_box:
@@ -1327,7 +1330,7 @@ if page_mode == "Batch-план":
             key="__batch_pick_mode_page",
         )
         total_expanded = int(sum(int(row.get("expanded_graphs") or 1) for row in preview_rows))
-        st.caption(f"Найдено файлов: {len(display_files)}; будет рассчитано графов: {total_expanded}")
+        st.caption(f"Найдено файлов: {len(display_files)}; будет рассчитано графов: {total_expanded}. Промежуточный экспорт будет идти чанками по {int(batch_chunk_size)}.")
         st.dataframe(pd.DataFrame(preview_rows), width="stretch", height=260)
         if pick_mode == "Только выбранных":
             selected_display = st.multiselect(
@@ -1422,6 +1425,8 @@ if page_mode == "Batch-план":
                     energy_rw_impulse=bool(batch_energy_rw_impulse),
                     source_mode=str(batch_source_mode),
                     selected_files=selected_run_files,
+                    batch_chunk_size=int(batch_chunk_size),
+                    write_full_bundle=bool(batch_write_full_bundle),
                 )
 
                 def _ui_progress(done: int, total: int, label: str):
