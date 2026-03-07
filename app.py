@@ -79,6 +79,7 @@ from src.ui.tabs import compare as tab_compare
 from src.ui.tabs import dashboard as tab_dashboard
 from src.ui.tabs import energy as tab_energy
 from src.ui.tabs import structure as tab_structure
+from src.batch_ops import build_ui_args, make_run_dir, run_batch_attack, run_batch_metrics
 
 inject_custom_css()
 ctx.ensure_initialized()
@@ -107,6 +108,16 @@ def _guess_cols(columns):
     w = pick(["weight", "w", "score", "value"])
     conf = pick(["confidence", "conf", "p", "prob", "support"])
     return src, dst, w, conf
+
+
+def _norm_path_str(value: str) -> str:
+    """Normalize path-like string from UI input."""
+    return str(Path(str(value).strip()).expanduser()) if str(value).strip() else ""
+
+
+def _default_batch_output_root() -> str:
+    """Default root for UI-triggered batch run outputs."""
+    return str((Path(__file__).resolve().parent / "batch_runs").resolve())
 
 
 def add_graph_to_state(name, df, source, src, dst):
@@ -514,6 +525,186 @@ with st.sidebar:
                         "experiments.xlsx",
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
+
+    with st.expander("🗂 Batch runner", expanded=False):
+        batch_input_dir = st.text_input(
+            "Папка с входными файлами",
+            value=st.session_state.get("__batch_input_dir", os.getcwd()),
+            key="__batch_input_dir",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            batch_pattern = st.text_input("Pattern", value=st.session_state.get("__batch_pattern", "*.mat"), key="__batch_pattern")
+            batch_recursive = st.checkbox("Recursive", value=st.session_state.get("__batch_recursive", True), key="__batch_recursive")
+            batch_limit = st.number_input(
+                "Limit (0 = all)",
+                min_value=0,
+                value=int(st.session_state.get("__batch_limit", 0)),
+                step=1,
+                key="__batch_limit",
+            )
+            batch_mode = st.selectbox("Что считать", ["metrics", "attack"], index=0, key="__batch_mode")
+            batch_run_label = st.text_input(
+                "Имя запуска (опционально)",
+                value=st.session_state.get("__batch_run_label", "mat_batch"),
+                key="__batch_run_label",
+            )
+            batch_output_root = st.text_input(
+                "Корневая папка для результатов",
+                value=st.session_state.get("__batch_output_root", _default_batch_output_root()),
+                key="__batch_output_root",
+            )
+        with c2:
+            batch_input_kind = st.selectbox("Input kind", ["auto", "matrix", "edge"], index=1, key="__batch_input_kind")
+            batch_mat_key = st.text_input("MAT key (optional)", value=st.session_state.get("__batch_mat_key", ""), key="__batch_mat_key")
+            batch_sign_policy = st.selectbox("Sign policy", ["abs", "positive_only", "shift"], index=0, key="__batch_sign_policy")
+            batch_threshold_mode = st.selectbox("Threshold mode", ["density", "absolute"], index=0, key="__batch_threshold_mode")
+            batch_threshold_value = st.number_input(
+                "Threshold value",
+                value=float(st.session_state.get("__batch_threshold_value", 0.15)),
+                min_value=0.0,
+                step=0.01,
+                key="__batch_threshold_value",
+            )
+            batch_shift = st.number_input(
+                "Shift",
+                value=float(st.session_state.get("__batch_shift", 0.0)),
+                step=0.01,
+                key="__batch_shift",
+            )
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            batch_seed = st.number_input(
+                "Seed",
+                min_value=0,
+                value=int(st.session_state.get("__batch_seed", int(settings.DEFAULT_SEED))),
+                step=1,
+                key="__batch_seed",
+            )
+            batch_lcc = st.checkbox("LCC only", value=st.session_state.get("__batch_lcc", True), key="__batch_lcc")
+        with d2:
+            batch_compute_curv = st.checkbox("Compute curvature", value=st.session_state.get("__batch_compute_curv", False), key="__batch_compute_curv")
+            batch_curv_n = st.number_input(
+                "Curvature sample edges",
+                min_value=1,
+                value=int(st.session_state.get("__batch_curv_n", 120)),
+                step=1,
+                key="__batch_curv_n",
+            )
+        with d3:
+            batch_eff_k = st.number_input("eff_k", min_value=1, value=int(st.session_state.get("__batch_eff_k", 32)), step=1, key="__batch_eff_k")
+            batch_skip_spectral = st.checkbox("Skip spectral", value=st.session_state.get("__batch_skip_spectral", False), key="__batch_skip_spectral")
+
+        attack_box = st.container(border=True)
+        with attack_box:
+            st.caption("Параметры атаки используются только если выбран mode = attack")
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                batch_family = st.selectbox("Family", ["node", "edge", "mix"], index=0, key="__batch_family")
+                batch_kind = st.text_input("Kind", value=st.session_state.get("__batch_kind", "degree"), key="__batch_kind")
+            with a2:
+                batch_frac = st.number_input(
+                    "Frac",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(st.session_state.get("__batch_frac", 0.5)),
+                    step=0.05,
+                    key="__batch_frac",
+                )
+                batch_steps = st.number_input("Steps", min_value=1, value=int(st.session_state.get("__batch_steps", 30)), step=1, key="__batch_steps")
+            with a3:
+                batch_heavy_every = st.number_input(
+                    "Heavy every",
+                    min_value=1,
+                    value=int(st.session_state.get("__batch_heavy_every", 5)),
+                    step=1,
+                    key="__batch_heavy_every",
+                )
+                batch_fast_mode = st.checkbox("Fast mode", value=st.session_state.get("__batch_fast_mode", False), key="__batch_fast_mode")
+
+        in_dir_path = Path(_norm_path_str(batch_input_dir)) if str(batch_input_dir).strip() else None
+        out_root_path = Path(_norm_path_str(batch_output_root)) if str(batch_output_root).strip() else None
+        if in_dir_path and in_dir_path.exists():
+            try:
+                candidates = sorted([
+                    p
+                    for p in (in_dir_path.rglob(batch_pattern) if batch_recursive else in_dir_path.glob(batch_pattern))
+                    if p.is_file() and p.suffix.lower() in {".mat", ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".npy", ".npz"}
+                ])
+                shown = candidates[:10]
+                st.caption(f"Найдено файлов: {len(candidates)}")
+                if shown:
+                    st.dataframe(
+                        pd.DataFrame({"file": [str(p.relative_to(in_dir_path)) for p in shown]}),
+                        use_container_width=True,
+                        height=180,
+                    )
+            except Exception as e:  # pylint: disable=broad-except
+                st.warning(f"Не удалось просканировать папку: {type(e).__name__}: {e}")
+        else:
+            st.caption("Укажи существующую папку с файлами.")
+
+        batch_status = st.empty()
+        batch_prog = st.progress(0.0)
+        run_batch_btn = st.button("Run batch", type="primary", use_container_width=True)
+
+        if run_batch_btn:
+            try:
+                if not in_dir_path or not in_dir_path.exists():
+                    raise FileNotFoundError("Папка с входными файлами не найдена")
+                if not out_root_path:
+                    raise ValueError("Не указана корневая папка для результатов")
+
+                planned_dir = make_run_dir(
+                    out_root_path,
+                    mode=f"batch_{batch_mode}",
+                    seed=int(batch_seed),
+                    run_label=str(batch_run_label).strip(),
+                )
+
+                args = build_ui_args(
+                    input_dir=str(in_dir_path),
+                    out_dir=str(planned_dir),
+                    pattern=str(batch_pattern),
+                    recursive=bool(batch_recursive),
+                    limit=int(batch_limit),
+                    input_kind=str(batch_input_kind),
+                    mat_key=str(batch_mat_key),
+                    sign_policy=str(batch_sign_policy),
+                    threshold_mode=str(batch_threshold_mode),
+                    threshold_value=float(batch_threshold_value),
+                    shift=float(batch_shift),
+                    seed=int(batch_seed),
+                    lcc=bool(batch_lcc),
+                    eff_k=int(batch_eff_k),
+                    compute_curvature=bool(batch_compute_curv),
+                    curvature_sample_edges=int(batch_curv_n),
+                    skip_spectral=bool(batch_skip_spectral),
+                    family=str(batch_family),
+                    kind=str(batch_kind),
+                    frac=float(batch_frac),
+                    steps=int(batch_steps),
+                    heavy_every=int(batch_heavy_every),
+                    fast_mode=bool(batch_fast_mode),
+                )
+
+                def _ui_progress(done: int, total: int, label: str):
+                    frac = 1.0 if total <= 0 else min(1.0, max(0.0, float(done) / float(total)))
+                    batch_prog.progress(frac)
+                    batch_status.info(f"[{done}/{total}] {label}")
+
+                if batch_mode == "metrics":
+                    run_dir, df_batch = run_batch_metrics(args, progress_cb=_ui_progress)
+                    ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
+                    batch_status.success(f"Готово: metrics batch, ok={ok_n}/{len(df_batch)}\n{run_dir}")
+                else:
+                    run_dir, df_batch = run_batch_attack(args, progress_cb=_ui_progress)
+                    ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
+                    batch_status.success(f"Готово: attack batch, ok={ok_n}/{len(df_batch)}\n{run_dir}")
+                batch_prog.progress(1.0)
+            except Exception as e:  # pylint: disable=broad-except
+                batch_status.error(f"Batch run error: {type(e).__name__}: {e}")
 
     st.markdown("---")
     st.subheader("📂 Данные")

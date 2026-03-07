@@ -34,7 +34,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if mode == "ui":
         extra = argv[1:]
-        cmd = [py, "-m", "streamlit", "run", str(root / "app.py"), *extra]
+        # Stable defaults for local/dev containers; caller can still override via extra args.
+        default_flags = [
+            "--server.headless=true",
+            "--server.fileWatcherType=none",
+            "--server.runOnSave=false",
+            "--server.websocketPingInterval=30",
+            "--server.disconnectedSessionTTL=600",
+            "--browser.gatherUsageStats=false",
+        ]
+        cmd = [py, "-m", "streamlit", "run", str(root / "app.py"), *default_flags, *extra]
         return int(subprocess.call(cmd))
 
     if mode == "cli":
