@@ -29,6 +29,23 @@ DEFAULT_TRAJECTORY_META_COLS = {
     "C",
 }
 
+EXPORT_SETTINGS_COLUMNS = ["key", "value"]
+EXPORT_OVERVIEW_COLUMNS = ["table_name", "rows", "status", "note"]
+EXPORT_ERRORS_COLUMNS = ["scope", "entity_id", "entity_name", "error_type", "message"]
+EXPORT_MANIFEST_COLUMNS = [
+    "graph_id",
+    "graph_name",
+    "subject_id",
+    "group",
+    "source",
+    "created_at",
+    "selected_for_export",
+    "filtered_edge_rows",
+    "experiment_count",
+    "mixfrac_experiment_count",
+    "trajectory_experiment_count",
+]
+
 
 def _safe_name(x: str) -> str:
     """Return stable display-safe stem for subject identifiers."""
@@ -77,6 +94,36 @@ def _metrics_to_plain_dict(metrics_obj) -> dict:
     if hasattr(metrics_obj, "__dict__"):
         return dict(vars(metrics_obj))
     return {}
+
+
+def _ensure_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Return a frame containing at least the requested columns in stable order."""
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = np.nan
+    ordered = list(columns) + [c for c in out.columns if c not in columns]
+    return out.loc[:, ordered]
+
+
+def _clean_for_export(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize NaN/inf/object values for cleaner CSV/XLSX exports."""
+    out = df.copy()
+    if out.empty:
+        return out
+    out = out.replace([np.inf, -np.inf], np.nan)
+    for col in out.columns:
+        series = out[col]
+        if pd.api.types.is_datetime64_any_dtype(series):
+            continue
+        if pd.api.types.is_float_dtype(series):
+            continue
+        if pd.api.types.is_integer_dtype(series):
+            continue
+        if pd.api.types.is_bool_dtype(series):
+            continue
+        out[col] = series.map(lambda x: "" if x is None else x)
+    return out
 
 
 def build_subject_metrics_table(
@@ -154,13 +201,14 @@ def build_subject_metrics_table(
                 "eff_sources_k": int(eff_sources_k),
                 "compute_curvature": bool(compute_curvature),
                 "curvature_sample_edges": int(curvature_sample_edges),
+                "export_status": "ok",
+                "export_error": "",
             }
             row.update(met)
             rows.append(row)
             if progress_cb is not None:
                 progress_cb(idx, total, f"{entry.name} ✓")
         except Exception as exc:
-            # Export should be robust: keep failed rows with error description.
             rows.append(
                 {
                     "graph_id": entry.id,
@@ -175,6 +223,7 @@ def build_subject_metrics_table(
                     "eff_sources_k": int(eff_sources_k),
                     "compute_curvature": bool(compute_curvature),
                     "curvature_sample_edges": int(curvature_sample_edges),
+                    "export_status": "error",
                     "export_error": str(exc),
                 }
             )
@@ -184,7 +233,7 @@ def build_subject_metrics_table(
     if progress_cb is not None:
         progress_cb(total, total, "done")
 
-    return pd.DataFrame(rows)
+    return _clean_for_export(pd.DataFrame(rows))
 
 
 def build_mixfrac_subjects_table(
@@ -225,7 +274,7 @@ def build_mixfrac_subjects_table(
             }
         )
 
-    return pd.DataFrame(rows)
+    return _clean_for_export(pd.DataFrame(rows))
 
 
 def build_trajectories_long_table(
@@ -311,7 +360,217 @@ def build_trajectories_long_table(
                 "value",
             ]
         )
-    return pd.concat(chunks, ignore_index=True)
+    return _clean_for_export(pd.concat(chunks, ignore_index=True))
+
+
+def build_export_settings_table(*,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+    eff_sources_k: int,
+    seed: int,
+    compute_curvature: bool,
+    curvature_sample_edges: int,
+    graph_ids: list[str] | None,
+    lightweight: bool,
+) -> pd.DataFrame:
+    """Build a compact settings table for traceability of exported stats."""
+    selected = "ALL" if not graph_ids else ";".join([str(x) for x in graph_ids])
+    rows = [
+        {"key": "analysis_mode", "value": str(analysis_mode)},
+        {"key": "min_conf", "value": float(min_conf)},
+        {"key": "min_weight", "value": float(min_weight)},
+        {"key": "eff_sources_k", "value": int(eff_sources_k)},
+        {"key": "seed", "value": int(seed)},
+        {"key": "compute_curvature", "value": bool(compute_curvature)},
+        {"key": "curvature_sample_edges", "value": int(curvature_sample_edges)},
+        {"key": "lightweight", "value": bool(lightweight)},
+        {"key": "selected_graph_ids", "value": selected},
+    ]
+    return _ensure_columns(pd.DataFrame(rows), EXPORT_SETTINGS_COLUMNS)
+
+
+def build_export_manifest_table(
+    graphs: dict[str, GraphEntry],
+    experiments: list[ExperimentEntry],
+    *,
+    min_conf: float,
+    min_weight: float,
+    graph_ids: list[str] | None,
+) -> pd.DataFrame:
+    """Build one-row-per-graph manifest for traceability and diagnostics."""
+    selected = set(graph_ids or list(graphs.keys()))
+    exp_by_graph: dict[str, list[ExperimentEntry]] = {}
+    for exp in experiments:
+        exp_by_graph.setdefault(exp.graph_id, []).append(exp)
+
+    rows: list[dict] = []
+    for gid, entry in graphs.items():
+        exps = exp_by_graph.get(gid, [])
+        mixfrac_n = sum(1 for exp in exps if exp.attack_kind == "mix_frac_estimate" or (exp.params or {}).get("attack_family") == "mixfrac")
+        traj_n = sum(1 for exp in exps if exp.history is not None and not exp.history.empty)
+        try:
+            filtered_rows = int(len(entry.get_filtered_edges(float(min_conf), float(min_weight))))
+        except Exception:
+            filtered_rows = np.nan
+        rows.append(
+            {
+                "graph_id": entry.id,
+                "graph_name": entry.name,
+                "subject_id": _subject_id_from_graph(entry),
+                "group": _infer_group(entry.name, entry.source),
+                "source": entry.source,
+                "created_at": float(entry.created_at),
+                "selected_for_export": entry.id in selected,
+                "filtered_edge_rows": filtered_rows,
+                "experiment_count": len(exps),
+                "mixfrac_experiment_count": mixfrac_n,
+                "trajectory_experiment_count": traj_n,
+            }
+        )
+    return _clean_for_export(_ensure_columns(pd.DataFrame(rows), EXPORT_MANIFEST_COLUMNS))
+
+
+def build_export_errors_table(
+    df_subjects: pd.DataFrame,
+    experiments: list[ExperimentEntry],
+    graphs: dict[str, GraphEntry],
+) -> pd.DataFrame:
+    """Collect export-time diagnostics into a dedicated table."""
+    rows: list[dict] = []
+
+    if not df_subjects.empty and "export_error" in df_subjects.columns:
+        bad = df_subjects[df_subjects["export_error"].fillna("").astype(str).str.len() > 0]
+        for _, row in bad.iterrows():
+            rows.append(
+                {
+                    "scope": "subject_metrics",
+                    "entity_id": row.get("graph_id", ""),
+                    "entity_name": row.get("graph_name", ""),
+                    "error_type": "subject_export_error",
+                    "message": row.get("export_error", ""),
+                }
+            )
+
+    for exp in experiments:
+        entry = graphs.get(exp.graph_id)
+        if entry is None:
+            rows.append(
+                {
+                    "scope": "experiments",
+                    "entity_id": exp.id,
+                    "entity_name": exp.name,
+                    "error_type": "missing_graph_reference",
+                    "message": f"graph_id={exp.graph_id} not found in graphs",
+                }
+            )
+        if exp.history is None or exp.history.empty:
+            rows.append(
+                {
+                    "scope": "experiments",
+                    "entity_id": exp.id,
+                    "entity_name": exp.name,
+                    "error_type": "empty_history",
+                    "message": "history is empty, so no trajectory rows were exported",
+                }
+            )
+    return _clean_for_export(_ensure_columns(pd.DataFrame(rows), EXPORT_ERRORS_COLUMNS))
+
+
+def build_export_overview_table(
+    df_subjects: pd.DataFrame,
+    df_mixfrac: pd.DataFrame,
+    df_traj: pd.DataFrame,
+    df_manifest: pd.DataFrame,
+    df_errors: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarize exported tables with row counts and human-readable status."""
+    rows = []
+    specs = [
+        ("manifest", df_manifest, "traceability by graph"),
+        ("subject_metrics", df_subjects, "subject-level graph metrics"),
+        ("mixfrac_subjects", df_mixfrac, "mix_frac estimate results"),
+        ("trajectories_long", df_traj, "long-format attack / trajectory metrics"),
+        ("errors", df_errors, "diagnostics collected during export"),
+    ]
+    for name, df, note in specs:
+        status = "ok" if len(df) > 0 else "empty"
+        rows.append({"table_name": name, "rows": int(len(df)), "status": status, "note": note})
+    return _ensure_columns(pd.DataFrame(rows), EXPORT_OVERVIEW_COLUMNS)
+
+
+def _autosize_worksheet(ws) -> None:
+    """Apply basic readability formatting for openpyxl worksheets."""
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for column_cells in ws.columns:
+        first = column_cells[0]
+        letter = first.column_letter
+        values = ["" if cell.value is None else str(cell.value) for cell in column_cells[:100]]
+        max_len = max((len(v) for v in values), default=0)
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 10), 40)
+
+
+def _build_export_bundle(
+    graphs: dict[str, GraphEntry],
+    experiments: list[ExperimentEntry],
+    *,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+    eff_sources_k: int = 32,
+    seed: int = 42,
+    compute_curvature: bool = True,
+    curvature_sample_edges: int = 120,
+    graph_ids: list[str] | None = None,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    lightweight: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Build all exported stats tables in one place to keep zip/xlsx consistent."""
+    df_subjects = build_subject_metrics_table(
+        graphs,
+        min_conf=min_conf,
+        min_weight=min_weight,
+        analysis_mode=analysis_mode,
+        eff_sources_k=eff_sources_k,
+        seed=seed,
+        compute_curvature=compute_curvature,
+        curvature_sample_edges=curvature_sample_edges,
+        graph_ids=graph_ids,
+        progress_cb=progress_cb,
+        lightweight=lightweight,
+    )
+    df_mixfrac = build_mixfrac_subjects_table(experiments, graphs)
+    df_traj = build_trajectories_long_table(experiments, graphs)
+    df_manifest = build_export_manifest_table(
+        graphs,
+        experiments,
+        min_conf=min_conf,
+        min_weight=min_weight,
+        graph_ids=graph_ids,
+    )
+    df_errors = build_export_errors_table(df_subjects, experiments, graphs)
+    df_overview = build_export_overview_table(df_subjects, df_mixfrac, df_traj, df_manifest, df_errors)
+    df_settings = build_export_settings_table(
+        min_conf=min_conf,
+        min_weight=min_weight,
+        analysis_mode=analysis_mode,
+        eff_sources_k=eff_sources_k,
+        seed=seed,
+        compute_curvature=compute_curvature,
+        curvature_sample_edges=curvature_sample_edges,
+        graph_ids=graph_ids,
+        lightweight=lightweight,
+    )
+    return {
+        "overview": df_overview,
+        "settings": df_settings,
+        "manifest": df_manifest,
+        "subject_metrics": df_subjects,
+        "mixfrac_subjects": df_mixfrac,
+        "trajectories_long": df_traj,
+        "errors": df_errors,
+    }
 
 
 def export_stats_zip_bytes(
@@ -329,9 +588,10 @@ def export_stats_zip_bytes(
     progress_cb: Callable[[int, int, str], None] | None = None,
     lightweight: bool = False,
 ) -> bytes:
-    """Export tidy statistical tables as zip with three CSV files."""
-    df_subjects = build_subject_metrics_table(
+    """Export tidy statistical tables as ZIP with diagnostics and CSV files."""
+    bundle = _build_export_bundle(
         graphs,
+        experiments,
         min_conf=min_conf,
         min_weight=min_weight,
         analysis_mode=analysis_mode,
@@ -343,14 +603,11 @@ def export_stats_zip_bytes(
         progress_cb=progress_cb,
         lightweight=lightweight,
     )
-    df_mixfrac = build_mixfrac_subjects_table(experiments, graphs)
-    df_traj = build_trajectories_long_table(experiments, graphs)
 
     buf = BytesIO()
     with ZipFile(buf, mode="w", compression=ZIP_DEFLATED) as zf:
-        zf.writestr("subject_metrics.csv", df_subjects.to_csv(index=False))
-        zf.writestr("mixfrac_subjects.csv", df_mixfrac.to_csv(index=False))
-        zf.writestr("trajectories_long.csv", df_traj.to_csv(index=False))
+        for name, df in bundle.items():
+            zf.writestr(f"{name}.csv", _clean_for_export(df).to_csv(index=False))
     buf.seek(0)
     return buf.getvalue()
 
@@ -370,9 +627,10 @@ def export_stats_xlsx_bytes(
     progress_cb: Callable[[int, int, str], None] | None = None,
     lightweight: bool = False,
 ) -> bytes:
-    """Export tidy statistical tables as Excel workbook with three sheets."""
-    df_subjects = build_subject_metrics_table(
+    """Export tidy statistical tables as Excel workbook with diagnostics."""
+    bundle = _build_export_bundle(
         graphs,
+        experiments,
         min_conf=min_conf,
         min_weight=min_weight,
         analysis_mode=analysis_mode,
@@ -384,13 +642,13 @@ def export_stats_xlsx_bytes(
         progress_cb=progress_cb,
         lightweight=lightweight,
     )
-    df_mixfrac = build_mixfrac_subjects_table(experiments, graphs)
-    df_traj = build_trajectories_long_table(experiments, graphs)
 
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_subjects.to_excel(writer, sheet_name="subject_metrics", index=False)
-        df_mixfrac.to_excel(writer, sheet_name="mixfrac_subjects", index=False)
-        df_traj.to_excel(writer, sheet_name="trajectories_long", index=False)
+        for name, df in bundle.items():
+            clean_df = _clean_for_export(df)
+            clean_df.to_excel(writer, sheet_name=name[:31], index=False)
+        for ws in writer.book.worksheets:
+            _autosize_worksheet(ws)
     buf.seek(0)
     return buf.getvalue()

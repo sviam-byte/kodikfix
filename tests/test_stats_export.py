@@ -14,6 +14,7 @@ from src.stats_export import (
 
 
 def _edges_df() -> pd.DataFrame:
+    """Build a tiny connected graph for export smoke tests."""
     return pd.DataFrame(
         {
             "src": ["a", "b", "c", "d", "a"],
@@ -25,6 +26,7 @@ def _edges_df() -> pd.DataFrame:
 
 
 def test_stats_tables_shapes_and_columns():
+    """Ensure core table builders return expected basic structure."""
     g_hc = build_graph_entry(
         name="hc_001",
         source="upload",
@@ -91,6 +93,7 @@ def test_stats_tables_shapes_and_columns():
 
 
 def test_stats_zip_and_xlsx_exports():
+    """Ensure both export formats include full table bundle."""
     g = build_graph_entry(
         name="hc_001",
         source="upload",
@@ -118,7 +121,15 @@ def test_stats_zip_and_xlsx_exports():
     )
     with ZipFile(io.BytesIO(blob_zip), "r") as zf:
         names = set(zf.namelist())
-    assert {"subject_metrics.csv", "mixfrac_subjects.csv", "trajectories_long.csv"}.issubset(names)
+    assert {
+        "overview.csv",
+        "settings.csv",
+        "manifest.csv",
+        "subject_metrics.csv",
+        "mixfrac_subjects.csv",
+        "trajectories_long.csv",
+        "errors.csv",
+    }.issubset(names)
 
     blob_xlsx = export_stats_xlsx_bytes(
         {"g1": g},
@@ -129,3 +140,53 @@ def test_stats_zip_and_xlsx_exports():
         compute_curvature=False,
     )
     assert len(blob_xlsx) > 100
+
+
+def test_stats_export_includes_diagnostics_and_status_columns():
+    """Validate diagnostics tables/columns are present in XLSX export."""
+    g = build_graph_entry(
+        name="cont_001",
+        source="upload",
+        edges=_edges_df(),
+        src_col="src",
+        dst_col="dst",
+        entry_id="g1",
+    )
+    e = build_experiment_entry(
+        name="empty_attack",
+        graph_id="g1",
+        attack_kind="degree",
+        params={"attack_family": "node"},
+        history=pd.DataFrame(),
+        entry_id="e1",
+    )
+
+    blob_xlsx = export_stats_xlsx_bytes(
+        {"g1": g},
+        [e],
+        min_conf=0,
+        min_weight=0,
+        analysis_mode="Global",
+        compute_curvature=False,
+    )
+    xl = pd.ExcelFile(io.BytesIO(blob_xlsx))
+    assert {
+        "overview",
+        "settings",
+        "manifest",
+        "subject_metrics",
+        "mixfrac_subjects",
+        "trajectories_long",
+        "errors",
+    }.issubset(set(xl.sheet_names))
+
+    overview = pd.read_excel(io.BytesIO(blob_xlsx), sheet_name="overview")
+    manifest = pd.read_excel(io.BytesIO(blob_xlsx), sheet_name="manifest")
+    subjects = pd.read_excel(io.BytesIO(blob_xlsx), sheet_name="subject_metrics")
+    errors = pd.read_excel(io.BytesIO(blob_xlsx), sheet_name="errors")
+
+    assert "export_status" in subjects.columns
+    assert "selected_for_export" in manifest.columns
+    assert "table_name" in overview.columns
+    assert (overview["table_name"] == "mixfrac_subjects").any()
+    assert (errors["error_type"] == "empty_history").any()
