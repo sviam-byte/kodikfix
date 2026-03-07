@@ -78,7 +78,7 @@ from src.ui.tabs import compare as tab_compare
 from src.ui.tabs import dashboard as tab_dashboard
 from src.ui.tabs import energy as tab_energy
 from src.ui.tabs import structure as tab_structure
-from src.batch_ops import build_ui_args, make_run_dir, run_batch_plan, stage_batch_inputs
+from src.batch_ops import build_ui_args, discover_batch_files, make_run_dir, run_batch_plan, stage_batch_inputs
 
 inject_custom_css()
 ctx.ensure_initialized()
@@ -407,6 +407,12 @@ def cached_build_graph(
 # ============================================================
 with st.sidebar:
     st.title("🎛️ Kodik Lab")
+    page_mode = st.radio(
+        "Страница",
+        ["Граф и вкладки", "Batch-план"],
+        index=0,
+        key="__page_mode",
+    )
 
     with st.expander("📥 Импорт / Экспорт", expanded=False):
         t1, t2 = st.tabs(["Workspace", "Exps"])
@@ -449,267 +455,7 @@ with st.sidebar:
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
 
-    with st.expander("🗂 Batch runner", expanded=False):
-        batch_source_mode = st.selectbox(
-            "Источник данных",
-            ["local_folder", "uploaded_files", "uploaded_zip"],
-            index=0,
-            format_func=lambda x: {
-                "local_folder": "Локальная папка",
-                "uploaded_files": "Загруженные файлы",
-                "uploaded_zip": "ZIP-архив",
-            }.get(x, x),
-            key="__batch_source_mode",
-        )
-
-        batch_input_dir = ""
-        batch_uploaded_files = []
-        batch_uploaded_zip = None
-        if batch_source_mode == "local_folder":
-            batch_input_dir = st.text_input(
-                "Папка с входными файлами",
-                value=st.session_state.get("__batch_input_dir", os.getcwd()),
-                key="__batch_input_dir",
-            )
-        elif batch_source_mode == "uploaded_files":
-            batch_uploaded_files = st.file_uploader(
-                "Загрузи набор файлов для batch",
-                type=["mat", "csv", "tsv", "txt", "xlsx", "xls", "npy", "npz"],
-                accept_multiple_files=True,
-                key="__batch_uploaded_files",
-            ) or []
-        else:
-            batch_uploaded_zip = st.file_uploader(
-                "Загрузи ZIP с файлами для batch",
-                type=["zip"],
-                accept_multiple_files=False,
-                key="__batch_uploaded_zip",
-            )
-
-        c1, c2 = st.columns(2)
-        with c1:
-            batch_pattern = st.text_input("Pattern", value=st.session_state.get("__batch_pattern", "*.mat"), key="__batch_pattern")
-            batch_recursive = st.checkbox("Recursive", value=st.session_state.get("__batch_recursive", True), key="__batch_recursive")
-            batch_limit = st.number_input(
-                "Limit (0 = all)",
-                min_value=0,
-                value=int(st.session_state.get("__batch_limit", 0)),
-                step=1,
-                key="__batch_limit",
-            )
-            p1, p2 = st.columns(2)
-            with p1:
-                batch_run_metrics = st.checkbox("Metrics", value=st.session_state.get("__batch_run_metrics", True), key="__batch_run_metrics")
-            with p2:
-                batch_run_attack = st.checkbox("Attack", value=st.session_state.get("__batch_run_attack", False), key="__batch_run_attack")
-            batch_run_label = st.text_input(
-                "Имя запуска (опционально)",
-                value=st.session_state.get("__batch_run_label", "mat_batch"),
-                key="__batch_run_label",
-            )
-            batch_output_root = st.text_input(
-                "Корневая папка для результатов",
-                value=st.session_state.get("__batch_output_root", _default_batch_output_root()),
-                key="__batch_output_root",
-            )
-        with c2:
-            batch_input_kind = st.selectbox("Input kind", ["auto", "matrix", "edge"], index=1, key="__batch_input_kind")
-            batch_mat_key = st.text_input("MAT key (optional)", value=st.session_state.get("__batch_mat_key", ""), key="__batch_mat_key")
-            batch_sign_policy = st.selectbox("Sign policy", ["abs", "positive_only", "shift"], index=0, key="__batch_sign_policy")
-            batch_threshold_mode = st.selectbox("Threshold mode", ["density", "absolute"], index=0, key="__batch_threshold_mode")
-            batch_threshold_value = st.number_input(
-                "Threshold value",
-                value=float(st.session_state.get("__batch_threshold_value", 0.15)),
-                min_value=0.0,
-                step=0.01,
-                key="__batch_threshold_value",
-            )
-            batch_shift = st.number_input(
-                "Shift",
-                value=float(st.session_state.get("__batch_shift", 0.0)),
-                step=0.01,
-                key="__batch_shift",
-            )
-
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            batch_seed = st.number_input(
-                "Seed",
-                min_value=0,
-                value=int(st.session_state.get("__batch_seed", int(settings.DEFAULT_SEED))),
-                step=1,
-                key="__batch_seed",
-            )
-            batch_lcc = st.checkbox("LCC only", value=st.session_state.get("__batch_lcc", True), key="__batch_lcc")
-        with d2:
-            batch_compute_curv = st.checkbox("Compute curvature", value=st.session_state.get("__batch_compute_curv", False), key="__batch_compute_curv")
-            batch_curv_n = st.number_input(
-                "Curvature sample edges",
-                min_value=1,
-                value=int(st.session_state.get("__batch_curv_n", 120)),
-                step=1,
-                key="__batch_curv_n",
-            )
-        with d3:
-            batch_eff_k = st.number_input("eff_k", min_value=1, value=int(st.session_state.get("__batch_eff_k", 32)), step=1, key="__batch_eff_k")
-            batch_skip_spectral = st.checkbox("Skip spectral", value=st.session_state.get("__batch_skip_spectral", False), key="__batch_skip_spectral")
-
-        attack_box = st.container(border=True)
-        with attack_box:
-            st.caption("Параметры атаки используются только если включён Attack")
-            a1, a2, a3 = st.columns(3)
-            with a1:
-                batch_family = st.selectbox("Family", ["node", "edge", "mix"], index=0, key="__batch_family")
-                batch_kind = st.text_input("Kind", value=st.session_state.get("__batch_kind", "degree"), key="__batch_kind")
-            with a2:
-                batch_frac = st.number_input(
-                    "Frac",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(st.session_state.get("__batch_frac", 0.5)),
-                    step=0.05,
-                    key="__batch_frac",
-                )
-                batch_steps = st.number_input("Steps", min_value=1, value=int(st.session_state.get("__batch_steps", 30)), step=1, key="__batch_steps")
-            with a3:
-                batch_heavy_every = st.number_input(
-                    "Heavy every",
-                    min_value=1,
-                    value=int(st.session_state.get("__batch_heavy_every", 5)),
-                    step=1,
-                    key="__batch_heavy_every",
-                )
-                batch_fast_mode = st.checkbox("Fast mode", value=st.session_state.get("__batch_fast_mode", False), key="__batch_fast_mode")
-
-        in_dir_path = Path(_norm_path_str(batch_input_dir)) if str(batch_input_dir).strip() else None
-        out_root_path = Path(_norm_path_str(batch_output_root)) if str(batch_output_root).strip() else None
-
-        preview_files = []
-        preview_root = None
-        preview_cleanup = None
-        try:
-            if batch_source_mode == "local_folder":
-                if in_dir_path and in_dir_path.exists():
-                    preview_root = in_dir_path
-                    preview_files = sorted([
-                        p
-                        for p in (in_dir_path.rglob(batch_pattern) if batch_recursive else in_dir_path.glob(batch_pattern))
-                        if p.is_file() and p.suffix.lower() in {".mat", ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".npy", ".npz"}
-                    ])
-                else:
-                    st.caption("Укажи существующую папку с файлами.")
-            elif batch_source_mode == "uploaded_files":
-                preview_files = [Path(f.name) for f in batch_uploaded_files]
-            elif batch_uploaded_zip is not None:
-                preview_root, _, preview_cleanup = stage_batch_inputs(
-                    source_mode="uploaded_zip",
-                    uploaded_zip_name=batch_uploaded_zip.name,
-                    uploaded_zip_bytes=batch_uploaded_zip.getvalue(),
-                )
-                preview_files = sorted([
-                    p
-                    for p in (preview_root.rglob(batch_pattern) if batch_recursive else preview_root.glob(batch_pattern))
-                    if p.is_file() and p.suffix.lower() in {".mat", ".csv", ".tsv", ".txt", ".xlsx", ".xls", ".npy", ".npz"}
-                ])
-
-            if preview_files:
-                shown = preview_files[:10]
-                st.caption(f"Найдено файлов: {len(preview_files)}")
-                rels = []
-                for p in shown:
-                    if preview_root is not None:
-                        try:
-                            rels.append(str(p.relative_to(preview_root)))
-                        except Exception:
-                            rels.append(str(p))
-                    else:
-                        rels.append(str(p))
-                st.dataframe(pd.DataFrame({"file": rels}), use_container_width=True, height=180)
-        except Exception as e:  # pylint: disable=broad-except
-            st.warning(f"Не удалось подготовить batch-вход: {type(e).__name__}: {e}")
-        finally:
-            if preview_cleanup is not None:
-                preview_cleanup()
-
-        batch_status = st.empty()
-        batch_prog = st.progress(0.0)
-        run_batch_btn = st.button("Посчитать по плану", type="primary", use_container_width=True)
-
-        if run_batch_btn:
-            cleanup_cb = None
-            try:
-                if not out_root_path:
-                    raise ValueError("Не указана корневая папка для результатов")
-                if not batch_run_metrics and not batch_run_attack:
-                    raise ValueError("Отметь хотя бы один расчёт")
-
-                staged_input_dir, _, cleanup_cb = stage_batch_inputs(
-                    source_mode=batch_source_mode,
-                    input_dir=str(in_dir_path) if in_dir_path else "",
-                    uploaded_files=batch_uploaded_files,
-                    uploaded_zip_name=batch_uploaded_zip.name if batch_uploaded_zip is not None else "",
-                    uploaded_zip_bytes=batch_uploaded_zip.getvalue() if batch_uploaded_zip is not None else None,
-                )
-
-                mode_label = "metrics_attack" if (batch_run_metrics and batch_run_attack) else ("metrics" if batch_run_metrics else "attack")
-                planned_dir = make_run_dir(
-                    out_root_path,
-                    mode=f"batch_{mode_label}",
-                    seed=int(batch_seed),
-                    run_label=str(batch_run_label).strip(),
-                )
-
-                args = build_ui_args(
-                    input_dir=str(staged_input_dir),
-                    out_dir=str(planned_dir),
-                    pattern=str(batch_pattern),
-                    recursive=bool(batch_recursive),
-                    limit=int(batch_limit),
-                    input_kind=str(batch_input_kind),
-                    mat_key=str(batch_mat_key),
-                    sign_policy=str(batch_sign_policy),
-                    threshold_mode=str(batch_threshold_mode),
-                    threshold_value=float(batch_threshold_value),
-                    shift=float(batch_shift),
-                    seed=int(batch_seed),
-                    lcc=bool(batch_lcc),
-                    eff_k=int(batch_eff_k),
-                    compute_curvature=bool(batch_compute_curv),
-                    curvature_sample_edges=int(batch_curv_n),
-                    skip_spectral=bool(batch_skip_spectral),
-                    family=str(batch_family),
-                    kind=str(batch_kind),
-                    frac=float(batch_frac),
-                    alpha_rewire=float(batch_alpha_rewire),
-                    beta_replace=float(batch_beta_replace),
-                    swaps_per_edge=float(batch_swaps_per_edge),
-                    replace_from=str(batch_replace_from),
-                    steps=int(batch_steps),
-                    heavy_every=int(batch_heavy_every),
-                    fast_mode=bool(batch_fast_mode),
-                    run_metrics=bool(batch_run_metrics),
-                    run_attack=bool(batch_run_attack),
-                    source_mode=str(batch_source_mode),
-                )
-
-                def _ui_progress(done: int, total: int, label: str):
-                    frac = 1.0 if total <= 0 else min(1.0, max(0.0, float(done) / float(total)))
-                    batch_prog.progress(frac)
-                    batch_status.info(f"[{done:.2f}/{total}] {label}")
-
-                run_dir, result_frames = run_batch_plan(args, progress_cb=_ui_progress)
-                summary_parts = []
-                for mode_name, df_batch in result_frames.items():
-                    ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
-                    summary_parts.append(f"{mode_name}: ok={ok_n}/{len(df_batch)}")
-                batch_status.success(f"Готово: {'; '.join(summary_parts)}\n{run_dir}")
-                batch_prog.progress(1.0)
-            except Exception as e:  # pylint: disable=broad-except
-                batch_status.error(f"Batch run error: {type(e).__name__}: {e}")
-            finally:
-                if cleanup_cb is not None:
-                    cleanup_cb()
-
+    st.markdown("---")
     st.markdown("---")
     st.subheader("📂 Данные")
 
@@ -956,6 +702,266 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
+
+
+if page_mode == "Batch-план":
+    st.header("Batch-план")
+    st.caption("Отдельная страница для пакетного расчёта по папке, ZIP или набору файлов.")
+
+    batch_source_mode = st.selectbox(
+        "Источник данных",
+        ["local_folder", "uploaded_files", "uploaded_zip"],
+        index=0,
+        format_func=lambda x: {
+            "local_folder": "Локальная папка",
+            "uploaded_files": "Загруженные файлы",
+            "uploaded_zip": "ZIP-архив",
+        }.get(x, x),
+        key="__batch_source_mode_page",
+    )
+
+    batch_input_dir = ""
+    batch_uploaded_files = []
+    batch_uploaded_zip = None
+    if batch_source_mode == "local_folder":
+        batch_input_dir = st.text_input(
+            "Папка с входными файлами",
+            value=st.session_state.get("__batch_input_dir_page", os.getcwd()),
+            key="__batch_input_dir_page",
+        )
+    elif batch_source_mode == "uploaded_files":
+        batch_uploaded_files = st.file_uploader(
+            "Загрузи набор файлов для batch",
+            type=["mat", "csv", "tsv", "txt", "xlsx", "xls", "npy", "npz"],
+            accept_multiple_files=True,
+            key="__batch_uploaded_files_page",
+        ) or []
+    else:
+        batch_uploaded_zip = st.file_uploader(
+            "Загрузи ZIP с файлами для batch",
+            type=["zip"],
+            accept_multiple_files=False,
+            key="__batch_uploaded_zip_page",
+        )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        batch_pattern = st.text_input("Pattern", value=st.session_state.get("__batch_pattern_page", "*.mat"), key="__batch_pattern_page")
+        batch_recursive = st.checkbox("Recursive", value=st.session_state.get("__batch_recursive_page", True), key="__batch_recursive_page")
+        batch_limit = st.number_input(
+            "Limit (0 = all)",
+            min_value=0,
+            value=int(st.session_state.get("__batch_limit_page", 0)),
+            step=1,
+            key="__batch_limit_page",
+        )
+        p1, p2 = st.columns(2)
+        with p1:
+            batch_run_metrics = st.checkbox("Metrics", value=st.session_state.get("__batch_run_metrics_page", True), key="__batch_run_metrics_page")
+        with p2:
+            batch_run_attack = st.checkbox("Attack", value=st.session_state.get("__batch_run_attack_page", False), key="__batch_run_attack_page")
+        batch_run_label = st.text_input(
+            "Имя запуска (опционально)",
+            value=st.session_state.get("__batch_run_label_page", "mat_batch"),
+            key="__batch_run_label_page",
+        )
+        batch_output_root = st.text_input(
+            "Корневая папка для результатов",
+            value=st.session_state.get("__batch_output_root_page", _default_batch_output_root()),
+            key="__batch_output_root_page",
+        )
+    with c2:
+        batch_input_kind = st.selectbox("Input kind", ["auto", "matrix", "edge"], index=1, key="__batch_input_kind_page")
+        batch_mat_key = st.text_input("MAT key (optional)", value=st.session_state.get("__batch_mat_key_page", ""), key="__batch_mat_key_page")
+        batch_sign_policy = st.selectbox("Sign policy", ["abs", "positive_only", "shift"], index=0, key="__batch_sign_policy_page")
+        batch_threshold_mode = st.selectbox("Threshold mode", ["density", "absolute"], index=0, key="__batch_threshold_mode_page")
+        batch_threshold_value = st.number_input(
+            "Threshold value",
+            value=float(st.session_state.get("__batch_threshold_value_page", 0.15)),
+            min_value=0.0,
+            step=0.01,
+            key="__batch_threshold_value_page",
+        )
+        batch_shift = st.number_input(
+            "Shift",
+            value=float(st.session_state.get("__batch_shift_page", 0.0)),
+            step=0.01,
+            key="__batch_shift_page",
+        )
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        batch_seed = st.number_input("Seed", min_value=0, value=int(st.session_state.get("__batch_seed_page", int(settings.DEFAULT_SEED))), step=1, key="__batch_seed_page")
+        batch_lcc = st.checkbox("LCC only", value=st.session_state.get("__batch_lcc_page", True), key="__batch_lcc_page")
+    with d2:
+        batch_compute_curv = st.checkbox("Compute curvature", value=st.session_state.get("__batch_compute_curv_page", False), key="__batch_compute_curv_page")
+        batch_curv_n = st.number_input("Curvature sample edges", min_value=1, value=int(st.session_state.get("__batch_curv_n_page", 120)), step=1, key="__batch_curv_n_page")
+    with d3:
+        batch_eff_k = st.number_input("eff_k", min_value=1, value=int(st.session_state.get("__batch_eff_k_page", 32)), step=1, key="__batch_eff_k_page")
+        batch_skip_spectral = st.checkbox("Skip spectral", value=st.session_state.get("__batch_skip_spectral_page", False), key="__batch_skip_spectral_page")
+
+    attack_box = st.container(border=True)
+    with attack_box:
+        st.caption("Параметры атаки используются только если включён Attack")
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            batch_family = st.selectbox("Family", ["node", "edge", "mix"], index=0, key="__batch_family_page")
+            batch_kind = st.text_input("Kind", value=st.session_state.get("__batch_kind_page", "degree"), key="__batch_kind_page")
+        with a2:
+            batch_frac = st.number_input("Frac", min_value=0.0, max_value=1.0, value=float(st.session_state.get("__batch_frac_page", 0.5)), step=0.05, key="__batch_frac_page")
+            batch_steps = st.number_input("Steps", min_value=1, value=int(st.session_state.get("__batch_steps_page", 30)), step=1, key="__batch_steps_page")
+        with a3:
+            batch_heavy_every = st.number_input("Heavy every", min_value=1, value=int(st.session_state.get("__batch_heavy_every_page", 5)), step=1, key="__batch_heavy_every_page")
+            batch_fast_mode = st.checkbox("Fast mode", value=st.session_state.get("__batch_fast_mode_page", False), key="__batch_fast_mode_page")
+        with a4:
+            batch_alpha_rewire = st.number_input("alpha_rewire", min_value=0.0, max_value=1.0, value=float(st.session_state.get("__batch_alpha_rewire_page", 0.6)), step=0.05, key="__batch_alpha_rewire_page")
+            batch_beta_replace = st.number_input("beta_replace", min_value=0.0, max_value=1.0, value=float(st.session_state.get("__batch_beta_replace_page", 0.4)), step=0.05, key="__batch_beta_replace_page")
+            batch_swaps_per_edge = st.number_input("swaps_per_edge", min_value=0.0, value=float(st.session_state.get("__batch_swaps_per_edge_page", 0.5)), step=0.1, key="__batch_swaps_per_edge_page")
+            batch_replace_from = st.text_input("replace_from", value=st.session_state.get("__batch_replace_from_page", "CFG"), key="__batch_replace_from_page")
+
+    preview_root = None
+    preview_files = []
+    cleanup_cb_preview = None
+    try:
+        preview_root, preview_files, cleanup_cb_preview = discover_batch_files(
+            source_mode=batch_source_mode,
+            input_dir=batch_input_dir,
+            uploaded_files=batch_uploaded_files,
+            uploaded_zip_name=batch_uploaded_zip.name if batch_uploaded_zip is not None else "",
+            uploaded_zip_bytes=batch_uploaded_zip.getvalue() if batch_uploaded_zip is not None else None,
+            pattern=batch_pattern,
+            recursive=batch_recursive,
+            limit=int(batch_limit),
+        )
+    except Exception as e:
+        st.info(f"Пока нет списка файлов: {type(e).__name__}: {e}")
+
+    selected_files_abs = []
+    if preview_files:
+        display_files = []
+        for p in preview_files:
+            try:
+                display_files.append(str(p.relative_to(preview_root)))
+            except Exception:
+                display_files.append(str(p))
+
+        st.subheader("Что считать")
+        pick_mode = st.radio(
+            "Посчитать для",
+            ["Всех найденных", "Только выбранных"],
+            horizontal=True,
+            key="__batch_pick_mode_page",
+        )
+        st.caption(f"Найдено файлов: {len(display_files)}")
+        st.dataframe(pd.DataFrame({"file": display_files}), use_container_width=True, height=260)
+        if pick_mode == "Только выбранных":
+            selected_display = st.multiselect(
+                "Выбери файлы",
+                options=display_files,
+                default=display_files[: min(10, len(display_files))],
+                key="__batch_selected_display_page",
+            )
+            selected_lookup = set(selected_display)
+            selected_files_abs = [str(p) for p, rel in zip(preview_files, display_files) if rel in selected_lookup]
+        else:
+            selected_files_abs = [str(p) for p in preview_files]
+
+        run_label = "всех" if pick_mode == "Всех найденных" else f"выбранных ({len(selected_files_abs)})"
+        batch_status = st.empty()
+        batch_prog = st.progress(0.0)
+        run_batch_btn = st.button(f"Посчитать для {run_label}", type="primary", use_container_width=True)
+
+        if run_batch_btn:
+            cleanup_cb_run = None
+            try:
+                if not str(batch_output_root).strip():
+                    raise ValueError("Не указана корневая папка для результатов")
+                if not batch_run_metrics and not batch_run_attack:
+                    raise ValueError("Отметь хотя бы один расчёт")
+                if not selected_files_abs:
+                    raise ValueError("Нет выбранных файлов")
+
+                staged_input_dir, _, cleanup_cb_run = stage_batch_inputs(
+                    source_mode=batch_source_mode,
+                    input_dir=batch_input_dir,
+                    uploaded_files=batch_uploaded_files,
+                    uploaded_zip_name=batch_uploaded_zip.name if batch_uploaded_zip is not None else "",
+                    uploaded_zip_bytes=batch_uploaded_zip.getvalue() if batch_uploaded_zip is not None else None,
+                )
+
+                selected_rel = []
+                for abs_path in selected_files_abs:
+                    try:
+                        selected_rel.append(str(Path(abs_path).resolve().relative_to(Path(preview_root).resolve())))
+                    except Exception:
+                        pass
+                selected_run_files = [str((Path(staged_input_dir) / rel).resolve()) for rel in selected_rel] if selected_rel else None
+
+                mode_label = "metrics_attack" if (batch_run_metrics and batch_run_attack) else ("metrics" if batch_run_metrics else "attack")
+                planned_dir = make_run_dir(
+                    batch_output_root,
+                    mode=f"batch_{mode_label}",
+                    seed=int(batch_seed),
+                    run_label=str(batch_run_label).strip(),
+                )
+
+                args = build_ui_args(
+                    input_dir=str(staged_input_dir),
+                    out_dir=str(planned_dir),
+                    pattern=str(batch_pattern),
+                    recursive=bool(batch_recursive),
+                    limit=int(batch_limit),
+                    input_kind=str(batch_input_kind),
+                    mat_key=str(batch_mat_key),
+                    sign_policy=str(batch_sign_policy),
+                    threshold_mode=str(batch_threshold_mode),
+                    threshold_value=float(batch_threshold_value),
+                    shift=float(batch_shift),
+                    seed=int(batch_seed),
+                    lcc=bool(batch_lcc),
+                    eff_k=int(batch_eff_k),
+                    compute_curvature=bool(batch_compute_curv),
+                    curvature_sample_edges=int(batch_curv_n),
+                    skip_spectral=bool(batch_skip_spectral),
+                    family=str(batch_family),
+                    kind=str(batch_kind),
+                    frac=float(batch_frac),
+                    alpha_rewire=float(batch_alpha_rewire),
+                    beta_replace=float(batch_beta_replace),
+                    swaps_per_edge=float(batch_swaps_per_edge),
+                    replace_from=str(batch_replace_from),
+                    steps=int(batch_steps),
+                    heavy_every=int(batch_heavy_every),
+                    fast_mode=bool(batch_fast_mode),
+                    run_metrics=bool(batch_run_metrics),
+                    run_attack=bool(batch_run_attack),
+                    source_mode=str(batch_source_mode),
+                    selected_files=selected_run_files,
+                )
+
+                def _ui_progress(done: int, total: int, label: str):
+                    frac = 1.0 if total <= 0 else min(1.0, max(0.0, float(done) / float(total)))
+                    batch_prog.progress(frac)
+                    batch_status.info(f"[{done:.2f}/{total}] {label}")
+
+                run_dir, result_frames = run_batch_plan(args, progress_cb=_ui_progress)
+                summary_parts = []
+                for mode_name, df_batch in result_frames.items():
+                    ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
+                    summary_parts.append(f"{mode_name}: ok={ok_n}/{len(df_batch)}")
+                batch_status.success(f"Готово: {'; '.join(summary_parts)}\n{run_dir}")
+                batch_prog.progress(1.0)
+            except Exception as e:
+                batch_status.error(f"Batch run error: {type(e).__name__}: {e}")
+            finally:
+                if cleanup_cb_run is not None:
+                    cleanup_cb_run()
+    else:
+        st.warning("Файлы пока не найдены. Проверь путь, pattern или загрузку.")
+
+    if cleanup_cb_preview is not None:
+        cleanup_cb_preview()
+    st.stop()
 
 # ============================================================
 # 5) AАКТИВНЫЙ ГРАФЧИК
