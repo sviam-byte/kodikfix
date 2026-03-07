@@ -6,7 +6,13 @@ import pandas as pd
 
 
 def _trapz_compat(y, x=None, dx: float = 1.0) -> float:
-    """Compat trapezoidal integration across NumPy versions."""
+    """Совместимое вычисление интеграла методом трапеций.
+
+    В NumPy 2.x предпочтителен ``np.trapezoid``. В более старых версиях
+    доступен ``np.trapz``. Если окружение предоставляет только базовые
+    ndarray-операции, используем локальную формулу трапеций как безопасный
+    fallback, чтобы метрики AUC не падали из-за несовместимости API.
+    """
     if hasattr(np, "trapezoid"):
         if x is None:
             return float(np.trapezoid(y, dx=dx))
