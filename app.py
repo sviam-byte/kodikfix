@@ -755,11 +755,15 @@ if page_mode == "Batch-план":
             step=1,
             key="__batch_limit_page",
         )
-        p1, p2 = st.columns(2)
+        p1, p2, p3, p4 = st.columns(4)
         with p1:
             batch_run_metrics = st.checkbox("Metrics", value=st.session_state.get("__batch_run_metrics_page", True), key="__batch_run_metrics_page")
         with p2:
             batch_run_attack = st.checkbox("Attack", value=st.session_state.get("__batch_run_attack_page", False), key="__batch_run_attack_page")
+        with p3:
+            batch_run_energy = st.checkbox("Energy", value=st.session_state.get("__batch_run_energy_page", False), key="__batch_run_energy_page")
+        with p4:
+            batch_run_resistance = st.checkbox("Resistance", value=st.session_state.get("__batch_run_resistance_page", False), key="__batch_run_resistance_page")
         batch_run_label = st.text_input(
             "Имя запуска (опционально)",
             value=st.session_state.get("__batch_run_label_page", "mat_batch"),
@@ -799,6 +803,21 @@ if page_mode == "Batch-план":
     with d3:
         batch_eff_k = st.number_input("eff_k", min_value=1, value=int(st.session_state.get("__batch_eff_k_page", 32)), step=1, key="__batch_eff_k_page")
         batch_skip_spectral = st.checkbox("Skip spectral", value=st.session_state.get("__batch_skip_spectral_page", False), key="__batch_skip_spectral_page")
+
+    energy_box = st.container(border=True)
+    with energy_box:
+        st.caption("Параметры diffusion используются только если включён Energy")
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            batch_energy_steps = st.number_input("Energy steps", min_value=1, value=int(st.session_state.get("__batch_energy_steps_page", 50)), step=1, key="__batch_energy_steps_page")
+            batch_energy_flow_mode = st.selectbox("Energy flow mode", ["rw", "evo", "phys"], index=0, key="__batch_energy_flow_mode_page")
+        with e2:
+            batch_energy_damping = st.number_input("Energy damping", min_value=0.0, max_value=1.0, value=float(st.session_state.get("__batch_energy_damping_page", 1.0)), step=0.05, key="__batch_energy_damping_page")
+            batch_energy_rw_impulse = st.checkbox("Energy RW impulse", value=st.session_state.get("__batch_energy_rw_impulse_page", True), key="__batch_energy_rw_impulse_page")
+        with e3:
+            batch_energy_phys_injection = st.number_input("Energy phys injection", min_value=0.0, value=float(st.session_state.get("__batch_energy_phys_injection_page", 0.15)), step=0.05, key="__batch_energy_phys_injection_page")
+            batch_energy_phys_leak = st.number_input("Energy phys leak", min_value=0.0, value=float(st.session_state.get("__batch_energy_phys_leak_page", 0.02)), step=0.01, key="__batch_energy_phys_leak_page")
+            batch_energy_phys_cap_mode = st.selectbox("Energy cap mode", ["strength", "degree"], index=0, key="__batch_energy_phys_cap_mode_page")
 
     attack_box = st.container(border=True)
     with attack_box:
@@ -876,7 +895,7 @@ if page_mode == "Batch-план":
             try:
                 if not str(batch_output_root).strip():
                     raise ValueError("Не указана корневая папка для результатов")
-                if not batch_run_metrics and not batch_run_attack:
+                if not batch_run_metrics and not batch_run_attack and not batch_run_energy and not batch_run_resistance:
                     raise ValueError("Отметь хотя бы один расчёт")
                 if not selected_files_abs:
                     raise ValueError("Нет выбранных файлов")
@@ -897,7 +916,8 @@ if page_mode == "Batch-план":
                         pass
                 selected_run_files = [str((Path(staged_input_dir) / rel).resolve()) for rel in selected_rel] if selected_rel else None
 
-                mode_label = "metrics_attack" if (batch_run_metrics and batch_run_attack) else ("metrics" if batch_run_metrics else "attack")
+                selected_modes = [name for name, flag in [("metrics", batch_run_metrics), ("attack", batch_run_attack), ("energy", batch_run_energy), ("resistance", batch_run_resistance)] if flag]
+                mode_label = "_".join(selected_modes) if selected_modes else "batch"
                 planned_dir = make_run_dir(
                     batch_output_root,
                     mode=f"batch_{mode_label}",
@@ -935,6 +955,15 @@ if page_mode == "Batch-план":
                     fast_mode=bool(batch_fast_mode),
                     run_metrics=bool(batch_run_metrics),
                     run_attack=bool(batch_run_attack),
+                    run_energy=bool(batch_run_energy),
+                    run_resistance=bool(batch_run_resistance),
+                    energy_steps=int(batch_energy_steps),
+                    energy_flow_mode=str(batch_energy_flow_mode),
+                    energy_damping=float(batch_energy_damping),
+                    energy_phys_injection=float(batch_energy_phys_injection),
+                    energy_phys_leak=float(batch_energy_phys_leak),
+                    energy_phys_cap_mode=str(batch_energy_phys_cap_mode),
+                    energy_rw_impulse=bool(batch_energy_rw_impulse),
                     source_mode=str(batch_source_mode),
                     selected_files=selected_run_files,
                 )

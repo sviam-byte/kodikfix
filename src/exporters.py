@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from io import BytesIO
+from zipfile import ZIP_DEFLATED, ZipFile
 from pathlib import Path
 from typing import Any
 
@@ -156,5 +157,49 @@ def experiments_to_xlsx_bytes(experiments: list) -> bytes:
 
         pd.DataFrame(index_rows).to_excel(writer, sheet_name="index", index=False)
 
+    buf.seek(0)
+    return buf.getvalue()
+
+
+
+def export_energy_tables_xlsx(
+    energy_nodes_long: pd.DataFrame,
+    energy_steps_summary: pd.DataFrame,
+    energy_run_summary: dict,
+) -> bytes:
+    """Export energy spread tables into an in-memory XLSX workbook."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        pd.DataFrame([energy_run_summary or {}]).to_excel(writer, sheet_name="energy_run_summary", index=False)
+        (energy_steps_summary.copy() if energy_steps_summary is not None else pd.DataFrame()).to_excel(
+            writer, sheet_name="energy_steps_summary", index=False
+        )
+        (energy_nodes_long.copy() if energy_nodes_long is not None else pd.DataFrame()).to_excel(
+            writer, sheet_name="energy_nodes_long", index=False
+        )
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def export_energy_tables_csv_zip(
+    energy_nodes_long: pd.DataFrame,
+    energy_steps_summary: pd.DataFrame,
+    energy_run_summary: dict,
+) -> bytes:
+    """Export energy spread tables as a zip with CSV files."""
+    buf = BytesIO()
+    with ZipFile(buf, mode="w", compression=ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "energy_run_summary.csv",
+            pd.DataFrame([energy_run_summary or {}]).to_csv(index=False).encode("utf-8"),
+        )
+        zf.writestr(
+            "energy_steps_summary.csv",
+            (energy_steps_summary.copy() if energy_steps_summary is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
+        )
+        zf.writestr(
+            "energy_nodes_long.csv",
+            (energy_nodes_long.copy() if energy_nodes_long is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
+        )
     buf.seek(0)
     return buf.getvalue()
