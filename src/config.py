@@ -55,7 +55,10 @@ class Settings:
     APPROX_EFFICIENCY_K: int = 32
 
     # Ограничения на хранение в памяти для UI.
-    MAX_GRAPHS_IN_MEMORY: int = 8
+    # 0 или отрицательное значение = без лимита.
+    # Важно: если лимит слишком маленький, workspace будет молча обрезаться,
+    # и batch/research по workspace увидят только хвост.
+    MAX_GRAPHS_IN_MEMORY: int = 256
     MAX_EXPS_IN_MEMORY: int = 40
 
     # Дефолты для энергии

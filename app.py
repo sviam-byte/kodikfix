@@ -91,7 +91,7 @@ from src.ui.tabs import compare as tab_compare
 from src.ui.tabs import dashboard as tab_dashboard
 from src.ui.tabs import energy as tab_energy
 from src.ui.tabs import structure as tab_structure
-from src.batch_ops import build_ui_args, discover_batch_files, make_run_dir, run_batch_plan, stage_batch_inputs
+from src.batch_ops import build_ui_args, discover_batch_files, inspect_batch_file, make_run_dir, run_batch_plan, stage_batch_inputs
 
 inject_custom_css()
 ctx.ensure_initialized()
@@ -656,9 +656,14 @@ def _render_research_tab(
         graph_ids = list(ctx.graphs.keys())
 
     if run_active or run_all:
+        # Защита от рассинхрона: после rerun/trim_memory/drop_graph набор id
+        # может устареть, поэтому валидируем его прямо перед запуском.
         graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
         if not graph_ids:
-            st.error("В workspace нет доступных графов для расчёта. Возможно, список устарел после удаления или trim_memory.")
+            st.error(
+                "В workspace нет доступных графов для расчёта. "
+                "Возможно, список устарел после удаления графов или trim_memory()."
+            )
             return
         frames, extras = _run_research_workspace_plan(
             graph_ids,
@@ -1179,7 +1184,9 @@ if page_mode == "Batch-план":
 
     c1, c2 = st.columns(2)
     with c1:
-        batch_pattern = st.text_input("Pattern", value=st.session_state.get("__batch_pattern_page", "*.mat"), key="__batch_pattern_page")
+        # По умолчанию берём все имена; затем фильтруем по поддерживаемым
+        # расширениям в discover_batch_files/_iter_input_files.
+        batch_pattern = st.text_input("Pattern", value=st.session_state.get("__batch_pattern_page", "*"), key="__batch_pattern_page")
         batch_recursive = st.checkbox("Recursive", value=st.session_state.get("__batch_recursive_page", True), key="__batch_recursive_page")
         batch_limit = st.number_input(
             "Limit (0 = all)",
@@ -1291,11 +1298,26 @@ if page_mode == "Batch-план":
     selected_files_abs = []
     if preview_files:
         display_files = []
+        preview_rows = []
         for p in preview_files:
             try:
-                display_files.append(str(p.relative_to(preview_root)))
+                rel = str(p.relative_to(preview_root))
             except Exception:
-                display_files.append(str(p))
+                rel = str(p)
+            display_files.append(rel)
+            meta = inspect_batch_file(p)
+            preview_rows.append(
+                {
+                    "file": rel,
+                    "suffix": meta.get("suffix"),
+                    "kind_guess": meta.get("kind_guess"),
+                    "expanded_graphs": meta.get("expanded_graphs"),
+                    "packed_mat": meta.get("packed_mat"),
+                    "n_subjects": meta.get("n_subjects"),
+                    "n_nodes": meta.get("n_nodes"),
+                    "preview_error": meta.get("preview_error"),
+                }
+            )
 
         st.subheader("Что считать")
         pick_mode = st.radio(
@@ -1304,8 +1326,9 @@ if page_mode == "Batch-план":
             horizontal=True,
             key="__batch_pick_mode_page",
         )
-        st.caption(f"Найдено файлов: {len(display_files)}")
-        st.dataframe(pd.DataFrame({"file": display_files}), width="stretch", height=260)
+        total_expanded = int(sum(int(row.get("expanded_graphs") or 1) for row in preview_rows))
+        st.caption(f"Найдено файлов: {len(display_files)}; будет рассчитано графов: {total_expanded}")
+        st.dataframe(pd.DataFrame(preview_rows), width="stretch", height=260)
         if pick_mode == "Только выбранных":
             selected_display = st.multiselect(
                 "Выбери файлы",
@@ -1413,6 +1436,35 @@ if page_mode == "Batch-план":
                     summary_parts.append(f"{mode_name}: ok={ok_n}/{len(df_batch)}")
                 batch_status.success(f"Готово: {'; '.join(summary_parts)}\n{run_dir}")
                 batch_prog.progress(1.0)
+
+                bundle_zip_path = Path(run_dir) / "batch_plan_bundle.zip"
+                manifest_xlsx_path = Path(run_dir) / "batch_plan_manifest.xlsx"
+                manifest_csv_path = Path(run_dir) / "batch_plan_manifest.csv"
+
+                if manifest_xlsx_path.exists():
+                    st.download_button(
+                        "Скачать общий manifest (.xlsx)",
+                        data=manifest_xlsx_path.read_bytes(),
+                        file_name=manifest_xlsx_path.name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        width="stretch",
+                    )
+                if manifest_csv_path.exists():
+                    st.download_button(
+                        "Скачать общий manifest (.csv)",
+                        data=manifest_csv_path.read_bytes(),
+                        file_name=manifest_csv_path.name,
+                        mime="text/csv",
+                        width="stretch",
+                    )
+                if bundle_zip_path.exists():
+                    st.download_button(
+                        "Скачать весь batch bundle (.zip)",
+                        data=bundle_zip_path.read_bytes(),
+                        file_name=bundle_zip_path.name,
+                        mime="application/zip",
+                        width="stretch",
+                    )
             except Exception as e:
                 batch_status.error(f"Batch run error: {type(e).__name__}: {e}")
             finally:

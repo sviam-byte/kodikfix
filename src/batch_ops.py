@@ -4,11 +4,12 @@ import json
 import re
 import shutil
 import tempfile
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Iterable
-from zipfile import ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
 
@@ -33,6 +34,131 @@ from .robustness import graph_resistance_summary
 
 # Колбэк прогресса: done, total, label
 ProgressCb = Callable[[int, int, str], None]
+
+
+def _metrics_payload_xlsx_bytes(payload: dict) -> bytes:
+    """Serialize one metrics payload to XLSX bytes.
+
+    The workbook keeps both flattened and structured sections so downstream
+    users can inspect the same payload in Excel without opening JSON.
+    """
+    buf = BytesIO()
+    flat_row = payload_to_flat_row(payload)
+    summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    settings = payload.get("settings", {}) if isinstance(payload.get("settings"), dict) else {}
+    metrics = payload.get("metrics", {}) if isinstance(payload.get("metrics"), dict) else {}
+    batch = payload.get("batch", {}) if isinstance(payload.get("batch"), dict) else {}
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        pd.DataFrame([flat_row]).to_excel(writer, sheet_name="metrics_flat", index=False)
+        pd.DataFrame([summary]).to_excel(writer, sheet_name="summary", index=False)
+        pd.DataFrame([settings]).to_excel(writer, sheet_name="settings", index=False)
+        pd.DataFrame([metrics]).to_excel(writer, sheet_name="metrics", index=False)
+        pd.DataFrame([batch]).to_excel(writer, sheet_name="batch", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _attack_payload_xlsx_bytes(payload: dict, history: pd.DataFrame) -> bytes:
+    """Serialize one attack payload (+history) to XLSX bytes."""
+    buf = BytesIO()
+    summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    final_row = payload.get("final_row", {}) if isinstance(payload.get("final_row"), dict) else {}
+    settings = payload.get("settings", {}) if isinstance(payload.get("settings"), dict) else {}
+    batch = payload.get("batch", {}) if isinstance(payload.get("batch"), dict) else {}
+    meta = {
+        "mode": payload.get("mode", "attack"),
+        "input": payload.get("input", ""),
+        "family": payload.get("family", ""),
+        "kind": payload.get("kind", ""),
+    }
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        pd.DataFrame([meta]).to_excel(writer, sheet_name="meta", index=False)
+        pd.DataFrame([summary]).to_excel(writer, sheet_name="summary", index=False)
+        pd.DataFrame([final_row]).to_excel(writer, sheet_name="final_row", index=False)
+        pd.DataFrame([settings]).to_excel(writer, sheet_name="settings", index=False)
+        pd.DataFrame([batch]).to_excel(writer, sheet_name="batch", index=False)
+        (history.copy() if history is not None else pd.DataFrame()).to_excel(writer, sheet_name="history", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _single_row_xlsx_bytes(row: dict, *, sheet_name: str = "summary") -> bytes:
+    """Serialize a single summary row to XLSX bytes."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        pd.DataFrame([row or {}]).to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _write_manifest_tables(out_dir: Path, df: pd.DataFrame, *, prefix: str = "manifest") -> tuple[Path, Path]:
+    """Write manifest as CSV + XLSX and return paths to saved files."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"{prefix}.csv"
+    xlsx_path = out_dir / f"{prefix}.xlsx"
+    df_to_save = df.copy() if df is not None else pd.DataFrame()
+    df_to_save.to_csv(csv_path, index=False)
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        df_to_save.to_excel(writer, sheet_name=prefix[:31], index=False)
+    return csv_path, xlsx_path
+
+
+def _base_manifest_row(job: dict, idx: int, mode: str) -> dict:
+    """Return common manifest fields for one expanded graph job."""
+    path = Path(job["path"])
+    return {
+        "mode": mode,
+        "batch_index": idx,
+        "input": str(job.get("input", path)),
+        "input_file": path.name,
+        "input_stem": path.stem,
+        "input_suffix": path.suffix.lower(),
+        "relative_input": str(job.get("relative_input", "")),
+        "subject_name": str(job.get("subject_name") or ""),
+        "subject_index": job.get("subject_index"),
+    }
+
+
+def zip_tree_to_file(root_dir: Path, zip_path: Path) -> Path:
+    """Create a recursive zip archive of ``root_dir`` at ``zip_path``."""
+    root_dir = Path(root_dir)
+    zip_path = Path(zip_path)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(zip_path, mode="w", compression=ZIP_DEFLATED) as zf:
+        for path in sorted(root_dir.rglob("*")):
+            if path.is_file() and path.resolve() != zip_path.resolve():
+                zf.write(path, arcname=str(path.relative_to(root_dir)))
+    return zip_path
+
+
+def inspect_batch_file(path: Path) -> dict:
+    """Build preview metadata for a batch file.
+
+    For packed ``.mat`` files, this performs a lightweight parse to estimate
+    how many graph jobs will be expanded during batch execution.
+    """
+    suffix = path.suffix.lower()
+    row = {
+        "file": str(path),
+        "suffix": suffix,
+        "kind_guess": "matrix" if suffix in {".mat", ".npy", ".npz"} else "edge",
+        "expanded_graphs": 1,
+        "packed_mat": False,
+        "n_subjects": None,
+        "n_nodes": None,
+        "preview_error": "",
+    }
+    if suffix == ".mat":
+        try:
+            bundle = load_packed_mat_bundle(path.read_bytes())
+            row["packed_mat"] = True
+            row["expanded_graphs"] = int(bundle.n_subjects)
+            row["n_subjects"] = int(bundle.n_subjects)
+            row["n_nodes"] = int(bundle.n_nodes)
+        except Exception as exc:  # pylint: disable=broad-except
+            row["preview_error"] = f"{type(exc).__name__}: {exc}"
+    return row
 
 
 def stage_batch_inputs(
@@ -188,6 +314,7 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
         jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
     total = len(jobs)
     rows: list[dict] = []
+    manifest_rows: list[dict] = []
 
     for idx, job in enumerate(jobs, start=1):
         path = Path(job["path"])
@@ -235,9 +362,20 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
             })
             xlsx_path = per_item_dir / f"{item_name}.xlsx"
             xlsx_path.write_bytes(export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary))
-            rows.append({**energy_run_summary, "xlsx_path": str(xlsx_path.resolve())})
+            xlsx_abs = str(xlsx_path.resolve())
+            rows.append({**energy_run_summary, "xlsx_path": xlsx_abs})
+            manifest_rows.append(
+                {
+                    **_base_manifest_row(job, idx, "energy"),
+                    "status": "ok",
+                    "error": "",
+                    "xlsx_path": xlsx_abs,
+                    "json_path": "",
+                    "history_csv_path": "",
+                }
+            )
         except Exception as exc:
-            rows.append({
+            err_row = {
                 "mode": "energy",
                 "batch_index": idx,
                 "input": str(path),
@@ -249,9 +387,21 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "subject_index": job.get("subject_index"),
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
-            })
+            }
+            rows.append(err_row)
+            manifest_rows.append(
+                {
+                    **_base_manifest_row(job, idx, "energy"),
+                    "status": "error",
+                    "error": err_row["error"],
+                    "xlsx_path": "",
+                    "json_path": "",
+                    "history_csv_path": "",
+                }
+            )
 
     df = pd.DataFrame(rows)
+    manifest_df = pd.DataFrame(manifest_rows)
     summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "energy_summary.csv"
     summary_xlsx = out_dir / "energy_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
@@ -259,6 +409,7 @@ def run_batch_energy(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     df.to_csv(summary_csv, index=False)
     with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="energy_runs", index=False)
+    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
     manifest_path.write_text(
         json.dumps(build_batch_manifest(files=files, args=args, mode="batch-energy"), ensure_ascii=False, indent=2, default=_json_default),
         encoding="utf-8",
@@ -272,6 +423,8 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
     """Run structural resistance batch and return output dir and summary DataFrame."""
     input_dir = Path(args.input_dir)
     out_dir = Path(args.out_dir)
+    per_item_dir = out_dir / "per_item"
+    per_item_dir.mkdir(parents=True, exist_ok=True)
     explicit_files = [Path(p) for p in getattr(args, "selected_files", []) or []]
     files = explicit_files or _iter_input_files(
         input_dir,
@@ -284,17 +437,20 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
         jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
     total = len(jobs)
     rows: list[dict] = []
+    manifest_rows: list[dict] = []
     for idx, job in enumerate(jobs, start=1):
         path = Path(job["path"])
         if progress_cb:
             label = job.get("subject_name") or path.name
             progress_cb(idx - 1, total, f"resistance :: {label}")
+        item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
+        item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
         try:
             if job.get("graph") is None:
                 raise ValueError("Resistance batch currently supports matrix/MAT inputs expanded to graphs")
             graph = job["graph"]
             res = graph_resistance_summary(graph)
-            rows.append({
+            row = {
                 "mode": "resistance",
                 "batch_index": idx,
                 "input": str(job["input"]),
@@ -307,9 +463,24 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
                 "status": "ok",
                 "error": "",
                 **res,
-            })
+            }
+            xlsx_path = per_item_dir / f"{item_name}.xlsx"
+            xlsx_path.write_bytes(_single_row_xlsx_bytes(row, sheet_name="resistance"))
+            xlsx_abs = str(xlsx_path.resolve())
+            row["xlsx_path"] = xlsx_abs
+            rows.append(row)
+            manifest_rows.append(
+                {
+                    **_base_manifest_row(job, idx, "resistance"),
+                    "status": "ok",
+                    "error": "",
+                    "xlsx_path": xlsx_abs,
+                    "json_path": "",
+                    "history_csv_path": "",
+                }
+            )
         except Exception as exc:
-            rows.append({
+            err_row = {
                 "mode": "resistance",
                 "batch_index": idx,
                 "input": str(path),
@@ -321,8 +492,20 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
                 "subject_index": job.get("subject_index"),
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
-            })
+            }
+            rows.append(err_row)
+            manifest_rows.append(
+                {
+                    **_base_manifest_row(job, idx, "resistance"),
+                    "status": "error",
+                    "error": err_row["error"],
+                    "xlsx_path": "",
+                    "json_path": "",
+                    "history_csv_path": "",
+                }
+            )
     df = pd.DataFrame(rows)
+    manifest_df = pd.DataFrame(manifest_rows)
     summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "resistance_summary.csv"
     summary_xlsx = out_dir / "resistance_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
@@ -330,6 +513,7 @@ def run_batch_resistance(args, *, progress_cb: ProgressCb | None = None) -> tupl
     df.to_csv(summary_csv, index=False)
     with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="robustness_summary", index=False)
+    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
     manifest_path.write_text(
         json.dumps(build_batch_manifest(files=files, args=args, mode="batch-resistance"), ensure_ascii=False, indent=2, default=_json_default),
         encoding="utf-8",
@@ -358,6 +542,7 @@ def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path
 
     total_modes = len(modes)
     result_frames: dict[str, pd.DataFrame] = {}
+    manifest_frames: list[pd.DataFrame] = []
 
     def _wrap_progress(mode_idx: int, mode_name: str):
         """Map per-mode progress into one global progress stream for UI."""
@@ -386,13 +571,29 @@ def run_batch_plan(args, *, progress_cb: ProgressCb | None = None) -> tuple[Path
             _, df_mode = run_batch_resistance(mode_args, progress_cb=_wrap_progress(mode_idx, "resistance"))
         result_frames[mode_name] = df_mode
 
+        mode_manifest_csv = mode_out_dir / "manifest.csv"
+        if mode_manifest_csv.exists():
+            try:
+                manifest_frames.append(pd.read_csv(mode_manifest_csv))
+            except Exception:
+                pass
+
     combined_xlsx = out_dir / "batch_plan_summary.xlsx"
     with pd.ExcelWriter(combined_xlsx, engine="openpyxl") as writer:
         for mode_name, df_mode in result_frames.items():
             df_mode.to_excel(writer, sheet_name=mode_name[:31], index=False)
 
+    if manifest_frames:
+        combined_manifest_df = pd.concat(manifest_frames, ignore_index=True, sort=False)
+    else:
+        combined_manifest_df = pd.DataFrame()
+    _write_manifest_tables(out_dir, combined_manifest_df, prefix="batch_plan_manifest")
+
+    bundle_zip = out_dir / "batch_plan_bundle.zip"
+    zip_tree_to_file(out_dir, bundle_zip)
+
     if progress_cb is not None:
-        progress_cb(total_modes, total_modes, f"saved -> {combined_xlsx.name}")
+        progress_cb(total_modes, total_modes, f"saved -> {bundle_zip.name}")
     return out_dir, result_frames
 
 
@@ -505,6 +706,7 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
         jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
     total = len(jobs)
     rows: list[dict] = []
+    manifest_rows: list[dict] = []
 
     for idx, job in enumerate(jobs, start=1):
         path = Path(job["path"])
@@ -529,6 +731,10 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
             }
             json_path = per_item_dir / f"{item_name}.json"
             export_metrics_payload(payload, str(json_path), "json")
+            xlsx_path = per_item_dir / f"{item_name}.xlsx"
+            xlsx_path.write_bytes(_metrics_payload_xlsx_bytes(payload))
+            json_abs = str(json_path.resolve())
+            xlsx_abs = str(xlsx_path.resolve())
 
             row = payload_to_flat_row(payload)
             row.update(
@@ -540,30 +746,51 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
                     "relative_input": str(job["relative_input"]),
                     "subject_name": str(job.get("subject_name") or ""),
                     "subject_index": job.get("subject_index"),
-                    "json_path": str(json_path.resolve()),
+                    "json_path": json_abs,
+                    "xlsx_path": xlsx_abs,
                     "status": "ok",
                     "error": "",
                 }
             )
             rows.append(row)
-        except Exception as exc:  # pylint: disable=broad-except
-            rows.append(
+            manifest_rows.append(
                 {
-                    "mode": "metrics",
-                    "batch_index": idx,
-                    "input": str(path),
-                    "input_file": path.name,
-                    "input_stem": path.stem,
-                    "input_suffix": path.suffix.lower(),
-                    "relative_input": str(job["relative_input"]),
-                    "subject_name": str(job.get("subject_name") or ""),
-                    "subject_index": job.get("subject_index"),
+                    **_base_manifest_row(job, idx, "metrics"),
+                    "status": "ok",
+                    "error": "",
+                    "xlsx_path": xlsx_abs,
+                    "json_path": json_abs,
+                    "history_csv_path": "",
+                }
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            err_row = {
+                "mode": "metrics",
+                "batch_index": idx,
+                "input": str(path),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            rows.append(err_row)
+            manifest_rows.append(
+                {
+                    **_base_manifest_row(job, idx, "metrics"),
                     "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": err_row["error"],
+                    "xlsx_path": "",
+                    "json_path": "",
+                    "history_csv_path": "",
                 }
             )
 
     df = pd.DataFrame(rows)
+    manifest_df = pd.DataFrame(manifest_rows)
     summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "metrics_summary.csv"
     summary_xlsx = out_dir / "metrics_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
@@ -572,6 +799,7 @@ def run_batch_metrics(args, *, progress_cb: ProgressCb | None = None) -> tuple[P
     df.to_csv(summary_csv, index=False)
     with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="metrics", index=False)
+    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
 
     manifest_path.write_text(
         json.dumps(build_batch_manifest(files=files, args=args, mode="batch-metrics"), ensure_ascii=False, indent=2, default=_json_default),
@@ -589,8 +817,10 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     out_dir = Path(args.out_dir)
     json_dir = out_dir / "payloads"
     hist_dir = out_dir / "histories"
+    xlsx_dir = out_dir / "per_item"
     json_dir.mkdir(parents=True, exist_ok=True)
     hist_dir.mkdir(parents=True, exist_ok=True)
+    xlsx_dir.mkdir(parents=True, exist_ok=True)
 
     explicit_files = [Path(p) for p in getattr(args, "selected_files", []) or []]
     files = explicit_files or _iter_input_files(
@@ -604,6 +834,7 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
         jobs.extend(list(_iter_expanded_graph_jobs(path, args, input_dir=input_dir)))
     total = len(jobs)
     rows: list[dict] = []
+    manifest_rows: list[dict] = []
 
     for idx, job in enumerate(jobs, start=1):
         path = Path(job["path"])
@@ -630,6 +861,11 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
             export_metrics_payload(payload, str(payload_json_path), "json")
             history_path = hist_dir / f"{item_name}.csv"
             history.to_csv(history_path, index=False)
+            xlsx_path = xlsx_dir / f"{item_name}.xlsx"
+            xlsx_path.write_bytes(_attack_payload_xlsx_bytes(payload, history))
+            json_abs = str(payload_json_path.resolve())
+            hist_abs = str(history_path.resolve())
+            xlsx_abs = str(xlsx_path.resolve())
 
             row = {
                 "mode": "attack",
@@ -643,34 +879,55 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "subject_index": job.get("subject_index"),
                 "family": payload.get("family"),
                 "kind": payload.get("kind"),
-                "payload_json_path": str(payload_json_path.resolve()),
-                "history_csv_path": str(history_path.resolve()),
+                "payload_json_path": json_abs,
+                "history_csv_path": hist_abs,
+                "xlsx_path": xlsx_abs,
                 "status": "ok",
                 "error": "",
                 **payload.get("summary", {}),
                 **{f"final__{k}": v for k, v in payload.get("final_row", {}).items()},
             }
             rows.append(row)
-        except Exception as exc:  # pylint: disable=broad-except
-            rows.append(
+            manifest_rows.append(
                 {
-                    "mode": "attack",
-                    "batch_index": idx,
-                    "input": str(path),
-                    "input_file": path.name,
-                    "input_stem": path.stem,
-                    "input_suffix": path.suffix.lower(),
-                    "relative_input": str(job["relative_input"]),
-                    "subject_name": str(job.get("subject_name") or ""),
-                    "subject_index": job.get("subject_index"),
-                    "family": str(args.family),
-                    "kind": str(args.kind),
+                    **_base_manifest_row(job, idx, "attack"),
+                    "status": "ok",
+                    "error": "",
+                    "xlsx_path": xlsx_abs,
+                    "json_path": json_abs,
+                    "history_csv_path": hist_abs,
+                }
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            err_row = {
+                "mode": "attack",
+                "batch_index": idx,
+                "input": str(path),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "family": str(args.family),
+                "kind": str(args.kind),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            rows.append(err_row)
+            manifest_rows.append(
+                {
+                    **_base_manifest_row(job, idx, "attack"),
                     "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": err_row["error"],
+                    "xlsx_path": "",
+                    "json_path": "",
+                    "history_csv_path": "",
                 }
             )
 
     df = pd.DataFrame(rows)
+    manifest_df = pd.DataFrame(manifest_rows)
     summary_csv = Path(args.summary_out) if str(getattr(args, "summary_out", "")).strip() else out_dir / "attack_summary.csv"
     summary_xlsx = out_dir / "attack_summary.xlsx"
     manifest_path = out_dir / "manifest.json"
@@ -679,6 +936,7 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     df.to_csv(summary_csv, index=False)
     with pd.ExcelWriter(summary_xlsx, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="attacks", index=False)
+    _write_manifest_tables(out_dir, manifest_df, prefix="manifest")
 
     manifest_path.write_text(
         json.dumps(build_batch_manifest(files=files, args=args, mode="batch-attack"), ensure_ascii=False, indent=2, default=_json_default),
