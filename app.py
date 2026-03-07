@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
-import math
 import os
 import traceback
 from pathlib import Path
@@ -44,6 +42,7 @@ from src.services.graph_service import GraphService
 from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
+from src.mat_packed import bundle_to_edge_frames
 from src.ui_blocks import inject_custom_css
 
 # session_io функциональность опциональна для UI.
@@ -176,87 +175,11 @@ def _stats_export_selection(export_scope: str, active_gid: str | None) -> list[s
     return None
 
 
-def _packed_edge_count_to_n(m: int) -> int:
-    """Восстановить число узлов n из packed-edge размера m=n*(n-1)/2."""
-    if m <= 0:
-        raise ValueError("Число packed-edge признаков должно быть > 0")
-
-    disc = 1 + 8 * int(m)
-    root = int(math.isqrt(disc))
-    if root * root != disc:
-        raise ValueError(
-            f"Число столбцов {m} не похоже на верхний треугольник матрицы: "
-            "m должно быть равно n*(n-1)/2"
-        )
-
-    n = (1 + root) // 2
-    if n * (n - 1) // 2 != m:
-        raise ValueError(f"Число столбцов {m} не раскладывается как n*(n-1)/2")
-    return int(n)
-
-
-def _mat_obj_to_subject_names(obj: np.ndarray, n_rows: int) -> list[str]:
-    """Преобразовать MATLAB object-array `subj_id` в список строковых имён."""
-    flat = np.asarray(obj, dtype=object).ravel().tolist()
-    out: list[str] = []
-    for x in flat:
-        if isinstance(x, np.ndarray):
-            if x.size == 1:
-                out.append(str(x.item()))
-            else:
-                out.append(" ".join(map(str, x.ravel().tolist())))
-        else:
-            out.append(str(x))
-
-    if len(out) < n_rows:
-        out.extend([f"subject_{i:03d}" for i in range(len(out), n_rows)])
-    return out[:n_rows]
-
-
 @st.cache_data(show_spinner=False)
 def cached_load_packed_mat_graphs(file_bytes: bytes, filename: str) -> tuple[list[tuple[str, pd.DataFrame]], int]:
-    """
-    Загрузить MAT-файл формата:
-      - data: (subjects, packed_edges)
-      - subj_id: optional subject ids
-
-    где packed_edges = n*(n-1)/2 (верхний треугольник без диагонали).
-    """
-    _ = filename  # участвует в ключе cache_data и не используется в логике ниже.
-    from scipy.io import loadmat
-
-    mat = loadmat(io.BytesIO(file_bytes))
-    if "data" not in mat:
-        raise ValueError("В .mat не найден ключ 'data'")
-
-    X = np.asarray(mat["data"], dtype=float)
-    if X.ndim != 2:
-        raise ValueError(f"'data' в .mat должна быть 2D, получено: ndim={X.ndim}")
-
-    n_subjects, m = X.shape
-    n_nodes = _packed_edge_count_to_n(int(m))
-    iu, ju = np.triu_indices(n_nodes, k=1)
-
-    if "subj_id" in mat:
-        subj_names = _mat_obj_to_subject_names(mat["subj_id"], n_subjects)
-    else:
-        subj_names = [f"subject_{i:03d}" for i in range(n_subjects)]
-
-    graphs: list[tuple[str, pd.DataFrame]] = []
-    for i in range(n_subjects):
-        row = np.asarray(X[i], dtype=float).ravel()
-        keep = np.isfinite(row)
-        df = pd.DataFrame(
-            {
-                "src": iu[keep].astype(int),
-                "dst": ju[keep].astype(int),
-                "weight": row[keep].astype(float),
-                "confidence": np.full(int(np.sum(keep)), 100.0, dtype=float),
-            }
-        )
-        graphs.append((subj_names[i], df))
-
-    return graphs, int(n_nodes)
+    """Load packed MAT connectomes into per-subject edge tables."""
+    _ = filename
+    return bundle_to_edge_frames(file_bytes, keep_zero_weight=False)
 
 
 def _clear_pending_upload_state():
