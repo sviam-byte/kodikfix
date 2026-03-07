@@ -385,7 +385,15 @@ def _run_research_workspace_plan(
     energy_phys_cap_mode: str,
     energy_rw_impulse: bool,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, bytes]]:
-    """Execute the full research batch plan over selected workspace graphs."""
+    """Execute the full research batch plan over selected workspace graphs.
+
+    Design notes:
+    - Processing is intentionally sequential to keep Streamlit progress updates
+      deterministic and easy to debug.
+    - Partial failures should not abort the full run; every selected graph gets
+      a chance to produce outputs.
+    - Export artifacts are accumulated in-memory for a single download step.
+    """
     results: dict[str, list[dict]] = {
         "research_metrics": [],
         "research_resistance": [],
@@ -532,7 +540,11 @@ def _render_research_tab(
     seed_val: int,
     curv_n: int,
 ) -> None:
-    """Render UI for the standalone research workspace batch calculations."""
+    """Render UI for the standalone research workspace batch calculations.
+
+    State hygiene: this tab stores controls under the ``__research_*`` prefix to
+    avoid collisions with controls from other tabs.
+    """
     st.subheader("🧠 Research calc")
     st.caption("Отдельная вкладка для полного исследовательского расчёта по активному графу или по всему workspace.")
 
@@ -658,7 +670,11 @@ def _run_article_plan(
     export_graph_ids: list[str] | None,
     export_key_base,
 ) -> None:
-    """Run a single-click pipeline for article-ready metrics and exports."""
+    """Run a single-click pipeline for article-ready metrics and exports.
+
+    The function writes results into dedicated caches in ``st.session_state`` so
+    tab reruns can reuse expensive intermediate results.
+    """
     prog = st.progress(0.0)
     msg = st.empty()
 
