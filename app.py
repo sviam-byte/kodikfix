@@ -48,6 +48,7 @@ from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
 from src.exporters import payload_to_flat_row
 from src.energy_export import (
     energy_run_summary_dict,
+    frames_to_energy_edges_long,
     frames_to_energy_nodes_long,
     frames_to_energy_steps_summary,
 )
@@ -149,8 +150,22 @@ def _safe_run_label(value: str, fallback: str = "research") -> str:
     return cleaned[:96] or str(fallback)
 
 
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLS = 16_384
+
+
+def _excel_sheet_fits(frame: pd.DataFrame) -> bool:
+    """Return True when frame shape fits into a single XLSX worksheet."""
+    frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+    return int(len(frame.index)) <= EXCEL_MAX_ROWS and int(len(frame.columns)) <= EXCEL_MAX_COLS
+
+
 def _write_tables_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
-    """Serialize dataframes to a workbook (sheet-per-frame)."""
+    """Serialize dataframes to a workbook (sheet-per-frame).
+
+    Oversized tables are replaced by a compact note sheet instead of crashing
+    the whole research run. Full data should still be taken from CSV exports.
+    """
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         wrote = False
@@ -158,7 +173,28 @@ def _write_tables_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
             if df is None:
                 continue
             frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
-            frame.to_excel(writer, sheet_name=_safe_run_label(sheet_name, "sheet")[:31], index=False)
+            safe_sheet = _safe_run_label(sheet_name, "sheet")[:31]
+            if _excel_sheet_fits(frame):
+                frame.to_excel(writer, sheet_name=safe_sheet, index=False)
+            else:
+                logger.warning(
+                    "Skipping oversized XLSX sheet %s with shape=%s; keep CSV as canonical export",
+                    sheet_name,
+                    tuple(frame.shape),
+                )
+                pd.DataFrame(
+                    [
+                        {
+                            "sheet": str(sheet_name),
+                            "status": "skipped_oversized_for_excel",
+                            "rows": int(len(frame.index)),
+                            "cols": int(len(frame.columns)),
+                            "excel_max_rows": int(EXCEL_MAX_ROWS),
+                            "excel_max_cols": int(EXCEL_MAX_COLS),
+                            "note": "Table was too large for one Excel sheet. Use CSV export.",
+                        }
+                    ]
+                ).to_excel(writer, sheet_name=safe_sheet, index=False)
             wrote = True
         if not wrote:
             pd.DataFrame([{"status": "empty"}]).to_excel(writer, sheet_name="summary", index=False)
@@ -547,8 +583,34 @@ def _bundle_frames_to_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
     """Serialize research summary tables into a single XLSX payload."""
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for name, df in frames.items():
-            (df.copy() if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=name[:31], index=False)
+        wrote = False
+        for name, df in (frames or {}).items():
+            frame = df.copy() if df is not None else pd.DataFrame()
+            safe_sheet = _safe_run_label(name, "sheet")[:31]
+            if _excel_sheet_fits(frame):
+                frame.to_excel(writer, sheet_name=safe_sheet, index=False)
+            else:
+                logger.warning(
+                    "Skipping oversized summary XLSX sheet %s with shape=%s; keep CSV as canonical export",
+                    name,
+                    tuple(frame.shape),
+                )
+                pd.DataFrame(
+                    [
+                        {
+                            "sheet": str(name),
+                            "status": "skipped_oversized_for_excel",
+                            "rows": int(len(frame.index)),
+                            "cols": int(len(frame.columns)),
+                            "excel_max_rows": int(EXCEL_MAX_ROWS),
+                            "excel_max_cols": int(EXCEL_MAX_COLS),
+                            "note": "Table was too large for one Excel sheet. Use CSV export.",
+                        }
+                    ]
+                ).to_excel(writer, sheet_name=safe_sheet, index=False)
+            wrote = True
+        if not wrote:
+            pd.DataFrame([{"status": "empty"}]).to_excel(writer, sheet_name="summary", index=False)
     buf.seek(0)
     return buf.getvalue()
 
@@ -850,7 +912,7 @@ def _run_research_workspace_plan(
                     sources=None,
                     flow_mode=str(energy_flow_mode),
                 )
-                energy_edges_long = pd.DataFrame(edge_frames or [])
+                energy_edges_long = frames_to_energy_edges_long(graph, edge_frames, sources=None)
                 energy_run_summary.update({
                     "graph_id": entry.id,
                     "graph_name": entry.name,
