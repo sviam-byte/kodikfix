@@ -45,7 +45,7 @@ from src.core.graph_ops import calculate_metrics
 from src.core.physics import simulate_energy_flow
 from src.services.graph_service import GraphService
 from src.stats_export import export_stats_xlsx_bytes, export_stats_zip_bytes
-from src.exporters import export_energy_tables_xlsx, payload_to_flat_row
+from src.exporters import payload_to_flat_row
 from src.energy_export import (
     energy_run_summary_dict,
     frames_to_energy_nodes_long,
@@ -174,8 +174,15 @@ def _persist_research_graph_result(
     per_graph_extras: dict[str, bytes],
     manifest_rows: list[dict],
     aggregate_frames: dict[str, pd.DataFrame] | None = None,
+    workbook_frames: dict[str, pd.DataFrame] | None = None,
 ) -> None:
-    """Persist current per-graph and aggregate research outputs immediately."""
+    """Persist current per-graph and aggregate research outputs immediately.
+
+    ``per_graph_frames`` remain the canonical compact tables (research_* rows)
+    that are written both to CSV and to the per-graph workbook. Additional
+    detailed sheets (e.g., energy trajectories) can be passed via
+    ``workbook_frames`` and are added only to the workbook.
+    """
     run_dir = Path(run_dir).expanduser().resolve()
     per_graph_dir = run_dir / "per_graph"
     extras_dir = run_dir / "extras"
@@ -186,8 +193,11 @@ def _persist_research_graph_result(
         getattr(graph_entry, "id", "graph"),
     )
 
-    workbook_path = per_graph_dir / f"{stem}__research.xlsx"
-    workbook_path.write_bytes(_write_tables_xlsx_bytes(per_graph_frames))
+    workbook_payload: dict[str, pd.DataFrame] = {}
+    workbook_payload.update(per_graph_frames or {})
+    workbook_payload.update(workbook_frames or {})
+    workbook_path = per_graph_dir / f"{stem}__full.xlsx"
+    workbook_path.write_bytes(_write_tables_xlsx_bytes(workbook_payload))
 
     for name, df in (per_graph_frames or {}).items():
         if df is None:
@@ -572,6 +582,10 @@ def _run_research_workspace_plan(
             "source": getattr(entry, "source", ""),
             "status": "running",
         }
+        # Keep graph-local frames separate from global aggregations so that
+        # stream-save writes one deterministic workbook per graph.
+        per_graph_frames: dict[str, pd.DataFrame] = {}
+        workbook_frames_local: dict[str, pd.DataFrame] = {}
         try:
             graph = cached_build_graph(
                 entry.edges,
@@ -616,11 +630,13 @@ def _run_research_workspace_plan(
                         if col in row:
                             row[col] = np.nan
                 results["research_metrics"].append(row)
+                per_graph_frames["research_metrics"] = pd.DataFrame([row])
 
             if flags.get("resistance", False):
                 row = graph_resistance_summary(graph)
                 row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
                 results["research_resistance"].append(row)
+                per_graph_frames["research_resistance"] = pd.DataFrame([row])
 
             if flags.get("attack", False):
                 args_attack = build_ui_args(
@@ -651,6 +667,7 @@ def _run_research_workspace_plan(
                     for k, v in attack_payload["final_row"].items():
                         attack_row[f"final__{k}"] = v
                 results["research_attacks"].append(attack_row)
+                per_graph_frames["research_attacks"] = pd.DataFrame([attack_row])
                 extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
                 extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
@@ -685,33 +702,20 @@ def _run_research_workspace_plan(
                     "n_edge_rows": int(len(energy_edges_long)),
                 })
                 results["research_energy_runs"].append(energy_run_summary)
-                extras[f"energy/{entry.id}__energy.xlsx"] = export_energy_tables_xlsx(energy_nodes_long, energy_steps_summary, energy_run_summary)
+                per_graph_frames["research_energy_runs"] = pd.DataFrame([energy_run_summary])
                 extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
                 extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
                 extras[f"energy/{entry.id}__steps_summary.csv"] = energy_steps_summary.to_csv(index=False).encode("utf-8")
                 extras[f"energy/{entry.id}__run_summary.json"] = json.dumps(energy_run_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                workbook_frames_local["energy_nodes_long"] = energy_nodes_long
+                workbook_frames_local["energy_edges_long"] = energy_edges_long
+                workbook_frames_local["energy_steps_summary"] = energy_steps_summary
+                workbook_frames_local["energy_run_summary"] = pd.DataFrame([energy_run_summary])
                 # Free heavy intermediate objects to reduce peak memory in long runs.
                 del node_frames, edge_frames, energy_nodes_long, energy_edges_long, energy_steps_summary
                 gc.collect()
 
             graph_manifest["status"] = "done"
-            per_graph_frames: dict[str, pd.DataFrame] = {}
-            if results["research_metrics"]:
-                last = results["research_metrics"][-1]
-                if graph_manifest["graph_id"] == last.get("graph_id"):
-                    per_graph_frames["research_metrics"] = pd.DataFrame([last])
-            if results["research_resistance"]:
-                last = results["research_resistance"][-1]
-                if graph_manifest["graph_id"] == last.get("graph_id"):
-                    per_graph_frames["research_resistance"] = pd.DataFrame([last])
-            if results["research_attacks"]:
-                last = results["research_attacks"][-1]
-                if graph_manifest["graph_id"] == last.get("graph_id"):
-                    per_graph_frames["research_attacks"] = pd.DataFrame([last])
-            if results["research_energy_runs"]:
-                last = results["research_energy_runs"][-1]
-                if graph_manifest["graph_id"] == last.get("graph_id"):
-                    per_graph_frames["research_energy_runs"] = pd.DataFrame([last])
             graph_manifest["tables"] = ",".join(sorted(per_graph_frames.keys()))
             graph_manifest["extras_count"] = int(sum(1 for k in extras.keys() if f"{gid}__" in k or f"/{gid}__" in k))
         except Exception:
@@ -731,6 +735,7 @@ def _run_research_workspace_plan(
                     }
                 ])
             }
+            workbook_frames_local = dict(per_graph_frames)
 
         manifest_rows.append(graph_manifest)
         frames_current = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
@@ -743,6 +748,7 @@ def _run_research_workspace_plan(
                 per_graph_extras=per_graph_extras,
                 manifest_rows=manifest_rows,
                 aggregate_frames=frames_current,
+                workbook_frames=workbook_frames_local,
             )
             write_run_metadata(
                 run_dir,
