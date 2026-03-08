@@ -475,6 +475,51 @@ def _find_existing_research_run(stream_root: Path, *, run_label: str, seed: int)
     return None
 
 
+def _resolve_explicit_research_run_dir(stream_root: Path, user_value: str) -> Path | None:
+    """Resolve explicit run-dir hint from UI.
+
+    Accepts either:
+    - absolute/relative path to a specific run directory
+    - plain folder name inside ``stream_root``
+    """
+    raw = str(user_value or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute() and candidate.parent == Path('.'):
+        candidate = Path(stream_root).expanduser().resolve() / candidate.name
+    else:
+        candidate = candidate.resolve()
+    return candidate
+
+
+def _research_read_run_info(run_dir: Path) -> dict:
+    """Best-effort read of run_info.json for UI preview."""
+    path = Path(run_dir) / 'run_info.json'
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        logger.exception('Failed to read research run info: %s', path)
+        return {}
+
+
+def _match_research_start_target(graph_entry, pattern: str) -> bool:
+    """Match user start-from string against common graph identifiers."""
+    needle = str(pattern or '').strip().lower()
+    if not needle:
+        return False
+    haystacks = [
+        str(getattr(graph_entry, 'id', '') or ''),
+        str(getattr(graph_entry, 'name', '') or ''),
+        str(getattr(graph_entry, 'source', '') or ''),
+        _research_graph_stem(graph_entry),
+    ]
+    return any(needle in item.lower() for item in haystacks if item)
+
+
 def add_graph_to_state(name, df, source, src, dst):
     gid = new_id("G")
     entry = build_graph_entry(
@@ -758,6 +803,11 @@ def _run_research_workspace_plan(
     stream_output_root: str = "",
     run_label: str = "",
     resume_existing_run: bool = True,
+    skip_existing: bool = True,
+    explicit_run_dir: str = "",
+    ignore_run_lock: bool = False,
+    start_from_index: int = 1,
+    start_from_graph: str = "",
 ) -> tuple[dict[str, pd.DataFrame], dict[str, bytes], Path | None]:
     """Execute the full research batch plan over selected workspace graphs.
 
@@ -784,7 +834,18 @@ def _run_research_workspace_plan(
     if bool(stream_save):
         stream_root = Path(str(stream_output_root).strip() or _default_research_output_root()).expanduser().resolve()
         stream_root.mkdir(parents=True, exist_ok=True)
-        if bool(resume_existing_run):
+        explicit_dir = _resolve_explicit_research_run_dir(stream_root, str(explicit_run_dir))
+        if explicit_dir is not None:
+            explicit_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = _research_lock_path(explicit_dir)
+            if lock_path.exists() and not bool(ignore_run_lock):
+                raise RuntimeError(
+                    f"Указанная папка run заблокирована RUNNING.lock: {explicit_dir}. "
+                    "Сними lock вручную или включи 'Игнорировать RUNNING.lock'."
+                )
+            run_dir = explicit_dir
+            manifest_rows = _load_research_manifest_rows(run_dir)
+        elif bool(resume_existing_run):
             run_dir = _find_existing_research_run(stream_root, run_label=safe_label, seed=int(seed_val))
             if run_dir is not None:
                 manifest_rows = _load_research_manifest_rows(run_dir)
@@ -819,6 +880,22 @@ def _run_research_workspace_plan(
     requested_graph_ids = [str(gid) for gid in graph_ids]
     missing_graph_ids = [gid for gid in requested_graph_ids if gid not in ctx.graphs]
     valid_graph_ids = [gid for gid in requested_graph_ids if gid in ctx.graphs]
+
+    # Allow explicit resume offset for long queues where the operator wants
+    # to restart from a specific graph number or graph id/name hint.
+    start_from_index = max(1, int(start_from_index))
+    start_from_graph = str(start_from_graph).strip()
+    if start_from_graph:
+        matched_pos = None
+        for pos, gid in enumerate(valid_graph_ids):
+            entry = ctx.graphs.get(gid)
+            if entry is not None and _match_research_start_target(entry, start_from_graph):
+                matched_pos = pos
+                break
+        if matched_pos is not None:
+            valid_graph_ids = valid_graph_ids[matched_pos:]
+    elif start_from_index > 1:
+        valid_graph_ids = valid_graph_ids[start_from_index - 1:]
 
     if missing_graph_ids:
         logger.warning("Research plan skipped missing graphs: %s", missing_graph_ids)
@@ -886,7 +963,7 @@ def _run_research_workspace_plan(
             "source": getattr(entry, "source", ""),
             "status": "running",
         }
-        if run_dir is not None and _is_research_graph_already_done(run_dir, entry):
+        if bool(skip_existing) and run_dir is not None and _is_research_graph_already_done(run_dir, entry):
             if keep_compact_results_in_memory:
                 _hydrate_existing_research_rows(run_dir, entry, results)
             graph_manifest["status"] = "skipped_existing"
@@ -1161,7 +1238,19 @@ def _render_research_tab(
             "Проверять и продолжать предыдущий run",
             value=bool(st.session_state.get("__research_resume_existing", True)),
             key="__research_resume_existing",
-            help="Ищет последний run с той же меткой и seed, подхватывает manifest и пропускает уже готовые графы.",
+            help="Ищет последний run с той же меткой и seed и подхватывает manifest.",
+        )
+        research_skip_existing = st.checkbox(
+            "Пропускать уже готовые графы",
+            value=bool(st.session_state.get("__research_skip_existing", True)),
+            key="__research_skip_existing",
+            help="Если в выбранной run-папке уже есть workbook и status=done, граф будет пропущен.",
+        )
+        research_ignore_run_lock = st.checkbox(
+            "Игнорировать RUNNING.lock у выбранной папки",
+            value=bool(st.session_state.get("__research_ignore_run_lock", False)),
+            key="__research_ignore_run_lock",
+            help="Включай только если уверена, что старый процесс уже мёртв.",
         )
         research_run_label = st.text_input(
             "Метка запуска",
@@ -1174,11 +1263,30 @@ def _render_research_tab(
             value=str(st.session_state.get("__research_output_root", _default_research_output_root())),
             key="__research_output_root",
         )
+        research_explicit_run_dir = st.text_input(
+            "Писать/проверять конкретную папку run",
+            value=str(st.session_state.get("__research_explicit_run_dir", "")),
+            key="__research_explicit_run_dir",
+            help="Можно указать либо полное имя/путь run-папки, либо просто имя подпапки внутри research root.",
+        )
         research_output_root_resolved = Path(str(research_output_root).strip() or _default_research_output_root()).expanduser().resolve()
         safe_research_label = _safe_run_label(str(research_run_label).strip() or "workspace_research")
         preview_run_dir = research_output_root_resolved / f"{safe_research_label}__seed_{int(seed_val)}__<timestamp>"
         st.caption(f"Research root: {research_output_root_resolved}")
-        if bool(research_resume_existing):
+        explicit_run_preview = _resolve_explicit_research_run_dir(research_output_root_resolved, str(research_explicit_run_dir))
+        if explicit_run_preview is not None:
+            st.caption(f"Выбрана конкретная папка run: {explicit_run_preview}")
+            if explicit_run_preview.exists():
+                info = _research_read_run_info(explicit_run_preview)
+                if info:
+                    status = info.get('status', '?')
+                    processed = info.get('processed_graphs', '?')
+                    total_graphs = info.get('total_graphs', info.get('requested_graphs', '?'))
+                    last_graph = info.get('last_graph', '')
+                    st.caption(f"run_info: status={status}, processed={processed}/{total_graphs}")
+                    if last_graph:
+                        st.caption(f"last_graph: {last_graph}")
+        elif bool(research_resume_existing):
             existing_run = _find_existing_research_run(research_output_root_resolved, run_label=safe_research_label, seed=int(seed_val))
             if existing_run is not None:
                 st.caption(f"Будет проверен предыдущий run: {existing_run}")
@@ -1228,6 +1336,24 @@ def _render_research_tab(
     graph_ids = [cur_gid] if scope == "Активный граф" else list(ctx.graphs.keys())
     graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
 
+    s1, s2 = st.columns(2)
+    with s1:
+        research_start_from_index = int(st.number_input(
+            "Начать с графа №",
+            min_value=1,
+            value=int(st.session_state.get("__research_start_from_index", 1)),
+            step=1,
+            key="__research_start_from_index",
+            help="1 = с самого начала списка. 26 = пропустить первые 25 графов текущего списка.",
+        ))
+    with s2:
+        research_start_from_graph = st.text_input(
+            "Или начать с graph_id / имени",
+            value=str(st.session_state.get("__research_start_from_graph", "")),
+            key="__research_start_from_graph",
+            help="Ищет подстроку в graph_id, name, source и имени workbook-стема. Если заполнено, имеет приоритет над номером.",
+        )
+
     c_run1, c_run2 = st.columns(2)
     run_active = c_run1.button("Посчитать всё", type="primary", width="stretch")
     run_all = c_run2.button("Посчитать всё для всех графов", width="stretch")
@@ -1272,6 +1398,11 @@ def _render_research_tab(
             stream_output_root=str(research_output_root),
             run_label=str(research_run_label),
             resume_existing_run=bool(research_resume_existing),
+            skip_existing=bool(research_skip_existing),
+            explicit_run_dir=str(research_explicit_run_dir),
+            ignore_run_lock=bool(research_ignore_run_lock),
+            start_from_index=int(research_start_from_index),
+            start_from_graph=str(research_start_from_graph),
         )
         cache_key = (
             tuple(graph_ids),
@@ -1309,20 +1440,26 @@ def _render_research_tab(
     cached = st.session_state.get("__research_results")
     if cached:
         run_dir_cached = str(cached.get("run_dir", "")).strip()
-        xlsx_data = cached.get("xlsx")
-        zip_data = cached.get("zip")
+        summary_payload = cached.get("xlsx")
+        zip_payload = cached.get("zip")
         if run_dir_cached:
             st.caption(f"Последний research-run: {run_dir_cached}")
             run_dir_path = Path(run_dir_cached)
-            xlsx_path = run_dir_path / "research_summary.xlsx"
+            summary_path = run_dir_path / "research_summary.xlsx"
             zip_path = run_dir_path / "research_bundle.zip"
-            if xlsx_path.exists():
-                xlsx_data = xlsx_path.read_bytes()
+            if summary_path.exists():
+                try:
+                    summary_payload = summary_path.read_bytes()
+                except Exception:
+                    logger.exception("Failed to read research summary from disk: %s", summary_path)
             if zip_path.exists():
-                zip_data = zip_path.read_bytes()
+                try:
+                    zip_payload = zip_path.read_bytes()
+                except Exception:
+                    logger.exception("Failed to read research zip from disk: %s", zip_path)
         d1, d2 = st.columns(2)
-        d1.download_button("Скачать research_summary.xlsx", data=xlsx_data, file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", disabled=xlsx_data is None)
-        d2.download_button("Скачать research_bundle.zip", data=zip_data, file_name="research_bundle.zip", mime="application/zip", width="stretch", disabled=zip_data is None)
+        d1.download_button("Скачать research_summary.xlsx", data=summary_payload, file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+        d2.download_button("Скачать research_bundle.zip", data=zip_payload, file_name="research_bundle.zip", mime="application/zip", width="stretch")
         for name, df in cached.get("frames", {}).items():
             st.markdown(f"**{name}**")
             st.dataframe(df, width="stretch", height=min(420, 44 + 36 * min(len(df), 8)))
