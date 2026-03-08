@@ -235,13 +235,6 @@ def _persist_research_graph_result(
     workbook_path = per_graph_dir / f"{stem}__full.xlsx"
     workbook_path.write_bytes(_write_tables_xlsx_bytes(workbook_payload))
 
-    for name, df in (per_graph_frames or {}).items():
-        if df is None:
-            continue
-        frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
-        csv_path = per_graph_dir / f"{stem}__{_safe_run_label(name, 'table')}.csv"
-        frame.to_csv(csv_path, index=False)
-
     for rel_name, payload in (per_graph_extras or {}).items():
         rel_path = Path(rel_name)
         out_path = extras_dir / rel_path
@@ -289,6 +282,37 @@ def _research_table_csv_path(run_dir: Path, graph_entry, table_name: str) -> Pat
     return Path(run_dir) / "per_graph" / f"{stem}__{table_stem}.csv"
 
 
+def _research_workbook_sheet_name(table_name: str) -> str:
+    """Return sanitized workbook sheet name for one research table."""
+    return _safe_run_label(table_name, "sheet")[:31]
+
+
+def _research_table_from_workbook(run_dir: Path, graph_entry, table_name: str) -> pd.DataFrame | None:
+    """Read one per-graph research table from the unified workbook.
+
+    New format: one workbook per graph with multiple sheets.
+    Backward compatibility: if workbook/sheet is missing, fall back to legacy CSV.
+    """
+    workbook_path = _research_workbook_path(run_dir, graph_entry)
+    sheet_name = _research_workbook_sheet_name(table_name)
+    if workbook_path.exists():
+        try:
+            xls = pd.ExcelFile(workbook_path, engine="openpyxl")
+            if sheet_name in xls.sheet_names:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                return df if df is not None else pd.DataFrame()
+        except Exception:
+            logger.exception("Failed to read workbook sheet %s from %s", sheet_name, workbook_path)
+
+    legacy_csv = _research_table_csv_path(run_dir, graph_entry, table_name)
+    if legacy_csv.exists():
+        try:
+            return pd.read_csv(legacy_csv)
+        except Exception:
+            logger.exception("Failed to read legacy research table: %s", legacy_csv)
+    return None
+
+
 def _load_research_manifest_rows(run_dir: Path) -> list[dict]:
     """Load existing manifest rows; tolerate missing/invalid files safely."""
     path = _research_manifest_path(run_dir)
@@ -320,16 +344,15 @@ def _upsert_manifest_row(manifest_rows: list[dict], row: dict) -> list[dict]:
 
 
 def _hydrate_existing_research_rows(run_dir: Path, graph_entry, results: dict[str, list[dict]]) -> bool:
-    """Read previously persisted per-graph tables and merge into in-memory results."""
+    """Read previously persisted per-graph tables and merge into in-memory results.
+
+    Preferred source is the per-graph workbook produced by stream-save mode.
+    Legacy per-table CSV files are still supported for older runs.
+    """
     found = False
     for table_name in ["research_metrics", "research_resistance", "research_attacks", "research_energy_runs"]:
-        csv_path = _research_table_csv_path(run_dir, graph_entry, table_name)
-        if not csv_path.exists():
-            continue
-        try:
-            df = pd.read_csv(csv_path)
-        except Exception:
-            logger.exception("Failed to read existing research table: %s", csv_path)
+        df = _research_table_from_workbook(run_dir, graph_entry, table_name)
+        if df is None:
             continue
         if df.empty:
             continue
@@ -339,7 +362,7 @@ def _hydrate_existing_research_rows(run_dir: Path, graph_entry, results: dict[st
 
 
 def _is_research_graph_already_done(run_dir: Path, graph_entry) -> bool:
-    """Check if graph has completed status and workbook in a previous run."""
+    """Check if graph has completed status and unified workbook in a previous run."""
     workbook_path = _research_workbook_path(run_dir, graph_entry)
     if not workbook_path.exists():
         return False
