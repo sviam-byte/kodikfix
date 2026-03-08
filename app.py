@@ -1336,20 +1336,37 @@ def _render_research_tab(
     graph_ids = [cur_gid] if scope == "Активный граф" else list(ctx.graphs.keys())
     graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
 
+    # Инициализация дефолтов для контролов старта research-run.
+    # Используем только session_state как источник истины, без value=...
+    # в самих widgets: это снижает риск конфликтов между параметрами и key.
+    st.session_state.setdefault("__research_start_from_index", 1)
+    st.session_state.setdefault("__research_start_from_graph", "")
+
+    # Применяем отложенные изменения ДО создания widgets,
+    # иначе Streamlit ругается на изменение session_state
+    # после instantiation соответствующих контролов.
+    if "__research_pending_start_from_index" in st.session_state:
+        st.session_state["__research_start_from_index"] = int(
+            st.session_state.pop("__research_pending_start_from_index")
+        )
+
+    if "__research_pending_start_from_graph" in st.session_state:
+        st.session_state["__research_start_from_graph"] = str(
+            st.session_state.pop("__research_pending_start_from_graph")
+        )
+
     s1, s2 = st.columns(2)
     with s1:
         research_start_from_index = int(st.number_input(
             "Начать с графа №",
             min_value=1,
-            value=int(st.session_state.get("__research_start_from_index", 1)),
             step=1,
             key="__research_start_from_index",
-            help="1 = с самого начала списка. 26 = пропустить первые 25 графов текущего списка.",
+            help="1-based индекс в текущем порядке графов workspace.",
         ))
     with s2:
         research_start_from_graph = st.text_input(
             "Или начать с graph_id / имени",
-            value=str(st.session_state.get("__research_start_from_graph", "")),
             key="__research_start_from_graph",
             help="Ищет подстроку в graph_id, name, source и имени workbook-стема. Если заполнено, имеет приоритет над номером.",
         )
@@ -1368,28 +1385,29 @@ def _render_research_tab(
 
     with quick_cols[0]:
         if st.button("С активного графа", key="__research_set_start_active", width="stretch"):
-            st.session_state["__research_start_from_graph"] = str(cur_gid)
+            st.session_state["__research_pending_start_from_graph"] = str(cur_gid)
             if cur_pos is not None:
-                st.session_state["__research_start_from_index"] = int(cur_pos) + 1
+                st.session_state["__research_pending_start_from_index"] = int(cur_pos) + 1
             st.rerun()
 
     with quick_cols[1]:
         if st.button("Со следующего после активного", key="__research_set_start_after_active", width="stretch"):
             if cur_pos is not None:
-                # +1 чтобы перейти к 1-based numbering, ещё +1 чтобы начать СО СЛЕДУЮЩЕГО
-                st.session_state["__research_start_from_index"] = int(cur_pos) + 2
-                st.session_state["__research_start_from_graph"] = ""
+                # 1-based номер следующего графа.
+                st.session_state["__research_pending_start_from_index"] = int(cur_pos) + 2
             else:
-                st.session_state["__research_start_from_index"] = max(
+                st.session_state["__research_pending_start_from_index"] = max(
                     1,
                     int(st.session_state.get("__research_start_from_index", 1)),
                 )
+            # Очищаем graph-поиск, чтобы сработал именно индекс.
+            st.session_state["__research_pending_start_from_graph"] = ""
             st.rerun()
 
     with quick_cols[2]:
         if st.button("Сбросить", key="__research_reset_start_from", width="stretch"):
-            st.session_state["__research_start_from_index"] = 1
-            st.session_state["__research_start_from_graph"] = ""
+            st.session_state["__research_pending_start_from_index"] = 1
+            st.session_state["__research_pending_start_from_graph"] = ""
             st.rerun()
 
     if cur_pos is not None:
