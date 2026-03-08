@@ -160,6 +160,57 @@ def frames_to_energy_nodes_long(
     return pd.DataFrame(rows)
 
 
+def frames_to_energy_edges_long(
+    G: nx.Graph,
+    edge_frames: list[dict],
+    *,
+    sources: list | None = None,
+) -> pd.DataFrame:
+    """Convert per-step edge-flux maps into a normalized long table.
+
+    Parameters mirror node/summary converters to keep a stable exporter API.
+    ``sources`` is currently unused but preserved for call-site compatibility.
+    """
+    _ = sources  # reserved for future edge-level source annotations.
+    rows: list[dict] = []
+    edge_weight = {}
+    if G is not None:
+        for u, v, d in G.edges(data=True):
+            key = tuple(sorted((str(u), str(v))))
+            edge_weight[key] = float(d.get("weight", 1.0))
+
+    for step, frame in enumerate(edge_frames or []):
+        cur = frame or {}
+        total_flux = float(sum(_safe_float(v) for v in cur.values()))
+        rank_items = sorted(cur.items(), key=lambda kv: _safe_float(kv[1]), reverse=True)
+        rank_map = {edge: int(rank + 1) for rank, (edge, _val) in enumerate(rank_items)}
+
+        for edge, flux in cur.items():
+            try:
+                u, v = edge
+            except Exception:
+                u, v = str(edge), ""
+
+            u_str = str(u)
+            v_str = str(v)
+            edge_key = tuple(sorted((u_str, v_str)))
+            flux_val = _safe_float(flux)
+
+            rows.append(
+                {
+                    "step": int(step),
+                    "u": u_str,
+                    "v": v_str,
+                    "edge": f"{u_str}--{v_str}",
+                    "flux": float(flux_val),
+                    "flux_norm": float(flux_val / total_flux) if total_flux > 0 else 0.0,
+                    "rank_flux": int(rank_map.get(edge, len(cur) + 1)),
+                    "weight": float(edge_weight.get(edge_key, 1.0)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def frames_to_energy_steps_summary(
     G: nx.Graph,
     node_frames: list[dict],
