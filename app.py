@@ -223,6 +223,118 @@ def _persist_research_graph_result(
         (run_dir / "research_summary.xlsx").write_bytes(_write_tables_xlsx_bytes(aggregate_frames))
 
 
+def _research_graph_stem(graph_entry) -> str:
+    """Build deterministic per-graph filename stem for research artifacts."""
+    return _safe_run_label(
+        getattr(graph_entry, "name", None) or getattr(graph_entry, "id", "graph"),
+        getattr(graph_entry, "id", "graph"),
+    )
+
+
+def _research_manifest_path(run_dir: Path) -> Path:
+    """Return canonical manifest.csv path for a research run directory."""
+    return Path(run_dir) / "manifest.csv"
+
+
+def _research_lock_path(run_dir: Path) -> Path:
+    """Return lock-file path used to guard currently running research jobs."""
+    return Path(run_dir) / "RUNNING.lock"
+
+
+def _research_workbook_path(run_dir: Path, graph_entry) -> Path:
+    """Return path to per-graph workbook generated in stream-save mode."""
+    return Path(run_dir) / "per_graph" / f"{_research_graph_stem(graph_entry)}__full.xlsx"
+
+
+def _research_table_csv_path(run_dir: Path, graph_entry, table_name: str) -> Path:
+    """Return path to a per-graph CSV table inside stream-save run dir."""
+    stem = _research_graph_stem(graph_entry)
+    table_stem = _safe_run_label(table_name, "table")
+    return Path(run_dir) / "per_graph" / f"{stem}__{table_stem}.csv"
+
+
+def _load_research_manifest_rows(run_dir: Path) -> list[dict]:
+    """Load existing manifest rows; tolerate missing/invalid files safely."""
+    path = _research_manifest_path(run_dir)
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        logger.exception("Failed to read existing research manifest: %s", path)
+        return []
+    if df.empty:
+        return []
+    rows = df.replace({np.nan: None}).to_dict(orient="records")
+    return [dict(row) for row in rows]
+
+
+def _upsert_manifest_row(manifest_rows: list[dict], row: dict) -> list[dict]:
+    """Insert or replace manifest row by graph_id while preserving order."""
+    key = str(row.get("graph_id", "")).strip()
+    if not key:
+        manifest_rows.append(dict(row))
+        return manifest_rows
+    for idx, existing in enumerate(manifest_rows):
+        if str(existing.get("graph_id", "")).strip() == key:
+            manifest_rows[idx] = dict(row)
+            return manifest_rows
+    manifest_rows.append(dict(row))
+    return manifest_rows
+
+
+def _hydrate_existing_research_rows(run_dir: Path, graph_entry, results: dict[str, list[dict]]) -> bool:
+    """Read previously persisted per-graph tables and merge into in-memory results."""
+    found = False
+    for table_name in ["research_metrics", "research_resistance", "research_attacks", "research_energy_runs"]:
+        csv_path = _research_table_csv_path(run_dir, graph_entry, table_name)
+        if not csv_path.exists():
+            continue
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception:
+            logger.exception("Failed to read existing research table: %s", csv_path)
+            continue
+        if df.empty:
+            continue
+        results.setdefault(table_name, []).extend(df.replace({np.nan: None}).to_dict(orient="records"))
+        found = True
+    return found
+
+
+def _is_research_graph_already_done(run_dir: Path, graph_entry) -> bool:
+    """Check if graph has completed status and workbook in a previous run."""
+    workbook_path = _research_workbook_path(run_dir, graph_entry)
+    if not workbook_path.exists():
+        return False
+    manifest_rows = _load_research_manifest_rows(run_dir)
+    gid = str(getattr(graph_entry, "id", "")).strip()
+    for row in manifest_rows:
+        if str(row.get("graph_id", "")).strip() == gid and str(row.get("status", "")).strip().lower() == "done":
+            return True
+    return False
+
+
+def _find_existing_research_run(stream_root: Path, *, run_label: str, seed: int) -> Path | None:
+    """Find latest compatible run dir with same label+seed and no active lock."""
+    root = Path(stream_root).expanduser().resolve()
+    if not root.exists():
+        return None
+    label = _safe_run_label(run_label, "research_run")
+    prefix = f"{label}__seed_{int(seed)}__"
+    candidates = [p for p in root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for candidate in candidates:
+        lock_path = _research_lock_path(candidate)
+        if lock_path.exists():
+            logger.warning("Research resume skipped locked run: %s", candidate)
+            continue
+        return candidate
+    return None
+
+
 def add_graph_to_state(name, df, source, src, dst):
     gid = new_id("G")
     entry = build_graph_entry(
@@ -479,6 +591,7 @@ def _run_research_workspace_plan(
     stream_save: bool = False,
     stream_output_root: str = "",
     run_label: str = "",
+    resume_existing_run: bool = True,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, bytes], Path | None]:
     """Execute the full research batch plan over selected workspace graphs.
 
@@ -497,16 +610,25 @@ def _run_research_workspace_plan(
         "research_energy_runs": [],
     }
     extras: dict[str, bytes] = {}
-    manifest_rows: list[dict] = []
     run_dir: Path | None = None
+    manifest_rows: list[dict] = []
+    safe_label = _safe_run_label(str(run_label).strip() or "research_run")
     if bool(stream_save):
         stream_root = Path(str(stream_output_root).strip() or _default_research_output_root()).expanduser().resolve()
-        run_dir = make_run_dir(
-            stream_root,
-            mode="research_stream",
-            seed=int(seed_val),
-            run_label=_safe_run_label(str(run_label).strip() or "research_run"),
-        )
+        stream_root.mkdir(parents=True, exist_ok=True)
+        if bool(resume_existing_run):
+            run_dir = _find_existing_research_run(stream_root, run_label=safe_label, seed=int(seed_val))
+            if run_dir is not None:
+                manifest_rows = _load_research_manifest_rows(run_dir)
+        if run_dir is None:
+            run_dir = make_run_dir(
+                stream_root,
+                mode="research_stream",
+                seed=int(seed_val),
+                run_label=safe_label,
+            )
+            manifest_rows = []
+        _research_lock_path(run_dir).write_text(str(os.getpid()), encoding="utf-8")
         write_run_metadata(
             run_dir,
             base_dir=stream_root,
@@ -519,6 +641,7 @@ def _run_research_workspace_plan(
                 "requested_graphs": len(list(graph_ids or [])),
                 "min_conf": float(min_conf),
                 "min_weight": float(min_weight),
+                "resume_existing_run": bool(resume_existing_run),
             },
         )
 
@@ -555,7 +678,19 @@ def _run_research_workspace_plan(
         msg.caption("Нет доступных графов для расчёта")
         bar.progress(1.0)
         frames = {name: pd.DataFrame(rows) for name, rows in results.items()}
+        if run_dir is not None:
+            try:
+                _research_lock_path(run_dir).unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Failed to remove research run lock: %s", _research_lock_path(run_dir))
         return frames, extras, run_dir
+
+    if run_dir is not None and manifest_rows:
+        for gid_existing in valid_graph_ids:
+            entry_existing = ctx.graphs.get(gid_existing)
+            if entry_existing is None:
+                continue
+            _hydrate_existing_research_rows(run_dir, entry_existing, results)
 
     for idx, gid in enumerate(valid_graph_ids, start=1):
         entry = ctx.graphs.get(gid)
@@ -582,6 +717,29 @@ def _run_research_workspace_plan(
             "source": getattr(entry, "source", ""),
             "status": "running",
         }
+        if run_dir is not None and _is_research_graph_already_done(run_dir, entry):
+            _hydrate_existing_research_rows(run_dir, entry, results)
+            graph_manifest["status"] = "skipped_existing"
+            graph_manifest["tables"] = "existing"
+            graph_manifest["extras_count"] = 0
+            _upsert_manifest_row(manifest_rows, graph_manifest)
+            write_run_metadata(
+                run_dir,
+                base_dir=run_dir.parent,
+                run_label=str(run_label).strip() or "research_run",
+                seed=int(seed_val),
+                mode="research_stream",
+                status="running",
+                extra={
+                    "processed_graphs": int(idx),
+                    "total_graphs": int(total),
+                    "last_graph": getattr(entry, "name", gid),
+                    "last_action": "skip_existing",
+                },
+            )
+            msg.caption(f"[{idx}/{total}] skip existing: {entry.name}")
+            bar.progress(float(idx) / float(total))
+            continue
         # Keep graph-local frames separate from global aggregations so that
         # stream-save writes one deterministic workbook per graph.
         per_graph_frames: dict[str, pd.DataFrame] = {}
@@ -737,7 +895,7 @@ def _run_research_workspace_plan(
             }
             workbook_frames_local = dict(per_graph_frames)
 
-        manifest_rows.append(graph_manifest)
+        _upsert_manifest_row(manifest_rows, graph_manifest)
         frames_current = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
         if run_dir is not None:
             per_graph_extras = {k: v for k, v in extras.items() if f"{gid}__" in k or f"/{gid}__" in k}
@@ -783,6 +941,10 @@ def _run_research_workspace_plan(
         )
         (run_dir / "research_bundle.zip").write_bytes(_bundle_frames_to_zip_bytes(frames, extras=extras))
         (run_dir / "research_summary.xlsx").write_bytes(_bundle_frames_to_xlsx_bytes(frames))
+        try:
+            _research_lock_path(run_dir).unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Failed to remove research run lock: %s", _research_lock_path(run_dir))
     return frames, extras, run_dir
 
 
@@ -811,6 +973,12 @@ def _render_research_tab(
             key="__research_stream_save",
             help="После каждого графа сразу пишет manifest, per-graph CSV/XLSX и итоговые summary-файлы в папку запуска.",
         )
+        research_resume_existing = st.checkbox(
+            "Проверять и продолжать предыдущий run",
+            value=bool(st.session_state.get("__research_resume_existing", True)),
+            key="__research_resume_existing",
+            help="Ищет последний run с той же меткой и seed, подхватывает manifest и пропускает уже готовые графы.",
+        )
         research_run_label = st.text_input(
             "Метка запуска",
             value=str(st.session_state.get("__research_run_label", "workspace_research")),
@@ -823,8 +991,15 @@ def _render_research_tab(
             key="__research_output_root",
         )
         research_output_root_resolved = Path(str(research_output_root).strip() or _default_research_output_root()).expanduser().resolve()
-        preview_run_dir = research_output_root_resolved / f"{_safe_run_label(str(research_run_label).strip() or 'workspace_research')}__seed_{int(seed_val)}__<timestamp>"
+        safe_research_label = _safe_run_label(str(research_run_label).strip() or "workspace_research")
+        preview_run_dir = research_output_root_resolved / f"{safe_research_label}__seed_{int(seed_val)}__<timestamp>"
         st.caption(f"Research root: {research_output_root_resolved}")
+        if bool(research_resume_existing):
+            existing_run = _find_existing_research_run(research_output_root_resolved, run_label=safe_research_label, seed=int(seed_val))
+            if existing_run is not None:
+                st.caption(f"Будет проверен предыдущий run: {existing_run}")
+            else:
+                st.caption("Предыдущий совместимый run не найден — будет создан новый.")
         st.caption(f"Папка запуска будет вида: {preview_run_dir}")
 
     g1, g2 = st.columns([1.2, 1.8])
@@ -912,6 +1087,7 @@ def _render_research_tab(
             stream_save=bool(research_stream_save),
             stream_output_root=str(research_output_root),
             run_label=str(research_run_label),
+            resume_existing_run=bool(research_resume_existing),
         )
         cache_key = (
             tuple(graph_ids),
