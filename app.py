@@ -202,6 +202,94 @@ def _write_tables_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
     return buf.getvalue()
 
 
+def _append_research_csv_rows(csv_path: Path, frame: pd.DataFrame | None) -> None:
+    """Append one compact research table to CSV without rebuilding previous rows.
+
+    Compatibility guard: if incoming columns differ from already persisted CSV
+    headers, fall back to one safe read+rewrite for this table to avoid writing
+    malformed rows with a shifted schema.
+    """
+    if frame is None or frame.empty:
+        return
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        frame.to_csv(csv_path, mode="a", header=True, index=False)
+        return
+
+    # Keep streaming append fast for the common stable-schema case.
+    try:
+        existing_cols = list(pd.read_csv(csv_path, nrows=0).columns)
+    except Exception:
+        logger.exception("Failed to inspect aggregate CSV header: %s", csv_path)
+        existing_cols = []
+
+    incoming_cols = list(frame.columns)
+    if existing_cols and incoming_cols == existing_cols:
+        frame.to_csv(csv_path, mode="a", header=False, index=False)
+        return
+
+    # Schema drift is rare, but when it happens we rewrite once to preserve data.
+    try:
+        prev = pd.read_csv(csv_path)
+    except Exception:
+        logger.exception("Failed to read aggregate CSV for rewrite: %s", csv_path)
+        prev = pd.DataFrame(columns=existing_cols)
+
+    merged = pd.concat([prev, frame], ignore_index=True, sort=False)
+    merged.to_csv(csv_path, index=False)
+
+
+def _load_research_aggregate_frames(run_dir: Path) -> dict[str, pd.DataFrame]:
+    """Load aggregate compact research tables from canonical CSV files."""
+    frames: dict[str, pd.DataFrame] = {}
+    run_dir = Path(run_dir)
+    for table_name in ["research_metrics", "research_resistance", "research_attacks", "research_energy_runs"]:
+        csv_path = run_dir / f"{_safe_run_label(table_name, 'summary')}.csv"
+        if not csv_path.exists():
+            continue
+        try:
+            frames[table_name] = pd.read_csv(csv_path)
+        except Exception:
+            logger.exception("Failed to read research aggregate CSV: %s", csv_path)
+    return frames
+
+
+def _write_research_bundle_from_run_dir(run_dir: Path, frames: dict[str, pd.DataFrame]) -> None:
+    """Build final ZIP directly from persisted run-dir artifacts."""
+    run_dir = Path(run_dir)
+    bundle_path = run_dir / "research_bundle.zip"
+    with ZipFile(bundle_path, mode="w", compression=ZIP_DEFLATED) as zf:
+        for name, df in (frames or {}).items():
+            zf.writestr(f"{name}.csv", (df.copy() if df is not None else pd.DataFrame()).to_csv(index=False).encode("utf-8"))
+        for folder_name in ["per_graph", "extras"]:
+            base = run_dir / folder_name
+            if not base.exists():
+                continue
+            for file_path in sorted(p for p in base.rglob("*") if p.is_file()):
+                zf.write(file_path, arcname=str(file_path.relative_to(run_dir)).replace('\\', '/'))
+        for manifest_name in ["manifest.csv", "manifest.xlsx", "run_meta.json", "research_summary.xlsx"]:
+            file_path = run_dir / manifest_name
+            if file_path.exists():
+                zf.write(file_path, arcname=manifest_name)
+
+
+def _finalize_research_run_outputs(run_dir: Path, *, manifest_rows: list[dict], aggregate_frames: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Write final manifest/summary artifacts once, at the end of the run."""
+    run_dir = Path(run_dir).expanduser().resolve()
+    manifest_df = pd.DataFrame(manifest_rows or [])
+    manifest_df.to_csv(run_dir / "manifest.csv", index=False)
+    with pd.ExcelWriter(run_dir / "manifest.xlsx", engine="openpyxl") as writer:
+        manifest_df.to_excel(writer, sheet_name="manifest", index=False)
+    for name, df in (aggregate_frames or {}).items():
+        (df if df is not None else pd.DataFrame()).to_csv(run_dir / f"{_safe_run_label(name, 'summary')}.csv", index=False)
+    summary_frames = aggregate_frames or _load_research_aggregate_frames(run_dir)
+    (run_dir / "research_summary.xlsx").write_bytes(_write_tables_xlsx_bytes(summary_frames))
+    _write_research_bundle_from_run_dir(run_dir, summary_frames)
+    return summary_frames
+
+
 def _persist_research_graph_result(
     run_dir: Path,
     *,
@@ -209,16 +297,10 @@ def _persist_research_graph_result(
     per_graph_frames: dict[str, pd.DataFrame],
     per_graph_extras: dict[str, bytes],
     manifest_rows: list[dict],
-    aggregate_frames: dict[str, pd.DataFrame] | None = None,
     workbook_frames: dict[str, pd.DataFrame] | None = None,
+    append_aggregate_rows: bool = True,
 ) -> None:
-    """Persist current per-graph and aggregate research outputs immediately.
-
-    ``per_graph_frames`` remain the canonical compact tables (research_* rows)
-    that are written both to CSV and to the per-graph workbook. Additional
-    detailed sheets (e.g., energy trajectories) can be passed via
-    ``workbook_frames`` and are added only to the workbook.
-    """
+    """Persist only current graph outputs immediately; finalize summaries later."""
     run_dir = Path(run_dir).expanduser().resolve()
     per_graph_dir = run_dir / "per_graph"
     extras_dir = run_dir / "extras"
@@ -243,13 +325,12 @@ def _persist_research_graph_result(
 
     manifest_df = pd.DataFrame(manifest_rows or [])
     manifest_df.to_csv(run_dir / "manifest.csv", index=False)
-    with pd.ExcelWriter(run_dir / "manifest.xlsx", engine="openpyxl") as writer:
-        manifest_df.to_excel(writer, sheet_name="manifest", index=False)
 
-    if aggregate_frames:
-        for name, df in aggregate_frames.items():
-            df.to_csv(run_dir / f"{_safe_run_label(name, 'summary')}.csv", index=False)
-        (run_dir / "research_summary.xlsx").write_bytes(_write_tables_xlsx_bytes(aggregate_frames))
+    if append_aggregate_rows:
+        for table_name, frame in (per_graph_frames or {}).items():
+            if not str(table_name).startswith("research_"):
+                continue
+            _append_research_csv_rows(run_dir / f"{_safe_run_label(table_name, 'summary')}.csv", frame)
 
 
 def _research_graph_stem(graph_entry) -> str:
@@ -694,6 +775,8 @@ def _run_research_workspace_plan(
         "research_attacks": [],
         "research_energy_runs": [],
     }
+    keep_compact_results_in_memory = not bool(stream_save)
+    keep_extras_in_memory = not bool(stream_save)
     extras: dict[str, bytes] = {}
     run_dir: Path | None = None
     manifest_rows: list[dict] = []
@@ -770,7 +853,7 @@ def _run_research_workspace_plan(
                 logger.exception("Failed to remove research run lock: %s", _research_lock_path(run_dir))
         return frames, extras, run_dir
 
-    if run_dir is not None and manifest_rows:
+    if run_dir is not None and manifest_rows and keep_compact_results_in_memory:
         for gid_existing in valid_graph_ids:
             entry_existing = ctx.graphs.get(gid_existing)
             if entry_existing is None:
@@ -781,17 +864,18 @@ def _run_research_workspace_plan(
         entry = ctx.graphs.get(gid)
         if entry is None:
             logger.warning("Research plan lost graph during run: %s", gid)
-            results["research_metrics"].append({
-                "graph_id": gid,
-                "graph_name": "<missing>",
-                "source": "<missing>",
-                "analysis_mode": str(analysis_mode),
-                "min_conf": float(min_conf),
-                "min_weight": float(min_weight),
-                "status": "missing_graph",
-                "error_type": "KeyError",
-                "error": f"Graph disappeared during run: {gid}",
-            })
+            if keep_compact_results_in_memory:
+                results["research_metrics"].append({
+                    "graph_id": gid,
+                    "graph_name": "<missing>",
+                    "source": "<missing>",
+                    "analysis_mode": str(analysis_mode),
+                    "min_conf": float(min_conf),
+                    "min_weight": float(min_weight),
+                    "status": "missing_graph",
+                    "error_type": "KeyError",
+                    "error": f"Graph disappeared during run: {gid}",
+                })
             bar.progress(idx / total)
             continue
         msg.caption(f"[{idx}/{total}] {entry.name}")
@@ -803,7 +887,8 @@ def _run_research_workspace_plan(
             "status": "running",
         }
         if run_dir is not None and _is_research_graph_already_done(run_dir, entry):
-            _hydrate_existing_research_rows(run_dir, entry, results)
+            if keep_compact_results_in_memory:
+                _hydrate_existing_research_rows(run_dir, entry, results)
             graph_manifest["status"] = "skipped_existing"
             graph_manifest["tables"] = "existing"
             graph_manifest["extras_count"] = 0
@@ -829,6 +914,7 @@ def _run_research_workspace_plan(
         # stream-save writes one deterministic workbook per graph.
         per_graph_frames: dict[str, pd.DataFrame] = {}
         workbook_frames_local: dict[str, pd.DataFrame] = {}
+        per_graph_extras: dict[str, bytes] = {}
         try:
             graph = cached_build_graph(
                 entry.edges,
@@ -872,13 +958,15 @@ def _run_research_workspace_plan(
                     for col in ["kappa_mean", "kappa_median", "kappa_frac_negative", "kappa_computed_edges", "kappa_skipped_edges", "kappa_var", "kappa_skew", "kappa_entropy", "fragility_kappa"]:
                         if col in row:
                             row[col] = np.nan
-                results["research_metrics"].append(row)
+                if keep_compact_results_in_memory:
+                    results["research_metrics"].append(row)
                 per_graph_frames["research_metrics"] = pd.DataFrame([row])
 
             if flags.get("resistance", False):
                 row = graph_resistance_summary(graph)
                 row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
-                results["research_resistance"].append(row)
+                if keep_compact_results_in_memory:
+                    results["research_resistance"].append(row)
                 per_graph_frames["research_resistance"] = pd.DataFrame([row])
 
             if flags.get("attack", False):
@@ -909,10 +997,11 @@ def _run_research_workspace_plan(
                 if isinstance(attack_payload.get("final_row"), dict):
                     for k, v in attack_payload["final_row"].items():
                         attack_row[f"final__{k}"] = v
-                results["research_attacks"].append(attack_row)
+                if keep_compact_results_in_memory:
+                    results["research_attacks"].append(attack_row)
                 per_graph_frames["research_attacks"] = pd.DataFrame([attack_row])
-                extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
-                extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                per_graph_extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
+                per_graph_extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
             if flags.get("energy", False):
                 node_frames, edge_frames = simulate_energy_flow(
@@ -944,12 +1033,13 @@ def _run_research_workspace_plan(
                     "n_node_rows": int(len(energy_nodes_long)),
                     "n_edge_rows": int(len(energy_edges_long)),
                 })
-                results["research_energy_runs"].append(energy_run_summary)
+                if keep_compact_results_in_memory:
+                    results["research_energy_runs"].append(energy_run_summary)
                 per_graph_frames["research_energy_runs"] = pd.DataFrame([energy_run_summary])
-                extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
-                extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
-                extras[f"energy/{entry.id}__steps_summary.csv"] = energy_steps_summary.to_csv(index=False).encode("utf-8")
-                extras[f"energy/{entry.id}__run_summary.json"] = json.dumps(energy_run_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                per_graph_extras[f"energy/{entry.id}__nodes_long.csv"] = energy_nodes_long.to_csv(index=False).encode("utf-8")
+                per_graph_extras[f"energy/{entry.id}__edges_long.csv"] = energy_edges_long.to_csv(index=False).encode("utf-8")
+                per_graph_extras[f"energy/{entry.id}__steps_summary.csv"] = energy_steps_summary.to_csv(index=False).encode("utf-8")
+                per_graph_extras[f"energy/{entry.id}__run_summary.json"] = json.dumps(energy_run_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8")
                 workbook_frames_local["energy_nodes_long"] = energy_nodes_long
                 workbook_frames_local["energy_edges_long"] = energy_edges_long
                 workbook_frames_local["energy_steps_summary"] = energy_steps_summary
@@ -960,7 +1050,9 @@ def _run_research_workspace_plan(
 
             graph_manifest["status"] = "done"
             graph_manifest["tables"] = ",".join(sorted(per_graph_frames.keys()))
-            graph_manifest["extras_count"] = int(sum(1 for k in extras.keys() if f"{gid}__" in k or f"/{gid}__" in k))
+            graph_manifest["extras_count"] = int(len(per_graph_extras))
+            if keep_extras_in_memory:
+                extras.update(per_graph_extras)
         except Exception:
             logger.exception("Research run failed for graph %s (%s)", gid, entry.name)
             err_text = traceback.format_exc()
@@ -979,19 +1071,19 @@ def _run_research_workspace_plan(
                 ])
             }
             workbook_frames_local = dict(per_graph_frames)
+            per_graph_extras = {}
+            graph_manifest["extras_count"] = 0
 
         _upsert_manifest_row(manifest_rows, graph_manifest)
-        frames_current = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
         if run_dir is not None:
-            per_graph_extras = {k: v for k, v in extras.items() if f"{gid}__" in k or f"/{gid}__" in k}
             _persist_research_graph_result(
                 run_dir,
                 graph_entry=entry,
                 per_graph_frames=per_graph_frames,
                 per_graph_extras=per_graph_extras,
                 manifest_rows=manifest_rows,
-                aggregate_frames=frames_current,
                 workbook_frames=workbook_frames_local,
+                append_aggregate_rows=True,
             )
             write_run_metadata(
                 run_dir,
@@ -1007,11 +1099,18 @@ def _run_research_workspace_plan(
                 },
             )
 
+        del per_graph_frames, workbook_frames_local, per_graph_extras
+        try:
+            del graph
+        except Exception:
+            pass
+        gc.collect()
         bar.progress(float(idx) / float(total))
 
     msg.caption("Research run complete")
-    frames = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
     if run_dir is not None:
+        frames = _load_research_aggregate_frames(run_dir)
+        frames = _finalize_research_run_outputs(run_dir, manifest_rows=manifest_rows, aggregate_frames=frames)
         write_run_metadata(
             run_dir,
             base_dir=run_dir.parent,
@@ -1024,12 +1123,12 @@ def _run_research_workspace_plan(
                 "summary_tables": ",".join(sorted(frames.keys())),
             },
         )
-        (run_dir / "research_bundle.zip").write_bytes(_bundle_frames_to_zip_bytes(frames, extras=extras))
-        (run_dir / "research_summary.xlsx").write_bytes(_bundle_frames_to_xlsx_bytes(frames))
         try:
             _research_lock_path(run_dir).unlink(missing_ok=True)
         except Exception:
             logger.exception("Failed to remove research run lock: %s", _research_lock_path(run_dir))
+    else:
+        frames = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
     return frames, extras, run_dir
 
 
@@ -1190,14 +1289,16 @@ def _render_research_tab(
             int(energy_steps),
             str(energy_flow_mode),
         )
-        st.session_state["__research_results"] = {
+        cached_payload = {
             "key": cache_key,
             "frames": frames,
-            "extras": extras,
-            "xlsx": _bundle_frames_to_xlsx_bytes(frames),
-            "zip": _bundle_frames_to_zip_bytes(frames, extras=extras),
             "run_dir": str(run_dir) if run_dir is not None else "",
         }
+        if run_dir is None:
+            cached_payload["extras"] = extras
+            cached_payload["xlsx"] = _bundle_frames_to_xlsx_bytes(frames)
+            cached_payload["zip"] = _bundle_frames_to_zip_bytes(frames, extras=extras)
+        st.session_state["__research_results"] = cached_payload
         if run_dir is not None:
             st.session_state["__last_research_run_dir"] = str(run_dir)
             st.success(f"Готово: рассчитано {len(graph_ids)} граф(ов). Папка запуска: {run_dir}")
@@ -1208,11 +1309,20 @@ def _render_research_tab(
     cached = st.session_state.get("__research_results")
     if cached:
         run_dir_cached = str(cached.get("run_dir", "")).strip()
+        xlsx_data = cached.get("xlsx")
+        zip_data = cached.get("zip")
         if run_dir_cached:
             st.caption(f"Последний research-run: {run_dir_cached}")
+            run_dir_path = Path(run_dir_cached)
+            xlsx_path = run_dir_path / "research_summary.xlsx"
+            zip_path = run_dir_path / "research_bundle.zip"
+            if xlsx_path.exists():
+                xlsx_data = xlsx_path.read_bytes()
+            if zip_path.exists():
+                zip_data = zip_path.read_bytes()
         d1, d2 = st.columns(2)
-        d1.download_button("Скачать research_summary.xlsx", data=cached["xlsx"], file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-        d2.download_button("Скачать research_bundle.zip", data=cached["zip"], file_name="research_bundle.zip", mime="application/zip", width="stretch")
+        d1.download_button("Скачать research_summary.xlsx", data=xlsx_data, file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", disabled=xlsx_data is None)
+        d2.download_button("Скачать research_bundle.zip", data=zip_data, file_name="research_bundle.zip", mime="application/zip", width="stretch", disabled=zip_data is None)
         for name, df in cached.get("frames", {}).items():
             st.markdown(f"**{name}**")
             st.dataframe(df, width="stretch", height=min(420, 44 + 36 * min(len(df), 8)))
