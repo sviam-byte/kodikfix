@@ -132,6 +132,87 @@ def _default_batch_output_root() -> str:
     return str((Path(__file__).resolve().parent / "batch_runs").resolve())
 
 
+def _default_research_output_root() -> str:
+    """Default root for persistent research-run outputs."""
+    return str((Path(__file__).resolve().parent / "research_runs").resolve())
+
+
+def _safe_run_label(value: str, fallback: str = "research") -> str:
+    """Build a filesystem-safe short label for run files/directories."""
+    raw = str(value or "").strip()
+    if not raw:
+        raw = str(fallback)
+    cleaned = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in raw)
+    cleaned = cleaned.strip("._-")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned[:96] or str(fallback)
+
+
+def _write_tables_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
+    """Serialize dataframes to a workbook (sheet-per-frame)."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        wrote = False
+        for sheet_name, df in (frames or {}).items():
+            if df is None:
+                continue
+            frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+            frame.to_excel(writer, sheet_name=_safe_run_label(sheet_name, "sheet")[:31], index=False)
+            wrote = True
+        if not wrote:
+            pd.DataFrame([{"status": "empty"}]).to_excel(writer, sheet_name="summary", index=False)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _persist_research_graph_result(
+    run_dir: Path,
+    *,
+    graph_entry,
+    per_graph_frames: dict[str, pd.DataFrame],
+    per_graph_extras: dict[str, bytes],
+    manifest_rows: list[dict],
+    aggregate_frames: dict[str, pd.DataFrame] | None = None,
+) -> None:
+    """Persist current per-graph and aggregate research outputs immediately."""
+    run_dir = Path(run_dir).expanduser().resolve()
+    per_graph_dir = run_dir / "per_graph"
+    extras_dir = run_dir / "extras"
+    per_graph_dir.mkdir(parents=True, exist_ok=True)
+    extras_dir.mkdir(parents=True, exist_ok=True)
+    stem = _safe_run_label(
+        getattr(graph_entry, "name", None) or getattr(graph_entry, "id", "graph"),
+        getattr(graph_entry, "id", "graph"),
+    )
+
+    workbook_path = per_graph_dir / f"{stem}__research.xlsx"
+    workbook_path.write_bytes(_write_tables_xlsx_bytes(per_graph_frames))
+
+    for name, df in (per_graph_frames or {}).items():
+        if df is None:
+            continue
+        frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame(df)
+        csv_path = per_graph_dir / f"{stem}__{_safe_run_label(name, 'table')}.csv"
+        frame.to_csv(csv_path, index=False)
+
+    for rel_name, payload in (per_graph_extras or {}).items():
+        rel_path = Path(rel_name)
+        out_path = extras_dir / rel_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(payload)
+
+    manifest_df = pd.DataFrame(manifest_rows or [])
+    manifest_df.to_csv(run_dir / "manifest.csv", index=False)
+    with pd.ExcelWriter(run_dir / "manifest.xlsx", engine="openpyxl") as writer:
+        manifest_df.to_excel(writer, sheet_name="manifest", index=False)
+
+    if aggregate_frames:
+        for name, df in aggregate_frames.items():
+            df.to_csv(run_dir / f"{_safe_run_label(name, 'summary')}.csv", index=False)
+        (run_dir / "research_summary.xlsx").write_bytes(_write_tables_xlsx_bytes(aggregate_frames))
+
+
 def add_graph_to_state(name, df, source, src, dst):
     gid = new_id("G")
     entry = build_graph_entry(
@@ -385,7 +466,10 @@ def _run_research_workspace_plan(
     energy_phys_leak: float,
     energy_phys_cap_mode: str,
     energy_rw_impulse: bool,
-) -> tuple[dict[str, pd.DataFrame], dict[str, bytes]]:
+    stream_save: bool = False,
+    stream_output_root: str = "",
+    run_label: str = "",
+) -> tuple[dict[str, pd.DataFrame], dict[str, bytes], Path | None]:
     """Execute the full research batch plan over selected workspace graphs.
 
     Design notes:
@@ -394,6 +478,7 @@ def _run_research_workspace_plan(
     - Partial failures should not abort the full run; every selected graph gets
       a chance to produce outputs.
     - Export artifacts are accumulated in-memory for a single download step.
+    - Optional stream_save mode persists per-graph outputs immediately to disk.
     """
     results: dict[str, list[dict]] = {
         "research_metrics": [],
@@ -402,6 +487,30 @@ def _run_research_workspace_plan(
         "research_energy_runs": [],
     }
     extras: dict[str, bytes] = {}
+    manifest_rows: list[dict] = []
+    run_dir: Path | None = None
+    if bool(stream_save):
+        stream_root = Path(str(stream_output_root).strip() or _default_research_output_root()).expanduser().resolve()
+        run_dir = make_run_dir(
+            stream_root,
+            mode="research_stream",
+            seed=int(seed_val),
+            run_label=_safe_run_label(str(run_label).strip() or "research_run"),
+        )
+        write_run_metadata(
+            run_dir,
+            base_dir=stream_root,
+            run_label=str(run_label).strip() or "research_run",
+            seed=int(seed_val),
+            mode="research_stream",
+            status="running",
+            extra={
+                "analysis_mode": str(analysis_mode),
+                "requested_graphs": len(list(graph_ids or [])),
+                "min_conf": float(min_conf),
+                "min_weight": float(min_weight),
+            },
+        )
 
     # Validate incoming IDs against current workspace state to guard against
     # stale selections after graph deletion, trim_memory(), rerun/switch/import.
@@ -436,7 +545,7 @@ def _run_research_workspace_plan(
         msg.caption("Нет доступных графов для расчёта")
         bar.progress(1.0)
         frames = {name: pd.DataFrame(rows) for name, rows in results.items()}
-        return frames, extras
+        return frames, extras, run_dir
 
     for idx, gid in enumerate(valid_graph_ids, start=1):
         entry = ctx.graphs.get(gid)
@@ -456,6 +565,13 @@ def _run_research_workspace_plan(
             bar.progress(idx / total)
             continue
         msg.caption(f"[{idx}/{total}] {entry.name}")
+        graph_manifest = {
+            "idx": int(idx),
+            "graph_id": getattr(entry, "id", gid),
+            "graph_name": getattr(entry, "name", gid),
+            "source": getattr(entry, "source", ""),
+            "status": "running",
+        }
         try:
             graph = cached_build_graph(
                 entry.edges,
@@ -577,15 +693,91 @@ def _run_research_workspace_plan(
                 # Free heavy intermediate objects to reduce peak memory in long runs.
                 del node_frames, edge_frames, energy_nodes_long, energy_edges_long, energy_steps_summary
                 gc.collect()
+
+            graph_manifest["status"] = "done"
+            per_graph_frames: dict[str, pd.DataFrame] = {}
+            if results["research_metrics"]:
+                last = results["research_metrics"][-1]
+                if graph_manifest["graph_id"] == last.get("graph_id"):
+                    per_graph_frames["research_metrics"] = pd.DataFrame([last])
+            if results["research_resistance"]:
+                last = results["research_resistance"][-1]
+                if graph_manifest["graph_id"] == last.get("graph_id"):
+                    per_graph_frames["research_resistance"] = pd.DataFrame([last])
+            if results["research_attacks"]:
+                last = results["research_attacks"][-1]
+                if graph_manifest["graph_id"] == last.get("graph_id"):
+                    per_graph_frames["research_attacks"] = pd.DataFrame([last])
+            if results["research_energy_runs"]:
+                last = results["research_energy_runs"][-1]
+                if graph_manifest["graph_id"] == last.get("graph_id"):
+                    per_graph_frames["research_energy_runs"] = pd.DataFrame([last])
+            graph_manifest["tables"] = ",".join(sorted(per_graph_frames.keys()))
+            graph_manifest["extras_count"] = int(sum(1 for k in extras.keys() if f"{gid}__" in k or f"/{gid}__" in k))
         except Exception:
             logger.exception("Research run failed for graph %s (%s)", gid, entry.name)
-            msg.warning(f"⚠️ Ошибка при обработке {entry.name}: {traceback.format_exc()[-300:]}")
+            err_text = traceback.format_exc()
+            graph_manifest["status"] = "failed"
+            graph_manifest["error"] = err_text[-4000:]
+            msg.warning(f"⚠️ Ошибка при обработке {entry.name}: {err_text[-300:]}")
+            per_graph_frames = {
+                "research_errors": pd.DataFrame([
+                    {
+                        "graph_id": getattr(entry, "id", gid),
+                        "graph_name": getattr(entry, "name", gid),
+                        "source": getattr(entry, "source", ""),
+                        "status": "failed",
+                        "error": err_text,
+                    }
+                ])
+            }
+
+        manifest_rows.append(graph_manifest)
+        frames_current = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
+        if run_dir is not None:
+            per_graph_extras = {k: v for k, v in extras.items() if f"{gid}__" in k or f"/{gid}__" in k}
+            _persist_research_graph_result(
+                run_dir,
+                graph_entry=entry,
+                per_graph_frames=per_graph_frames,
+                per_graph_extras=per_graph_extras,
+                manifest_rows=manifest_rows,
+                aggregate_frames=frames_current,
+            )
+            write_run_metadata(
+                run_dir,
+                base_dir=run_dir.parent,
+                run_label=str(run_label).strip() or "research_run",
+                seed=int(seed_val),
+                mode="research_stream",
+                status="running",
+                extra={
+                    "processed_graphs": int(idx),
+                    "total_graphs": int(total),
+                    "last_graph": getattr(entry, "name", gid),
+                },
+            )
 
         bar.progress(float(idx) / float(total))
 
     msg.caption("Research run complete")
     frames = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
-    return frames, extras
+    if run_dir is not None:
+        write_run_metadata(
+            run_dir,
+            base_dir=run_dir.parent,
+            run_label=str(run_label).strip() or "research_run",
+            seed=int(seed_val),
+            mode="research_stream",
+            status="finished",
+            extra={
+                "processed_graphs": int(len(valid_graph_ids)),
+                "summary_tables": ",".join(sorted(frames.keys())),
+            },
+        )
+        (run_dir / "research_bundle.zip").write_bytes(_bundle_frames_to_zip_bytes(frames, extras=extras))
+        (run_dir / "research_summary.xlsx").write_bytes(_bundle_frames_to_xlsx_bytes(frames))
+    return frames, extras, run_dir
 
 
 def _render_research_tab(
@@ -604,6 +796,30 @@ def _render_research_tab(
     """
     st.subheader("🧠 Research calc")
     st.caption("Отдельная вкладка для полного исследовательского расчёта по активному графу или по всему workspace.")
+
+    stream_defaults = st.columns([1.2, 1.8])
+    with stream_defaults[0]:
+        research_stream_save = st.checkbox(
+            "Потоково сохранять на диск",
+            value=bool(st.session_state.get("__research_stream_save", True)),
+            key="__research_stream_save",
+            help="После каждого графа сразу пишет manifest, per-graph CSV/XLSX и итоговые summary-файлы в папку запуска.",
+        )
+        research_run_label = st.text_input(
+            "Метка запуска",
+            value=str(st.session_state.get("__research_run_label", "workspace_research")),
+            key="__research_run_label",
+        )
+    with stream_defaults[1]:
+        research_output_root = st.text_input(
+            "Папка результатов research",
+            value=str(st.session_state.get("__research_output_root", _default_research_output_root())),
+            key="__research_output_root",
+        )
+        research_output_root_resolved = Path(str(research_output_root).strip() or _default_research_output_root()).expanduser().resolve()
+        preview_run_dir = research_output_root_resolved / f"{_safe_run_label(str(research_run_label).strip() or 'workspace_research')}__seed_{int(seed_val)}__<timestamp>"
+        st.caption(f"Research root: {research_output_root_resolved}")
+        st.caption(f"Папка запуска будет вида: {preview_run_dir}")
 
     g1, g2 = st.columns([1.2, 1.8])
     with g1:
@@ -665,7 +881,7 @@ def _render_research_tab(
                 "Возможно, список устарел после удаления графов или trim_memory()."
             )
             return
-        frames, extras = _run_research_workspace_plan(
+        frames, extras, run_dir = _run_research_workspace_plan(
             graph_ids,
             min_conf=float(min_conf),
             min_weight=float(min_weight),
@@ -687,6 +903,9 @@ def _render_research_tab(
             energy_phys_leak=float(energy_phys_leak),
             energy_phys_cap_mode=str(energy_phys_cap_mode),
             energy_rw_impulse=bool(energy_rw_impulse),
+            stream_save=bool(research_stream_save),
+            stream_output_root=str(research_output_root),
+            run_label=str(research_run_label),
         )
         cache_key = (
             tuple(graph_ids),
@@ -710,11 +929,20 @@ def _render_research_tab(
             "extras": extras,
             "xlsx": _bundle_frames_to_xlsx_bytes(frames),
             "zip": _bundle_frames_to_zip_bytes(frames, extras=extras),
+            "run_dir": str(run_dir) if run_dir is not None else "",
         }
-        st.success(f"Готово: рассчитано {len(graph_ids)} граф(ов).")
+        if run_dir is not None:
+            st.session_state["__last_research_run_dir"] = str(run_dir)
+            st.success(f"Готово: рассчитано {len(graph_ids)} граф(ов). Папка запуска: {run_dir}")
+            st.code(str(run_dir), language=None)
+        else:
+            st.success(f"Готово: рассчитано {len(graph_ids)} граф(ов).")
 
     cached = st.session_state.get("__research_results")
     if cached:
+        run_dir_cached = str(cached.get("run_dir", "")).strip()
+        if run_dir_cached:
+            st.caption(f"Последний research-run: {run_dir_cached}")
         d1, d2 = st.columns(2)
         d1.download_button("Скачать research_summary.xlsx", data=cached["xlsx"], file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
         d2.download_button("Скачать research_bundle.zip", data=cached["zip"], file_name="research_bundle.zip", mime="application/zip", width="stretch")
