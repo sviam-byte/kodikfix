@@ -1354,6 +1354,54 @@ def _render_research_tab(
             help="Ищет подстроку в graph_id, name, source и имени workbook-стема. Если заполнено, имеет приоритет над номером.",
         )
 
+    # Быстрые кнопки для рестарта длинного research-run.
+    # Логика:
+    # - "С активного графа" -> заполняет start_from_graph текущим cur_gid
+    # - "Со следующего после активного" -> ставит start_from_index = позиция(cur_gid)+2
+    # - "Сбросить" -> очищает оба поля и стартует с начала
+    quick_cols = st.columns([1, 1.2, 0.8])
+    ordered_workspace_ids = [gid for gid in list(ctx.graphs.keys()) if gid in ctx.graphs]
+    try:
+        cur_pos = ordered_workspace_ids.index(cur_gid)
+    except ValueError:
+        cur_pos = None
+
+    with quick_cols[0]:
+        if st.button("С активного графа", key="__research_set_start_active", width="stretch"):
+            st.session_state["__research_start_from_graph"] = str(cur_gid)
+            if cur_pos is not None:
+                st.session_state["__research_start_from_index"] = int(cur_pos) + 1
+            st.rerun()
+
+    with quick_cols[1]:
+        if st.button("Со следующего после активного", key="__research_set_start_after_active", width="stretch"):
+            if cur_pos is not None:
+                # +1 чтобы перейти к 1-based numbering, ещё +1 чтобы начать СО СЛЕДУЮЩЕГО
+                st.session_state["__research_start_from_index"] = int(cur_pos) + 2
+                st.session_state["__research_start_from_graph"] = ""
+            else:
+                st.session_state["__research_start_from_index"] = max(
+                    1,
+                    int(st.session_state.get("__research_start_from_index", 1)),
+                )
+            st.rerun()
+
+    with quick_cols[2]:
+        if st.button("Сбросить", key="__research_reset_start_from", width="stretch"):
+            st.session_state["__research_start_from_index"] = 1
+            st.session_state["__research_start_from_graph"] = ""
+            st.rerun()
+
+    if cur_pos is not None:
+        st.caption(
+            f"Активный граф в текущем порядке workspace: №{cur_pos + 1} "
+            f"({cur_gid})"
+        )
+    else:
+        st.caption(
+            f"Активный graph_id={cur_gid} сейчас не найден в текущем порядке workspace."
+        )
+
     c_run1, c_run2 = st.columns(2)
     run_active = c_run1.button("Посчитать всё", type="primary", width="stretch")
     run_all = c_run2.button("Посчитать всё для всех графов", width="stretch")
