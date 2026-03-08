@@ -91,7 +91,7 @@ from src.ui.tabs import compare as tab_compare
 from src.ui.tabs import dashboard as tab_dashboard
 from src.ui.tabs import energy as tab_energy
 from src.ui.tabs import structure as tab_structure
-from src.batch_ops import build_ui_args, discover_batch_files, inspect_batch_file, make_run_dir, run_batch_plan, stage_batch_inputs
+from src.batch_ops import build_ui_args, discover_batch_files, inspect_batch_file, make_run_dir, run_batch_plan, stage_batch_inputs, write_run_metadata
 
 inject_custom_css()
 ctx.ensure_initialized()
@@ -1214,6 +1214,8 @@ if page_mode == "Batch-план":
             value=st.session_state.get("__batch_output_root_page", _default_batch_output_root()),
             key="__batch_output_root_page",
         )
+        batch_output_root_resolved = Path(str(batch_output_root).strip() or ".").expanduser().resolve()
+        st.caption(f"Абсолютный путь root: {batch_output_root_resolved}")
     with c2:
         batch_input_kind = st.selectbox("Input kind", ["auto", "matrix", "edge"], index=1, key="__batch_input_kind_page")
         batch_mat_key = st.text_input("MAT key (optional)", value=st.session_state.get("__batch_mat_key_page", ""), key="__batch_mat_key_page")
@@ -1345,6 +1347,21 @@ if page_mode == "Batch-план":
             selected_files_abs = [str(p) for p in preview_files]
 
         run_label = "всех" if pick_mode == "Всех найденных" else f"выбранных ({len(selected_files_abs)})"
+        selected_modes = [name for name, flag in [("metrics", batch_run_metrics), ("attack", batch_run_attack), ("energy", batch_run_energy), ("resistance", batch_run_resistance)] if flag]
+        mode_label = "_".join(selected_modes) if selected_modes else "batch"
+        batch_output_root_resolved = Path(str(batch_output_root).strip() or ".").expanduser().resolve()
+        preview_label = str(batch_run_label).strip() or f"batch_{mode_label}"
+        preview_name = f"{preview_label}__seed_{int(batch_seed)}__<timestamp>"
+        preview_run_dir = batch_output_root_resolved / preview_name
+        st.info(
+            "\n".join(
+                [
+                    f"Куда будет писать root: {batch_output_root_resolved}",
+                    f"Папка запуска будет вида: {preview_run_dir}",
+                    f"Файл-указатель последнего запуска: {batch_output_root_resolved / 'LAST_BATCH_RUN.txt'}",
+                ]
+            )
+        )
         batch_status = st.empty()
         batch_prog = st.progress(0.0)
         run_batch_btn = st.button(f"Посчитать для {run_label}", type="primary", width="stretch")
@@ -1383,6 +1400,21 @@ if page_mode == "Batch-план":
                     seed=int(batch_seed),
                     run_label=str(batch_run_label).strip(),
                 )
+                st.session_state["__last_batch_run_dir"] = str(planned_dir)
+                write_run_metadata(
+                    planned_dir,
+                    base_dir=batch_output_root,
+                    run_label=str(batch_run_label).strip() or f"batch_{mode_label}",
+                    seed=int(batch_seed),
+                    mode=f"batch_{mode_label}",
+                    status="planned",
+                    extra={
+                        "source_mode": str(batch_source_mode),
+                        "selected_modes": ",".join(selected_modes),
+                        "selected_files_count": len(selected_files_abs),
+                    },
+                )
+                batch_status.info(f"Создана папка запуска: {planned_dir}")
 
                 args = build_ui_args(
                     input_dir=str(staged_input_dir),
@@ -1439,8 +1471,13 @@ if page_mode == "Batch-план":
                 for mode_name, df_batch in result_frames.items():
                     ok_n = int((df_batch.get("status") == "ok").sum()) if "status" in df_batch else len(df_batch)
                     summary_parts.append(f"{mode_name}: ok={ok_n}/{len(df_batch)}")
-                batch_status.success(f"Готово: {'; '.join(summary_parts)}\n{run_dir}")
+                st.session_state["__last_batch_run_dir"] = str(run_dir)
+                batch_status.success(f"Готово: {'; '.join(summary_parts)}\nПапка запуска: {run_dir}")
                 batch_prog.progress(1.0)
+                st.code(str(run_dir), language=None)
+                latest_ptr = Path(run_dir).parent / "LAST_BATCH_RUN.txt"
+                if latest_ptr.exists():
+                    st.caption(f"Указатель последнего запуска: {latest_ptr}")
 
                 bundle_zip_path = Path(run_dir) / "batch_plan_bundle.zip"
                 manifest_xlsx_path = Path(run_dir) / "batch_plan_manifest.xlsx"
@@ -1477,6 +1514,10 @@ if page_mode == "Batch-план":
                     cleanup_cb_run()
     else:
         st.warning("Файлы пока не найдены. Проверь путь, pattern или загрузку.")
+
+    last_batch_run_dir = str(st.session_state.get("__last_batch_run_dir", "")).strip()
+    if last_batch_run_dir:
+        st.caption(f"Последняя папка batch-запуска в этой сессии: {last_batch_run_dir}")
 
     if cleanup_cb_preview is not None:
         cleanup_cb_preview()
