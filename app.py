@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import traceback
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +30,10 @@ try:
 except Exception:
     pass
 
+
+class _GraphTimeoutError(Exception):
+    """Raised when a single graph exceeds the time limit."""
+
 st.set_page_config(
     page_title="Kodik Lab",
     layout="wide",
@@ -37,7 +42,7 @@ st.set_page_config(
 )
 st.title("Graph Lab")
 
-from src.config import settings
+from src.config import GRAPH_TIMEOUT_SEC, settings
 from src.io_load import load_edges
 from src.preprocess import coerce_fixed_format
 from src.graph_build import build_graph
@@ -785,6 +790,7 @@ def _run_research_workspace_plan(
     seed_val: int,
     eff_k: int,
     curv_n: int,
+    curv_max_support: int = settings.RICCI_MAX_SUPPORT,
     flags: dict[str, bool],
     attack_family: str,
     attack_kind: str,
@@ -808,6 +814,7 @@ def _run_research_workspace_plan(
     ignore_run_lock: bool = False,
     start_from_index: int = 1,
     start_from_graph: str = "",
+    graph_timeout_sec: int = GRAPH_TIMEOUT_SEC,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, bytes], Path | None]:
     """Execute the full research batch plan over selected workspace graphs.
 
@@ -993,6 +1000,16 @@ def _run_research_workspace_plan(
         workbook_frames_local: dict[str, pd.DataFrame] = {}
         per_graph_extras: dict[str, bytes] = {}
         try:
+            _t_graph_start = time.monotonic()
+
+            def _check_timeout(label: str = "") -> None:
+                elapsed = time.monotonic() - _t_graph_start
+                if graph_timeout_sec > 0 and elapsed > graph_timeout_sec:
+                    raise _GraphTimeoutError(
+                        f"[{idx}/{total}] {entry.name}: {label} — "
+                        f"{elapsed:.0f}s > {graph_timeout_sec}s limit"
+                    )
+
             graph = cached_build_graph(
                 entry.edges,
                 entry.src_col,
@@ -1008,6 +1025,7 @@ def _run_research_workspace_plan(
                     eff_k=int(eff_k),
                     compute_curvature=bool(flags.get("curvature", False)),
                     curvature_sample_edges=int(curv_n),
+                    curvature_max_support=int(curv_max_support),
                     compute_heavy=bool(flags.get("efficiency", False) or flags.get("entropy", False) or flags.get("clustering", False) or flags.get("assortativity", False) or flags.get("spectral", False)),
                     skip_spectral=not bool(flags.get("spectral", False)),
                     diameter_samples=16,
@@ -1038,6 +1056,7 @@ def _run_research_workspace_plan(
                 if keep_compact_results_in_memory:
                     results["research_metrics"].append(row)
                 per_graph_frames["research_metrics"] = pd.DataFrame([row])
+                _check_timeout("after metrics+curvature")
 
             if flags.get("resistance", False):
                 row = graph_resistance_summary(graph)
@@ -1045,6 +1064,7 @@ def _run_research_workspace_plan(
                 if keep_compact_results_in_memory:
                     results["research_resistance"].append(row)
                 per_graph_frames["research_resistance"] = pd.DataFrame([row])
+                _check_timeout("after resistance")
 
             if flags.get("attack", False):
                 args_attack = build_ui_args(
@@ -1058,6 +1078,7 @@ def _run_research_workspace_plan(
                     fast_mode=bool(attack_fast_mode),
                     compute_curvature=bool(flags.get("curvature", False)),
                     curvature_sample_edges=int(curv_n),
+                    curvature_max_support=int(curv_max_support),
                     n_jobs=1,
                 )
                 attack_payload, history = _attack_payload_from_graph(args_attack, graph, input_label=entry.name)
@@ -1079,6 +1100,7 @@ def _run_research_workspace_plan(
                 per_graph_frames["research_attacks"] = pd.DataFrame([attack_row])
                 per_graph_extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
                 per_graph_extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                _check_timeout("after attack")
 
             if flags.get("energy", False):
                 node_frames, edge_frames = simulate_energy_flow(
@@ -1130,6 +1152,26 @@ def _run_research_workspace_plan(
             graph_manifest["extras_count"] = int(len(per_graph_extras))
             if keep_extras_in_memory:
                 extras.update(per_graph_extras)
+        except _GraphTimeoutError as _timeout_exc:
+            _elapsed = time.monotonic() - _t_graph_start
+            logger.warning("TIMEOUT [%s/%s] %s: %.0fs > %ss",
+                           idx, total, entry.name, _elapsed, graph_timeout_sec)
+            err_text = f"TIMEOUT after {_elapsed:.0f}s: {_timeout_exc}"
+            graph_manifest["status"] = "timeout"
+            graph_manifest["error"] = err_text
+            msg.warning(f"⏱️ [{idx}/{total}] TIMEOUT: {entry.name} — пропускаю (>{graph_timeout_sec}s)")
+            per_graph_frames = {
+                "research_errors": pd.DataFrame([{
+                    "graph_id": getattr(entry, "id", gid),
+                    "graph_name": getattr(entry, "name", gid),
+                    "source": getattr(entry, "source", ""),
+                    "status": "timeout",
+                    "error": err_text,
+                }])
+            }
+            workbook_frames_local = dict(per_graph_frames)
+            per_graph_extras = {}
+            graph_manifest["extras_count"] = 0
         except Exception:
             logger.exception("Research run failed for graph %s (%s)", gid, entry.name)
             err_text = traceback.format_exc()
@@ -1252,6 +1294,14 @@ def _render_research_tab(
             key="__research_ignore_run_lock",
             help="Включай только если уверена, что старый процесс уже мёртв.",
         )
+        research_graph_timeout = st.number_input(
+            "Таймаут на граф (сек, 0 = без лимита)",
+            min_value=0,
+            value=int(st.session_state.get("__research_graph_timeout", GRAPH_TIMEOUT_SEC)),
+            step=60,
+            key="__research_graph_timeout",
+            help="Если один граф считается дольше — пропустить и перейти к следующему.",
+        )
         research_run_label = st.text_input(
             "Метка запуска",
             value=str(st.session_state.get("__research_run_label", "workspace_research")),
@@ -1300,6 +1350,29 @@ def _render_research_tab(
         for key, label, help_text in _research_metric_catalog():
             st.checkbox(label, value=st.session_state.get(f"__research_flag_{key}", True), key=f"__research_flag_{key}", help=help_text)
         research_eff_k = int(st.number_input("Research eff_k", min_value=4, max_value=512, value=int(st.session_state.get("__research_eff_k", 32)), step=4, key="__research_eff_k"))
+        st.markdown("**Ricci curvature**")
+        _rc1, _rc2 = st.columns(2)
+        with _rc1:
+            research_ricci_max_support = int(st.number_input(
+                "Max support (0 = без лимита)",
+                min_value=0,
+                value=int(st.session_state.get("__research_ricci_max_support", settings.RICCI_MAX_SUPPORT)),
+                step=100,
+                key="__research_ricci_max_support",
+                help="Порог на |N(x)|+|N(y)|. Рёбра с бо́льшим support пропускаются. "
+                     "Для density d средний support ≈ 2·d·(N−1). "
+                     "Твои графы: d≈0.8, N=325 → support≈520. Ставь ≥ 650 или 0.",
+            ))
+        with _rc2:
+            research_ricci_sample_edges = int(st.number_input(
+                "Sample edges (0 = все)",
+                min_value=0,
+                value=int(st.session_state.get("__research_ricci_sample_edges", settings.RICCI_SAMPLE_EDGES)),
+                step=100,
+                key="__research_ricci_sample_edges",
+                help="Подвыборка рёбер для ORC. SE(κ̄) ≈ σ/√n. "
+                     "200 → SE≈0.007, 500 → SE≈0.004, 0 = все рёбра (точно, но долго).",
+            ))
         scope = st.radio("Область расчёта", ["Активный граф", "Все графы workspace"], horizontal=False, key="__research_scope")
 
     with g2:
@@ -1445,7 +1518,8 @@ def _render_research_tab(
             analysis_mode=str(analysis_mode),
             seed_val=int(seed_val),
             eff_k=int(research_eff_k),
-            curv_n=int(curv_n),
+            curv_n=int(research_ricci_sample_edges) if int(research_ricci_sample_edges) > 0 else int(curv_n),
+            curv_max_support=int(research_ricci_max_support),
             flags=flags,
             attack_family=str(attack_family),
             attack_kind=str(attack_kind),
@@ -1469,6 +1543,7 @@ def _render_research_tab(
             ignore_run_lock=bool(research_ignore_run_lock),
             start_from_index=int(research_start_from_index),
             start_from_graph=str(research_start_from_graph),
+            graph_timeout_sec=int(research_graph_timeout),
         )
         cache_key = (
             tuple(graph_ids),
@@ -1477,7 +1552,8 @@ def _render_research_tab(
             str(analysis_mode),
             int(seed_val),
             int(research_eff_k),
-            int(curv_n),
+            int(research_ricci_sample_edges) if int(research_ricci_sample_edges) > 0 else int(curv_n),
+            int(research_ricci_max_support),
             json.dumps(flags, sort_keys=True),
             str(attack_family),
             str(attack_kind),
@@ -2048,8 +2124,8 @@ if page_mode == "Batch-план":
         batch_seed = st.number_input("Seed", min_value=0, value=int(st.session_state.get("__batch_seed_page", int(settings.DEFAULT_SEED))), step=1, key="__batch_seed_page")
         batch_lcc = st.checkbox("LCC only", value=st.session_state.get("__batch_lcc_page", True), key="__batch_lcc_page")
     with d2:
-        batch_compute_curv = st.checkbox("Compute curvature", value=st.session_state.get("__batch_compute_curv_page", False), key="__batch_compute_curv_page")
-        batch_curv_n = st.number_input("Curvature sample edges", min_value=1, value=int(st.session_state.get("__batch_curv_n_page", 120)), step=1, key="__batch_curv_n_page")
+        batch_compute_curv = st.checkbox("Compute curvature", value=st.session_state.get("__batch_compute_curv_page", True), key="__batch_compute_curv_page")
+        batch_curv_n = st.number_input("Curvature sample edges", min_value=1, value=int(st.session_state.get("__batch_curv_n_page", 200)), step=1, key="__batch_curv_n_page")
     with d3:
         batch_eff_k = st.number_input("eff_k", min_value=1, value=int(st.session_state.get("__batch_eff_k_page", 32)), step=1, key="__batch_eff_k_page")
         batch_skip_spectral = st.checkbox("Skip spectral", value=st.session_state.get("__batch_skip_spectral_page", False), key="__batch_skip_spectral_page")
@@ -2386,7 +2462,7 @@ with st.sidebar:
 
     seed_val = int(st.number_input("Seed", value=settings.DEFAULT_SEED))
 
-    curv_n = int(st.slider("Ricci edges", 20, 300, int(settings.RICCI_SAMPLE_EDGES)))
+    curv_n = int(st.slider("Ricci edges", 50, 1000, int(settings.RICCI_SAMPLE_EDGES)))
     do_ricci = st.button("Compute Ricci (slow)")
 
     st.markdown("---")
@@ -2394,7 +2470,7 @@ with st.sidebar:
     st.caption("Tidy tables for p-value / regression / mixed models")
 
     stats_eff_k = int(st.number_input("Stats eff_k", min_value=4, max_value=512, value=32, step=4))
-    stats_do_curv = st.checkbox("Include curvature in subject_metrics", value=False)
+    stats_do_curv = st.checkbox("Include curvature in subject_metrics", value=True)
     stats_scope = st.radio("Что экспортировать", ["Active graph only", "All graphs"], horizontal=False, index=0)
     stats_lightweight = st.checkbox("Fast export (light metrics)", value=True)
 

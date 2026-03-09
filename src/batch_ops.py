@@ -16,6 +16,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
 
+from .config import settings
 from .cli import (
     _attack_payload_from_graph,
     _build_metrics_payload,
@@ -1006,6 +1007,7 @@ def build_ui_args(**kwargs):
         eff_k=32,
         compute_curvature=False,
         curvature_sample_edges=120,
+        curvature_max_support=settings.RICCI_MAX_SUPPORT,
         compute_heavy=True,
         skip_spectral=False,
         diameter_samples=16,

@@ -17,9 +17,12 @@ EPS_LOG: float = 1e-20      # log(p) guard
 # Ricci / W1 approximation
 # =========================
 RICCI_MASS_SCALE: int = 120_000
-RICCI_MAX_SUPPORT: int = 60
+RICCI_MAX_SUPPORT: int = 700          # was 60; dense graphs (d≈0.8, ~260 nbrs) need large support
 RICCI_CUTOFF: float = 8.0
-RICCI_SAMPLE_EDGES: int = 80
+RICCI_SAMPLE_EDGES: int = 200         # was 80; better sampling for research/paper
+
+# Per-graph timeout (seconds). 0 = no limit.
+GRAPH_TIMEOUT_SEC: int = 600          # 10 minutes
 
 # =========================
 # Phase transition detection
