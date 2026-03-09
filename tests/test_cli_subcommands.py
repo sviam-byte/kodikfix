@@ -122,3 +122,73 @@ def test_cli_batch_metrics_and_no_compute_heavy(tmp_path: Path):
     df = pd.read_csv(summary_csv)
     assert len(df) == 2
     assert set(df["status"].tolist()) == {"ok"}
+
+
+def test_cli_phenotype_match_subcommand(tmp_path: Path):
+    hc1 = tmp_path / "hc1.csv"
+    hc2 = tmp_path / "hc2.csv"
+    out = tmp_path / "pm.json"
+    winners = tmp_path / "winners.csv"
+    subject = tmp_path / "subject.csv"
+    traj = tmp_path / "traj.csv"
+    xlsx = tmp_path / "pm.xlsx"
+
+    for p in [hc1, hc2]:
+        _write_edges(p)
+
+    sz_df = pd.DataFrame(
+        [
+            {
+                "density": 0.5,
+                "clustering": 0.3,
+                "mod": 0.2,
+                "l2_lcc": 0.1,
+                "H_rw": 1.0,
+                "fragility_H": 0.4,
+                "eff_w": 0.5,
+                "lcc_frac": 1.0,
+            }
+        ]
+    )
+    sz_path = tmp_path / "sz_metrics.csv"
+    sz_df.to_csv(sz_path, index=False)
+
+    code = cli.main(
+        [
+            "phenotype-match",
+            "--hc",
+            str(hc1),
+            str(hc2),
+            "--sz-metrics",
+            str(sz_path),
+            "--attack-kinds",
+            "weight_noise,inter_module_removal",
+            "--metrics",
+            "density,clustering,mod,l2_lcc,H_rw,fragility_H,eff_w,lcc_frac",
+            "--steps",
+            "4",
+            "--out",
+            str(out),
+            "--winners-out",
+            str(winners),
+            "--subject-out",
+            str(subject),
+            "--traj-out",
+            str(traj),
+            "--xlsx-out",
+            str(xlsx),
+        ]
+    )
+
+    assert code == 0
+    assert out.exists()
+    assert winners.exists()
+    assert subject.exists()
+    assert traj.exists()
+    assert xlsx.exists()
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["mode"] == "phenotype-match"
+    assert "compact_summary" in payload
+    assert "summary_attack_rows" in payload
+    assert "summary_winner_rows" in payload
