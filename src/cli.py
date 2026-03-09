@@ -7,12 +7,15 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+import networkx as nx
+import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
 from .attacks import run_attack, run_edge_attack
 from .attacks_mix import run_mix_attack
 from .config import settings
+from .degradation import run_degradation_trajectory
 from .exporters import (
     export_metrics_payload,
     infer_output_format,
@@ -23,7 +26,9 @@ from .graph_build import build_graph_from_edges, graph_summary, lcc_subgraph
 from .matrix_import import load_matrix, matrix_to_graph
 from .metrics import calculate_metrics
 from .mix_frac_estimator import estimate_mix_frac_star
+from .phenotype_matching import compare_degradation_models, summarize_best_attack
 from .preprocess import coerce_fixed_format, filter_edges
+from .phenotype_reporting import export_phenotype_match_excel, build_paper_ready_summary
 
 SUPPORTED_EDGE_EXTS = {".csv", ".tsv", ".txt", ".xlsx", ".xls"}
 SUPPORTED_MATRIX_EXTS = {".mat", ".npy", ".npz"}
@@ -238,9 +243,83 @@ def _build_metrics_payload(args, path: Path) -> dict:
     return _metrics_payload_from_graph(args, graph, input_label=str(path))
 
 
+def _load_metrics_table(path: Path) -> pd.DataFrame:
+    """Load CSV/TSV/XLSX metrics table."""
+    suffix = path.suffix.lower()
+    if suffix in (".xlsx", ".xls"):
+        return pd.read_excel(path)
+    sep = "	" if suffix == ".tsv" else None
+    return pd.read_csv(path, sep=sep, engine="python", encoding_errors="replace")
+
+
+def _compute_metrics_row_for_graph(args, graph, *, label: str) -> dict:
+    """Compute one flat metrics row suitable for phenotype matching tables."""
+    met = calculate_metrics(
+        graph,
+        int(args.eff_k),
+        int(args.seed),
+        bool(getattr(args, "compute_curvature", False)),
+        curvature_sample_edges=int(getattr(args, "curvature_sample_edges", 80)),
+        compute_heavy=True,
+        skip_spectral=False,
+        diameter_samples=16,
+        ricci_n_jobs=None,
+    )
+    row = {"input": str(label)}
+    row.update(met)
+    return row
+
+
+def _build_graphs_for_paths(args, paths: list[str]) -> list[nx.Graph]:
+    """Load many graphs from CLI paths using current graph-loading options."""
+    graphs: list[nx.Graph] = []
+    for item in paths:
+        g = _build_graph_from_cli(
+            Path(item),
+            fixed=bool(args.fixed),
+            src=str(args.src),
+            dst=str(args.dst),
+            min_conf=float(args.min_conf),
+            min_weight=float(args.min_weight),
+            lcc=bool(args.lcc),
+            input_kind=str(getattr(args, "input_kind", "auto")),
+            mat_key=str(getattr(args, "mat_key", "")),
+            sign_policy=str(getattr(args, "sign_policy", "abs")),
+            threshold_mode=str(getattr(args, "threshold_mode", "density")),
+            threshold_value=float(getattr(args, "threshold_value", 0.15)),
+            shift=float(getattr(args, "shift", 0.0)),
+        )
+        graphs.append(g)
+    return graphs
+
+
+def _compute_baseline_metrics_df(args, paths: list[str]) -> pd.DataFrame:
+    """Compute HC baseline metrics table from graph files."""
+    rows = []
+    for item in paths:
+        graph = _build_graph_from_cli(
+            Path(item),
+            fixed=bool(args.fixed),
+            src=str(args.src),
+            dst=str(args.dst),
+            min_conf=float(args.min_conf),
+            min_weight=float(args.min_weight),
+            lcc=bool(args.lcc),
+            input_kind=str(getattr(args, "input_kind", "auto")),
+            mat_key=str(getattr(args, "mat_key", "")),
+            sign_policy=str(getattr(args, "sign_policy", "abs")),
+            threshold_mode=str(getattr(args, "threshold_mode", "density")),
+            threshold_value=float(getattr(args, "threshold_value", 0.15)),
+            shift=float(getattr(args, "shift", 0.0)),
+        )
+        rows.append(_compute_metrics_row_for_graph(args, graph, label=item))
+    return pd.DataFrame(rows)
+
+
 def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, pd.DataFrame]:
     """Execute one attack experiment for an already constructed graph."""
     family = str(args.family)
+
     if family == "node":
         history, aux = run_attack(
             graph,
@@ -252,6 +331,7 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             compute_heavy_every=int(args.heavy_every),
             fast_mode=bool(args.fast_mode),
         )
+
     elif family == "edge":
         history, aux = run_edge_attack(
             graph,
@@ -264,7 +344,8 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             compute_curvature=bool(args.compute_curvature),
             curvature_sample_edges=int(args.curvature_sample_edges),
         )
-    else:
+
+    elif family == "mix":
         history, aux = run_mix_attack(
             graph,
             kind=str(args.kind),
@@ -278,6 +359,28 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             replace_from=str(args.replace_from),
             fast_mode=bool(args.fast_mode),
         )
+
+    elif family == "degradation":
+        history, aux = run_degradation_trajectory(
+            graph,
+            kind=str(args.kind),
+            steps=int(args.steps),
+            frac=float(args.frac),
+            seed=int(args.seed),
+            eff_sources_k=int(args.eff_k),
+            compute_heavy_every=int(args.heavy_every),
+            compute_curvature=bool(args.compute_curvature),
+            curvature_sample_edges=int(args.curvature_sample_edges),
+            noise_sigma_max=float(args.noise_sigma_max),
+            keep_density_from_baseline=bool(args.keep_density_from_baseline),
+            recompute_modules=bool(args.recompute_modules),
+            module_resolution=float(args.module_resolution),
+            removal_mode=str(args.removal_mode),
+            fast_mode=bool(args.fast_mode),
+        )
+
+    else:
+        raise ValueError(f"Unsupported family: {family}")
 
     payload = {
         "mode": "attack",
@@ -295,6 +398,11 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             "alpha_rewire": getattr(args, "alpha_rewire", None),
             "beta_replace": getattr(args, "beta_replace", None),
             "swaps_per_edge": getattr(args, "swaps_per_edge", None),
+            "noise_sigma_max": getattr(args, "noise_sigma_max", None),
+            "keep_density_from_baseline": getattr(args, "keep_density_from_baseline", None),
+            "recompute_modules": getattr(args, "recompute_modules", None),
+            "module_resolution": getattr(args, "module_resolution", None),
+            "removal_mode": getattr(args, "removal_mode", None),
         },
         "aux": aux,
         "final_row": history.iloc[-1].to_dict() if not history.empty else {},
@@ -421,6 +529,92 @@ def _cmd_mixfrac(args) -> int:
     return 0
 
 
+
+def _cmd_phenotype_match(args) -> int:
+    """Compare degradation models HC -> SZ using a SZ metrics table."""
+    attack_kinds = [x.strip() for x in str(args.attack_kinds).split(",") if x.strip()]
+    if not attack_kinds:
+        raise ValueError("--attack-kinds must contain at least one attack kind")
+
+    metrics = [x.strip() for x in str(args.metrics).split(",") if x.strip()]
+    if not metrics:
+        raise ValueError("--metrics must contain at least one metric")
+
+    sz_group_metrics_df = _load_metrics_table(Path(args.sz_metrics))
+    if args.hc_baseline_metrics:
+        hc_baseline_metrics_df = _load_metrics_table(Path(args.hc_baseline_metrics))
+    else:
+        hc_baseline_metrics_df = _compute_baseline_metrics_df(args, list(args.hc))
+
+    hc_graphs = _build_graphs_for_paths(args, list(args.hc))
+
+    result = compare_degradation_models(
+        hc_graphs=hc_graphs,
+        sz_group_metrics_df=sz_group_metrics_df,
+        hc_baseline_metrics_df=hc_baseline_metrics_df,
+        attack_kinds=attack_kinds,
+        metrics=metrics,
+        steps=int(args.steps),
+        frac=float(args.frac),
+        seed=int(args.seed),
+        eff_sources_k=int(args.eff_k),
+        compute_heavy_every=int(args.heavy_every),
+        compute_curvature=bool(args.compute_curvature),
+        curvature_sample_edges=int(args.curvature_sample_edges),
+        noise_sigma_max=float(args.noise_sigma_max),
+        keep_density_from_baseline=bool(args.keep_density_from_baseline),
+        recompute_modules=bool(args.recompute_modules),
+        module_resolution=float(args.module_resolution),
+        removal_mode=str(args.removal_mode),
+    )
+
+    compact = summarize_best_attack(result)
+    paper_summary = build_paper_ready_summary(result)
+
+    winners_df = result["winner_results"]
+    subject_df = result["subject_results"]
+    traj_df = result["trajectory_results"]
+
+    if args.winners_out:
+        Path(args.winners_out).parent.mkdir(parents=True, exist_ok=True)
+        winners_df.to_csv(args.winners_out, index=False)
+
+    if args.subject_out:
+        Path(args.subject_out).parent.mkdir(parents=True, exist_ok=True)
+        subject_df.to_csv(args.subject_out, index=False)
+
+    if args.traj_out:
+        Path(args.traj_out).parent.mkdir(parents=True, exist_ok=True)
+        traj_df.to_csv(args.traj_out, index=False)
+
+    if args.xlsx_out:
+        export_phenotype_match_excel(result, args.xlsx_out)
+
+    payload = {
+        "mode": "phenotype-match",
+        "hc_n": int(len(hc_graphs)),
+        "attack_kinds": attack_kinds,
+        "metrics": metrics,
+        "target_vector": result["target_vector"],
+        "scales": result["scales"],
+        "winner_rows": winners_df.to_dict(orient="records"),
+        "subject_rows_n": int(len(subject_df)),
+        "trajectory_rows_n": int(len(traj_df)),
+        "compact_summary": compact,
+        "summary_attack_rows": paper_summary["summary_attack"].to_dict(orient="records"),
+        "summary_winner_rows": paper_summary["summary_winners"].to_dict(orient="records"),
+        "stats_overall_rows": paper_summary["stats_overall"].to_dict(orient="records"),
+        "stats_pairwise_rows": paper_summary["stats_pairwise"].to_dict(orient="records"),
+        "stats_winner_rows": paper_summary["stats_winners"].to_dict(orient="records"),
+        "scalar_subject_rows_n": int(len(result.get("scalar_subject_results", pd.DataFrame()))),
+        "scalar_winner_rows_n": int(len(result.get("scalar_winners", pd.DataFrame()))),
+        "scalar_summary_rows": result.get("scalar_summary", pd.DataFrame()).to_dict(orient="records")
+        if isinstance(result.get("scalar_summary", pd.DataFrame()), pd.DataFrame)
+        else [],
+    }
+    _write_json(payload, args.out)
+    return 0
+
 def _cmd_batch_metrics(args) -> int:
     """Run metrics for many inputs from a folder and save per-item + summary files."""
     input_dir = Path(args.input_dir)
@@ -543,7 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build root parser with subcommands for local runs."""
     parser = argparse.ArgumentParser(
         prog="kodiklab",
-        description="Kodik Lab local runner: metrics / attack / mixfrac / batch-metrics / batch-attack.",
+        description="Kodik Lab local runner: metrics / attack / mixfrac / phenotype-match / batch-metrics / batch-attack.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -571,7 +765,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_attack = subparsers.add_parser("attack", help="Run node/edge/mix attack locally")
     p_attack.add_argument("input", type=str, help="Path to edge list or matrix file (.mat/.npy/.npz)")
     _add_common_graph_args(p_attack)
-    p_attack.add_argument("--family", choices=["node", "edge", "mix"], required=True)
+    p_attack.add_argument("--family", choices=["node", "edge", "mix", "degradation"], required=True)
     p_attack.add_argument("--kind", type=str, required=True)
     p_attack.add_argument("--frac", type=float, default=0.5)
     p_attack.add_argument("--steps", type=int, default=30)
@@ -587,6 +781,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_attack.add_argument("--swaps-per-edge", type=float, default=0.5)
     p_attack.add_argument("--out", type=str, default="-")
     p_attack.add_argument("--history-out", type=str, default="")
+    p_attack.add_argument("--noise-sigma-max", type=float, default=0.5)
+    p_attack.add_argument("--keep-density-from-baseline", action="store_true")
+    p_attack.add_argument("--recompute-modules", action="store_true")
+    p_attack.add_argument("--module-resolution", type=float, default=1.0)
+    p_attack.add_argument("--removal-mode", choices=["random", "weak_weight", "strong_weight"], default="random")
 
     p_mix = subparsers.add_parser("mixfrac", help="Estimate mix_frac* from patient + healthy graphs")
     p_mix.add_argument("--patient", required=True, type=str, help="Patient graph edge list or matrix file")
@@ -607,6 +806,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_mix.add_argument("--curvature-sample-edges", type=int, default=120)
     p_mix.add_argument("--n-boot", type=int, default=1000)
     p_mix.add_argument("--out", type=str, default="-")
+
+
+    p_pm = subparsers.add_parser("phenotype-match", help="HC -> SZ degradation-model matching")
+    p_pm.add_argument("--hc", required=True, nargs="+", type=str, help="Healthy/control graph files")
+    p_pm.add_argument("--sz-metrics", required=True, type=str, help="CSV/XLSX table with SZ group metrics")
+    p_pm.add_argument("--hc-baseline-metrics", type=str, default="", help="Optional CSV/XLSX table with HC baseline metrics")
+    _add_common_graph_args(p_pm)
+    p_pm.add_argument("--attack-kinds", type=str, default="weight_noise,inter_module_removal,intra_module_removal,weak_edges_by_weight,strong_edges_by_weight,mix_default,mix_degree_preserving")
+    p_pm.add_argument("--metrics", type=str, default="density,clustering,mod,l2_lcc,H_rw,fragility_H,eff_w,lcc_frac")
+    p_pm.add_argument("--steps", type=int, default=12)
+    p_pm.add_argument("--frac", type=float, default=0.5)
+    p_pm.add_argument("--seed", type=int, default=settings.DEFAULT_SEED)
+    p_pm.add_argument("--eff-k", type=int, default=32)
+    p_pm.add_argument("--heavy-every", type=int, default=2)
+    p_pm.add_argument("--compute-curvature", action="store_true")
+    p_pm.add_argument("--curvature-sample-edges", type=int, default=80)
+    p_pm.add_argument("--noise-sigma-max", type=float, default=0.5)
+    p_pm.add_argument("--keep-density-from-baseline", action="store_true")
+    p_pm.add_argument("--recompute-modules", action="store_true")
+    p_pm.add_argument("--module-resolution", type=float, default=1.0)
+    p_pm.add_argument("--removal-mode", choices=["random", "weak_weight", "strong_weight"], default="random")
+    p_pm.add_argument("--out", type=str, default="-")
+    p_pm.add_argument("--winners-out", type=str, default="")
+    p_pm.add_argument("--subject-out", type=str, default="")
+    p_pm.add_argument("--traj-out", type=str, default="")
+    p_pm.add_argument("--xlsx-out", type=str, default="", help="Optional XLSX export with all phenotype-match tables")
 
     p_batch_m = subparsers.add_parser("batch-metrics", help="Run metrics for all graphs in a folder")
     p_batch_m.add_argument("--input-dir", required=True, type=str)
@@ -636,7 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_a.add_argument("--limit", type=int, default=0)
     p_batch_a.add_argument("--n-jobs", type=int, default=1)
     _add_common_graph_args(p_batch_a)
-    p_batch_a.add_argument("--family", choices=["node", "edge", "mix"], required=True)
+    p_batch_a.add_argument("--family", choices=["node", "edge", "mix", "degradation"], required=True)
     p_batch_a.add_argument("--kind", type=str, required=True)
     p_batch_a.add_argument("--frac", type=float, default=0.5)
     p_batch_a.add_argument("--steps", type=int, default=30)
@@ -650,6 +875,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_a.add_argument("--alpha-rewire", type=float, default=0.6)
     p_batch_a.add_argument("--beta-replace", type=float, default=0.4)
     p_batch_a.add_argument("--swaps-per-edge", type=float, default=0.5)
+    p_batch_a.add_argument("--noise-sigma-max", type=float, default=0.5)
+    p_batch_a.add_argument("--keep-density-from-baseline", action="store_true")
+    p_batch_a.add_argument("--recompute-modules", action="store_true")
+    p_batch_a.add_argument("--module-resolution", type=float, default=1.0)
+    p_batch_a.add_argument("--removal-mode", choices=["random", "weak_weight", "strong_weight"], default="random")
 
     return parser
 
@@ -657,7 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point with backwards-compatible default to `metrics`."""
     argv = list(sys.argv[1:] if argv is None else argv)
-    subcommands = {"metrics", "attack", "mixfrac", "batch-metrics", "batch-attack"}
+    subcommands = {"metrics", "attack", "mixfrac", "phenotype-match", "batch-metrics", "batch-attack"}
 
     if argv and argv[0] not in subcommands and not argv[0].startswith("-"):
         argv = ["metrics"] + argv
@@ -671,6 +901,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_attack(args)
     if args.command == "mixfrac":
         return _cmd_mixfrac(args)
+    if args.command == "phenotype-match":
+        return _cmd_phenotype_match(args)
     if args.command == "batch-metrics":
         return _cmd_batch_metrics(args)
     if args.command == "batch-attack":
