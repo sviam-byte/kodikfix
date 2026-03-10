@@ -13,6 +13,13 @@ from joblib import Parallel, delayed
 
 from .attacks import run_attack, run_edge_attack
 from .attacks_mix import run_mix_attack
+from .batch_degrade import (
+    ALL_ATTACK_KINDS,
+    DEFAULT_DEGRADE_METRICS,
+    consolidate,
+    run_batch_degrade,
+    run_phenotype_pass,
+)
 from .config import settings
 from .degradation import run_degradation_trajectory
 from .exporters import (
@@ -851,11 +858,132 @@ def _cmd_batch_attack(args) -> int:
     return 0
 
 
+def _cmd_batch_degrade(args) -> int:
+    """Run degradation batch and optional phenotype post-processing."""
+    input_dir = Path(args.input_dir)
+    out_dir = Path(args.out_dir)
+
+    if str(getattr(args, "consolidate_only", "")).lower() in {"1", "true", "yes"}:
+        consolidate(out_dir)
+        return 0
+
+    if str(getattr(args, "phenotype_only", "")).lower() in {"1", "true", "yes"}:
+        trajectories_csv = out_dir / "trajectories_all.csv"
+        if not trajectories_csv.exists():
+            raise FileNotFoundError(f"No trajectories_all.csv in {out_dir}")
+
+        sz_path = str(getattr(args, "sz_metrics", "")).strip()
+        if not sz_path:
+            raise ValueError("--sz-metrics is required for --phenotype-only")
+
+        sz_df = _load_metrics_table(Path(sz_path))
+        hc_df = (
+            _load_metrics_table(Path(args.hc_baseline_metrics))
+            if str(getattr(args, "hc_baseline_metrics", "")).strip()
+            else None
+        )
+        phenotype_metrics = [
+            x.strip()
+            for x in str(getattr(args, "phenotype_metrics", "")).split(",")
+            if x.strip()
+        ] or None
+        run_phenotype_pass(
+            trajectories_csv=trajectories_csv,
+            sz_group_metrics_df=sz_df,
+            hc_baseline_metrics_df=hc_df,
+            phenotype_metrics=phenotype_metrics,
+            distance_mode=str(getattr(args, "distance_mode", "raw")),
+            out_dir=out_dir / "phenotype",
+        )
+        print(f"[batch-degrade] phenotype results -> {out_dir / 'phenotype'}", flush=True)
+        return 0
+
+    attack_kinds = [x.strip() for x in str(args.attack_kinds).split(",") if x.strip()]
+    if not attack_kinds:
+        attack_kinds = list(ALL_ATTACK_KINDS)
+
+    metrics = [x.strip() for x in str(args.metrics).split(",") if x.strip()]
+    if not metrics:
+        metrics = list(DEFAULT_DEGRADE_METRICS)
+
+    files = _iter_input_files(
+        input_dir,
+        recursive=bool(args.recursive),
+        pattern=str(args.pattern),
+        limit=int(args.limit),
+    )
+    print(f"[batch-degrade] found {len(files)} graph files", flush=True)
+    print(f"[batch-degrade] attacks: {', '.join(attack_kinds)}", flush=True)
+    print(f"[batch-degrade] metrics: {', '.join(metrics)}", flush=True)
+    print(f"[batch-degrade] steps={args.steps}, frac={args.frac}", flush=True)
+
+    sid_source = str(getattr(args, "subject_id_source", "basename"))
+    if sid_source == "fullpath":
+        subject_ids = [str(path) for path in files]
+    elif sid_source == "index":
+        subject_ids = [f"hc_{idx:04d}" for idx, _ in enumerate(files)]
+    else:
+        subject_ids = [_safe_stem(path.stem) for path in files]
+
+    print("[batch-degrade] loading graphs ...", flush=True)
+    graphs = _build_graphs_for_paths(args, [str(path) for path in files])
+    print(f"[batch-degrade] loaded {len(graphs)} graphs", flush=True)
+
+    sz_df = None
+    hc_df = None
+    sz_path = str(getattr(args, "sz_metrics", "")).strip()
+    if sz_path:
+        sz_df = _load_metrics_table(Path(sz_path))
+        print(f"[batch-degrade] SZ metrics loaded: {len(sz_df)} rows", flush=True)
+        hc_path = str(getattr(args, "hc_baseline_metrics", "")).strip()
+        if hc_path:
+            hc_df = _load_metrics_table(Path(hc_path))
+            print(f"[batch-degrade] HC baseline loaded: {len(hc_df)} rows", flush=True)
+
+    phenotype_metrics = [
+        x.strip() for x in str(getattr(args, "phenotype_metrics", "")).split(",") if x.strip()
+    ] or None
+
+    result = run_batch_degrade(
+        graphs,
+        subject_ids=subject_ids,
+        attack_kinds=attack_kinds,
+        out_dir=out_dir,
+        steps=int(args.steps),
+        frac=float(args.frac),
+        seed=int(args.seed),
+        eff_sources_k=int(args.eff_k),
+        compute_heavy_every=int(args.heavy_every),
+        metric_names=metrics,
+        noise_sigma_max=float(args.noise_sigma_max),
+        keep_density_from_baseline=bool(args.keep_density_from_baseline),
+        recompute_modules=bool(args.recompute_modules),
+        module_resolution=float(args.module_resolution),
+        removal_mode=str(args.removal_mode),
+        fast_mode=bool(args.fast_mode),
+        skip_existing=bool(args.skip_existing),
+        start_from=int(args.start_from),
+        sz_group_metrics_df=sz_df,
+        hc_baseline_metrics_df=hc_df,
+        phenotype_metrics=phenotype_metrics,
+        distance_mode=str(getattr(args, "distance_mode", "raw")),
+        return_details=True,
+    )
+
+    print(f"[batch-degrade] raw trajectories -> {result['trajectories_csv']}", flush=True)
+    if result.get("phenotype"):
+        print(f"[batch-degrade] phenotype results -> {out_dir / 'phenotype'}", flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build root parser with subcommands for local runs."""
     parser = argparse.ArgumentParser(
         prog="kodiklab",
-        description="Kodik Lab local runner: metrics / attack / mixfrac / phenotype-match / batch-metrics / batch-attack.",
+        description=(
+            "Kodik Lab local runner: metrics / attack / mixfrac / phenotype-match / "
+            "batch-metrics / batch-attack / batch-degrade."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1009,13 +1137,114 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_a.add_argument("--module-resolution", type=float, default=1.0)
     p_batch_a.add_argument("--removal-mode", choices=["random", "weak_weight", "strong_weight"], default="random")
 
+    p_batch_d = subparsers.add_parser(
+        "batch-degrade",
+        help="Run all degradation attacks for every graph and save per-step trajectories",
+    )
+    p_batch_d.add_argument("--input-dir", required=True, type=str, help="Directory with graph files")
+    p_batch_d.add_argument("--out-dir", type=str, default="batch_degrade_out", help="Output directory")
+    p_batch_d.add_argument("--pattern", type=str, default="*")
+    p_batch_d.add_argument("--recursive", action="store_true")
+    p_batch_d.add_argument("--limit", type=int, default=0, help="Process at most N files (0=all)")
+    _add_common_graph_args(p_batch_d)
+    p_batch_d.add_argument(
+        "--attack-kinds",
+        type=str,
+        default=",".join(ALL_ATTACK_KINDS),
+        help="Comma-separated attack kinds to run",
+    )
+    p_batch_d.add_argument(
+        "--metrics",
+        type=str,
+        default=",".join(DEFAULT_DEGRADE_METRICS),
+        help="Comma-separated metric names to compute at each step",
+    )
+    p_batch_d.add_argument("--steps", type=int, default=12, help="Degradation steps per trajectory")
+    p_batch_d.add_argument("--frac", type=float, default=0.5, help="Max fraction of edges to remove")
+    p_batch_d.add_argument("--seed", type=int, default=settings.DEFAULT_SEED)
+    p_batch_d.add_argument("--eff-k", type=int, default=16)
+    p_batch_d.add_argument("--heavy-every", type=int, default=2, help="Compute heavy metrics every N steps")
+    p_batch_d.add_argument("--fast-mode", action="store_true")
+    p_batch_d.add_argument("--noise-sigma-max", type=float, default=0.5)
+    p_batch_d.add_argument("--keep-density-from-baseline", action="store_true")
+    p_batch_d.add_argument("--recompute-modules", action="store_true")
+    p_batch_d.add_argument("--module-resolution", type=float, default=1.0)
+    p_batch_d.add_argument(
+        "--removal-mode",
+        choices=["random", "weak_weight", "strong_weight"],
+        default="random",
+    )
+    p_batch_d.add_argument(
+        "--subject-id-source",
+        type=str,
+        default="basename",
+        choices=["basename", "fullpath", "index"],
+    )
+    p_batch_d.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=True,
+        help="Skip (subject, attack) pairs already computed (default: on)",
+    )
+    p_batch_d.add_argument(
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        help="Force recomputation of all trajectories",
+    )
+    p_batch_d.add_argument("--start-from", type=int, default=0, help="Start from N-th graph (0-indexed)")
+    p_batch_d.add_argument(
+        "--consolidate-only",
+        type=str,
+        default="",
+        help="Set to 1/true to only rebuild trajectories_all.csv from per_item",
+    )
+    p_batch_d.add_argument(
+        "--phenotype-only",
+        type=str,
+        default="",
+        help="Set to 1/true to only re-run phenotype pass on existing trajectories",
+    )
+    p_batch_d.add_argument(
+        "--sz-metrics",
+        type=str,
+        default="",
+        help="CSV/XLSX with SZ group metrics; enables phenotype pass",
+    )
+    p_batch_d.add_argument(
+        "--hc-baseline-metrics",
+        type=str,
+        default="",
+        help="CSV/XLSX with HC baseline metrics for scale normalization",
+    )
+    p_batch_d.add_argument(
+        "--phenotype-metrics",
+        type=str,
+        default="",
+        help="Comma-separated metrics for phenotype matching",
+    )
+    p_batch_d.add_argument(
+        "--distance-mode",
+        type=str,
+        default="raw",
+        choices=["raw", "family_balanced"],
+    )
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point with backwards-compatible default to `metrics`."""
     argv = list(sys.argv[1:] if argv is None else argv)
-    subcommands = {"metrics", "attack", "mixfrac", "phenotype-match", "batch-metrics", "batch-attack"}
+    subcommands = {
+        "metrics",
+        "attack",
+        "mixfrac",
+        "phenotype-match",
+        "batch-metrics",
+        "batch-attack",
+        "batch-degrade",
+    }
 
     if argv and argv[0] not in subcommands and not argv[0].startswith("-"):
         argv = ["metrics"] + argv
@@ -1035,6 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_batch_metrics(args)
     if args.command == "batch-attack":
         return _cmd_batch_attack(args)
+    if args.command == "batch-degrade":
+        return _cmd_batch_degrade(args)
 
     parser.error(f"Unknown command: {args.command}")
     return 2
