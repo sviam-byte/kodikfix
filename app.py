@@ -2295,6 +2295,44 @@ if page_mode == "Batch-план":
     attack_box = st.container(border=True)
     with attack_box:
         st.caption("Параметры атаки используются только если включён Attack")
+        meta1, meta2 = st.columns([1.2, 1.8])
+
+        with meta1:
+            batch_meta_file = st.file_uploader(
+                "Metadata CSV/XLSX для групп",
+                type=["csv", "xlsx", "xls"],
+                accept_multiple_files=False,
+                key="__batch_meta_file_page",
+                help="Используется для фильтра attack only healthy/control и для записи групп в summary/manifest.",
+            )
+            batch_attack_only_healthy = st.checkbox(
+                "Разрушать только healthy/control",
+                value=st.session_state.get("__batch_attack_only_healthy_page", False),
+                key="__batch_attack_only_healthy_page",
+            )
+
+        with meta2:
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                batch_metadata_id_col = st.text_input(
+                    "Metadata id col",
+                    value=st.session_state.get("__batch_metadata_id_col_page", ""),
+                    key="__batch_metadata_id_col_page",
+                )
+            with m2:
+                batch_metadata_group_col = st.text_input(
+                    "Metadata group col",
+                    value=st.session_state.get("__batch_metadata_group_col_page", ""),
+                    key="__batch_metadata_group_col_page",
+                )
+            with m3:
+                batch_healthy_group_values = st.text_input(
+                    "Healthy values",
+                    value=st.session_state.get("__batch_healthy_group_values_page", "healthy,control,hc,0,false"),
+                    key="__batch_healthy_group_values_page",
+                    help="Через запятую. Например: healthy,control,hc,0",
+                )
+
         a1, a2, a3, a4 = st.columns(4)
         with a1:
             batch_family = st.selectbox("Family", ["node", "edge", "mix"], index=0, key="__batch_family_page")
@@ -2428,6 +2466,15 @@ if page_mode == "Batch-план":
                     seed=int(batch_seed),
                     run_label=str(batch_run_label).strip(),
                 )
+
+                metadata_path = ""
+                if batch_meta_file is not None:
+                    meta_name = Path(batch_meta_file.name).name
+                    meta_dir = Path(planned_dir) / "_metadata"
+                    meta_dir.mkdir(parents=True, exist_ok=True)
+                    metadata_path = str((meta_dir / meta_name).resolve())
+                    Path(metadata_path).write_bytes(batch_meta_file.getvalue())
+
                 st.session_state["__last_batch_run_dir"] = str(planned_dir)
                 write_run_metadata(
                     planned_dir,
@@ -2440,6 +2487,8 @@ if page_mode == "Batch-план":
                         "source_mode": str(batch_source_mode),
                         "selected_modes": ",".join(selected_modes),
                         "selected_files_count": len(selected_files_abs),
+                        "metadata_path": metadata_path,
+                        "attack_only_healthy": bool(batch_attack_only_healthy),
                     },
                 )
                 batch_status.info(f"Создана папка запуска: {planned_dir}")
@@ -2487,6 +2536,11 @@ if page_mode == "Batch-план":
                     selected_files=selected_run_files,
                     batch_chunk_size=int(batch_chunk_size),
                     write_full_bundle=bool(batch_write_full_bundle),
+                    metadata_path=str(metadata_path),
+                    metadata_id_col=str(batch_metadata_id_col),
+                    metadata_group_col=str(batch_metadata_group_col),
+                    healthy_group_values=str(batch_healthy_group_values),
+                    attack_only_healthy=bool(batch_attack_only_healthy),
                 )
 
                 def _ui_progress(done: int, total: int, label: str):

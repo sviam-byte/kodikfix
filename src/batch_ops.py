@@ -40,6 +40,148 @@ from .robustness import graph_resistance_summary
 ProgressCb = Callable[[int, int, str], None]
 
 
+def _norm_meta_token(value) -> str:
+    """Normalize IDs/group labels for tolerant metadata matching."""
+    if value is None:
+        return ""
+    txt = str(value).strip()
+    if not txt or txt.lower() in {"nan", "none", "null"}:
+        return ""
+    txt = Path(txt).name
+    txt = txt.rsplit(".", 1)[0]
+    txt = re.sub(r"[^A-Za-z0-9]+", "", txt).lower()
+    return txt
+
+
+def _split_csv_tokens(value: str) -> list[str]:
+    """Split comma-separated UI values while ignoring empty chunks."""
+    return [tok.strip() for tok in str(value or "").split(",") if tok.strip()]
+
+
+def _auto_pick_column(columns: list[str], preferred: list[str]) -> str | None:
+    """Find the best matching column by exact then substring match."""
+    normalized = {str(col).strip().lower(): col for col in columns}
+    for cand in preferred:
+        if cand in normalized:
+            return normalized[cand]
+    for col in columns:
+        norm = str(col).strip().lower()
+        for cand in preferred:
+            if cand in norm:
+                return col
+    return None
+
+
+def _load_batch_metadata(
+    meta_path: str | Path | None,
+    *,
+    id_col: str = "",
+    group_col: str = "",
+) -> tuple[pd.DataFrame | None, dict[str, str]]:
+    """Load metadata CSV/XLSX and infer subject/group columns when possible."""
+    if not str(meta_path or "").strip():
+        return None, {}
+
+    path = Path(str(meta_path)).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Metadata file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        meta = pd.read_excel(path)
+    else:
+        meta = pd.read_csv(path)
+
+    if meta.empty:
+        raise ValueError(f"Metadata file is empty: {path}")
+
+    meta = meta.copy()
+    meta.columns = [str(col) for col in meta.columns]
+
+    id_col_resolved = str(id_col or "").strip() or _auto_pick_column(
+        list(meta.columns),
+        [
+            "subject_id",
+            "subject",
+            "subjectname",
+            "subject_name",
+            "participant_id",
+            "participant",
+            "filename",
+            "file",
+            "name",
+            "id",
+            "sz",
+            "hc",
+            "control_id",
+            "patient_id",
+        ],
+    )
+    if not id_col_resolved or id_col_resolved not in meta.columns:
+        raise ValueError("Could not infer metadata subject-id column. Set metadata_id_col explicitly.")
+
+    group_col_resolved = str(group_col or "").strip() or _auto_pick_column(
+        list(meta.columns),
+        ["group", "label", "class", "cohort", "diagnosis", "diag", "dx", "status"],
+    )
+    if not group_col_resolved or group_col_resolved not in meta.columns:
+        raise ValueError("Could not infer metadata group column. Set metadata_group_col explicitly.")
+
+    meta["__meta_subject_key"] = meta[id_col_resolved].map(_norm_meta_token)
+    meta["__meta_group_key"] = meta[group_col_resolved].map(_norm_meta_token)
+    meta = meta[meta["__meta_subject_key"] != ""].copy()
+    meta = meta.drop_duplicates(subset=["__meta_subject_key"], keep="first")
+
+    return meta, {
+        "meta_path": str(path),
+        "id_col": str(id_col_resolved),
+        "group_col": str(group_col_resolved),
+    }
+
+
+def _match_job_metadata(job: dict, meta_df: pd.DataFrame | None) -> dict:
+    """Match one batch job against metadata row using tolerant subject/file keys."""
+    if meta_df is None or meta_df.empty:
+        return {}
+
+    path = Path(job.get("path", ""))
+    candidates = [
+        job.get("subject_name", ""),
+        path.stem,
+        path.name,
+        job.get("relative_input", ""),
+        job.get("input", ""),
+    ]
+
+    seen = set()
+    for raw in candidates:
+        key = _norm_meta_token(raw)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        matched = meta_df.loc[meta_df["__meta_subject_key"] == key]
+        if not matched.empty:
+            row = matched.iloc[0].to_dict()
+            row["__matched_meta_key"] = key
+            return row
+    return {}
+
+
+def _healthy_values_set(raw: str | None) -> set[str]:
+    """Normalize configured healthy tokens into a comparable set."""
+    tokens = set(_split_csv_tokens(str(raw or "healthy,control,hc,0,false")))
+    return {_norm_meta_token(tok) for tok in tokens if _norm_meta_token(tok)}
+
+
+def _job_is_healthy(meta_row: dict, healthy_values: set[str], *, group_col: str) -> bool | None:
+    """Return health flag when metadata group is present, else ``None``."""
+    if not meta_row or not group_col:
+        return None
+    if group_col not in meta_row:
+        return None
+    return _norm_meta_token(meta_row.get(group_col, "")) in healthy_values
+
+
 def _run_info_txt(out_dir: Path) -> Path:
     """Return path to a human-readable run info file."""
     return Path(out_dir) / "RUN_INFO.txt"
@@ -1043,6 +1185,11 @@ def build_ui_args(**kwargs):
         selected_files=None,
         batch_chunk_size=10,
         write_full_bundle=False,
+        metadata_path="",
+        metadata_id_col="",
+        metadata_group_col="",
+        healthy_group_values="healthy,control,hc,0,false",
+        attack_only_healthy=False,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -1231,6 +1378,13 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
     if manifest_csv.exists():
         manifest_csv.unlink()
     _append_progress_log(out_dir, f"START attack total={total}")
+    meta_df, meta_info = _load_batch_metadata(
+        getattr(args, "metadata_path", ""),
+        id_col=str(getattr(args, "metadata_id_col", "") or ""),
+        group_col=str(getattr(args, "metadata_group_col", "") or ""),
+    )
+    healthy_values = _healthy_values_set(getattr(args, "healthy_group_values", ""))
+    meta_group_col = str(meta_info.get("group_col", ""))
 
     for idx, job in enumerate(_iter_jobs_stream(files, args, input_dir=input_dir), start=1):
         path = Path(job["path"])
@@ -1240,6 +1394,66 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
             progress_cb(idx - 1, total, f"attack :: {label}")
         item_suffix = f"__{safe_stem(job['subject_name'])}" if job.get("subject_name") else ""
         item_name = f"{idx:04d}__{safe_stem(path.stem)}{item_suffix}"
+
+        meta_row = _match_job_metadata(job, meta_df)
+        healthy_flag = _job_is_healthy(meta_row, healthy_values, group_col=meta_group_col)
+        meta_export = {k: v for k, v in meta_row.items() if not str(k).startswith("__")}
+
+        if bool(getattr(args, "attack_only_healthy", False)) and healthy_flag is not True:
+            group_value = meta_export.get(meta_group_col, "") if meta_group_col else ""
+            reason = "metadata_missing" if not meta_export else f"non_healthy:{group_value}"
+
+            row = {
+                "mode": "attack",
+                "batch_index": idx,
+                "input": str(path),
+                "input_file": path.name,
+                "input_stem": path.stem,
+                "input_suffix": path.suffix.lower(),
+                "relative_input": str(job["relative_input"]),
+                "subject_name": str(job.get("subject_name") or ""),
+                "subject_index": job.get("subject_index"),
+                "family": str(args.family),
+                "kind": str(args.kind),
+                "status": "skipped_non_healthy",
+                "error": reason,
+                "metadata_matched": bool(meta_export),
+                "metadata_match_key": meta_row.get("__matched_meta_key", "") if meta_row else "",
+                "metadata_group_value": group_value,
+                **meta_export,
+            }
+            manifest_item = {
+                **_base_manifest_row(job, idx, "attack"),
+                "status": "skipped_non_healthy",
+                "error": reason,
+                "xlsx_path": "",
+                "json_path": "",
+                "history_csv_path": "",
+            }
+
+            _append_row_csv(summary_csv, row)
+            _append_row_csv(manifest_csv, manifest_item)
+            rows_chunk.append(row)
+            manifest_chunk.append(manifest_item)
+            _append_progress_log(out_dir, f"[{idx}/{total}] SKIP non-healthy :: {label} :: {reason}")
+
+            del row, manifest_item
+            _gc_collect()
+
+            if chunk_size and len(rows_chunk) >= chunk_size:
+                chunk_idx += 1
+                _flush_chunk_tables(
+                    out_dir,
+                    mode_name="attack",
+                    chunk_idx=chunk_idx,
+                    rows_chunk=rows_chunk,
+                    manifest_chunk=manifest_chunk,
+                )
+                rows_chunk = []
+                manifest_chunk = []
+
+            continue
+
         done, resolved_paths = _item_already_done("attack", out_dir=out_dir, item_name=item_name)
         if bool(getattr(args, "skip_existing", True)) and done:
             row, manifest_item = _skipped_existing_row(
@@ -1303,6 +1517,10 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "xlsx_path": xlsx_abs,
                 "status": "ok",
                 "error": "",
+                "metadata_matched": bool(meta_export),
+                "metadata_match_key": meta_row.get("__matched_meta_key", "") if meta_row else "",
+                "metadata_group_value": meta_export.get(meta_group_col, "") if meta_group_col else "",
+                **meta_export,
                 **payload.get("summary", {}),
                 **{f"final__{k}": v for k, v in payload.get("final_row", {}).items()},
             }
@@ -1329,6 +1547,10 @@ def run_batch_attack(args, *, progress_cb: ProgressCb | None = None) -> tuple[Pa
                 "kind": str(args.kind),
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
+                "metadata_matched": bool(meta_export),
+                "metadata_match_key": meta_row.get("__matched_meta_key", "") if meta_row else "",
+                "metadata_group_value": meta_export.get(meta_group_col, "") if meta_group_col else "",
+                **meta_export,
             }
             manifest_item = {
                 **_base_manifest_row(job, idx, "attack"),
