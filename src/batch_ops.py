@@ -72,6 +72,90 @@ def _auto_pick_column(columns: list[str], preferred: list[str]) -> str | None:
     return None
 
 
+def _looks_like_subject_id_series(series: pd.Series) -> bool:
+    """Heuristic for subject-id columns in messy metadata exports."""
+    s = series.dropna().astype(str).map(str.strip)
+    s = s[s != ""]
+    if s.empty:
+        return False
+    unique_ratio = float(s.nunique()) / max(1.0, float(len(s)))
+    has_letters_ratio = float(s.str.contains(r"[A-Za-z]", regex=True).mean())
+    avg_len = float(s.str.len().mean())
+    return unique_ratio >= 0.90 and has_letters_ratio >= 0.60 and avg_len >= 4.0
+
+
+def _looks_like_binary_group_series(series: pd.Series) -> bool:
+    """Heuristic for binary diagnosis/group columns (0/1, true/false, hc/sz, etc.)."""
+    s = series.dropna().astype(str).map(_norm_meta_token)
+    s = s[s != ""]
+    if s.empty:
+        return False
+    uniq = set(s.unique().tolist())
+    allowed = {
+        "0", "1", "true", "false", "yes", "no",
+        "healthy", "control", "hc", "norm", "normal",
+        "sz", "schizo", "schizophrenia", "patient", "case",
+    }
+    return len(uniq) <= 4 and uniq.issubset(allowed)
+
+
+def _infer_metadata_id_col(meta: pd.DataFrame) -> str | None:
+    """Infer subject-id column, including unnamed first columns from CSV exports."""
+    columns = list(meta.columns)
+    picked = _auto_pick_column(
+        columns,
+        [
+            "subject_id",
+            "subject",
+            "subjectname",
+            "subject_name",
+            "participant_id",
+            "participant",
+            "filename",
+            "file",
+            "name",
+            "id",
+            "control_id",
+            "patient_id",
+        ],
+    )
+    if picked:
+        return picked
+
+    unnamed_candidates = [
+        col for col in columns
+        if not str(col).strip() or str(col).strip().lower().startswith("unnamed")
+    ]
+    for col in unnamed_candidates:
+        if _looks_like_subject_id_series(meta[col]):
+            return col
+
+    for col in columns:
+        if _looks_like_subject_id_series(meta[col]):
+            return col
+    return None
+
+
+def _infer_metadata_group_col(meta: pd.DataFrame, *, exclude: str = "") -> str | None:
+    """Infer diagnosis/group column, including common binary SZ/HC encodings."""
+    columns = [col for col in meta.columns if str(col) != str(exclude)]
+    picked = _auto_pick_column(
+        columns,
+        [
+            "group", "label", "class", "cohort", "diagnosis", "diag", "dx", "status",
+            "sz", "schizo", "schizophrenia", "hc", "healthy", "control", "patient", "case",
+            "is_sz", "is_hc", "is_patient", "is_control",
+        ],
+    )
+    if picked:
+        return picked
+
+    for col in columns:
+        if _looks_like_binary_group_series(meta[col]):
+            return col
+    return None
+
+
 def _load_batch_metadata(
     meta_path: str | Path | None,
     *,
@@ -98,32 +182,11 @@ def _load_batch_metadata(
     meta = meta.copy()
     meta.columns = [str(col) for col in meta.columns]
 
-    id_col_resolved = str(id_col or "").strip() or _auto_pick_column(
-        list(meta.columns),
-        [
-            "subject_id",
-            "subject",
-            "subjectname",
-            "subject_name",
-            "participant_id",
-            "participant",
-            "filename",
-            "file",
-            "name",
-            "id",
-            "sz",
-            "hc",
-            "control_id",
-            "patient_id",
-        ],
-    )
+    id_col_resolved = str(id_col or "").strip() or _infer_metadata_id_col(meta)
     if not id_col_resolved or id_col_resolved not in meta.columns:
         raise ValueError("Could not infer metadata subject-id column. Set metadata_id_col explicitly.")
 
-    group_col_resolved = str(group_col or "").strip() or _auto_pick_column(
-        list(meta.columns),
-        ["group", "label", "class", "cohort", "diagnosis", "diag", "dx", "status"],
-    )
+    group_col_resolved = str(group_col or "").strip() or _infer_metadata_group_col(meta, exclude=str(id_col_resolved))
     if not group_col_resolved or group_col_resolved not in meta.columns:
         raise ValueError("Could not infer metadata group column. Set metadata_group_col explicitly.")
 

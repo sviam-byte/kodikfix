@@ -34,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if mode == "ui":
         extra = argv[1:]
+        if extra and extra[0] == "--":
+            extra = extra[1:]
         # Stable defaults for local/dev containers; caller can still override via extra args.
         default_flags = [
             "--server.headless=true",

@@ -28,7 +28,7 @@ set "DEFAULT_ACTIVE_TAB=🧬 HC→SZ"
 echo [STEP] Starting Phenotype UI on http://127.0.0.1:%PORT% ...
 start "" "http://127.0.0.1:%PORT%"
 
-"%PYTHON_EXE%" run_local.py ui -- --server.port=%PORT% 1>logs\phenotype_ui_stdout.log 2>logs\phenotype_ui_stderr.log
+"%PYTHON_EXE%" run_local.py ui --server.port=%PORT% 1>logs\phenotype_ui_stdout.log 2>logs\phenotype_ui_stderr.log
 if errorlevel 1 (
     echo.
     echo [ERROR] Phenotype UI failed to start.
