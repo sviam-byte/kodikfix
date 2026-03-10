@@ -2,6 +2,10 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
+rem Optional flag for caller scripts: skip final pause in non-interactive flows.
+set "NO_PAUSE="
+if /I "%~1"=="--no-pause" set "NO_PAUSE=1"
+
 rem Detect a working Python bootstrap command (prefer py -3, then python, then python3).
 set "BOOTSTRAP_CMD="
 
@@ -30,7 +34,7 @@ if not defined BOOTSTRAP_CMD (
 if not defined BOOTSTRAP_CMD (
     echo [ERROR] Working Python interpreter not found in PATH.
     echo [HINT] Install official Python from python.org and make sure pip is available.
-    pause
+    if not defined NO_PAUSE pause
     exit /b 1
 )
 
@@ -39,9 +43,9 @@ echo [INFO] Bootstrap interpreter: %BOOTSTRAP_CMD%
 if errorlevel 1 (
     echo.
     echo [ERROR] Environment setup failed.
-    pause
+    if not defined NO_PAUSE pause
     exit /b 1
 )
 
-pause
+if not defined NO_PAUSE pause
 endlocal

@@ -6,6 +6,7 @@ portable while setup logic remains testable and easier to maintain.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 VENV_DIR = ROOT / ".venv"
 REQ_FILE = ROOT / "requirements.txt"
+STATE_FILE = VENV_DIR / ".bootstrap_state"
 
 
 def _run(cmd: list[str], *, check: bool = True) -> int:
@@ -130,8 +132,42 @@ def ensure_venv() -> Path:
     )
 
 
-def install_requirements(py: Path) -> None:
-    """Upgrade packaging tooling and install project requirements if present."""
+def _requirements_fingerprint() -> str:
+    """Return a deterministic requirements.txt fingerprint for cache checks."""
+    if not REQ_FILE.exists():
+        return "no-requirements"
+    return hashlib.sha256(REQ_FILE.read_bytes()).hexdigest()
+
+
+def _current_state(py: Path) -> str:
+    """Build a state token that captures interpreter + dependency inputs."""
+    return f"python={py.resolve()}|req={_requirements_fingerprint()}"
+
+
+def _installed_state() -> str | None:
+    """Read the last successful dependency installation state token."""
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return STATE_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _write_state(state: str) -> None:
+    """Persist the dependency installation state after successful pip steps."""
+    STATE_FILE.write_text(state + "\n", encoding="utf-8")
+
+
+def install_requirements(py: Path, *, force: bool = False) -> None:
+    """Install dependencies only when environment inputs changed."""
+    state = _current_state(py)
+    installed_state = _installed_state()
+
+    if not force and installed_state == state:
+        print("[INFO] Existing environment matches requirements, skipping pip install.", flush=True)
+        return
+
     print("[STEP] Upgrading pip/setuptools/wheel...", flush=True)
     _run([str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
 
@@ -140,6 +176,8 @@ def install_requirements(py: Path) -> None:
         _run([str(py), "-m", "pip", "install", "-r", str(REQ_FILE)])
     else:
         print("[WARN] requirements.txt not found, skipping install.", flush=True)
+
+    _write_state(state)
 
 
 def main() -> int:

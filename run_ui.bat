@@ -7,7 +7,7 @@ rem Default UI port changed from 8501 to 8502 to avoid common Streamlit conflict
 if not defined PORT set "PORT=8502"
 
 if not exist ".venv\Scripts\python.exe" if not exist ".venv\bin\python" (
-    call setup_env.bat
+    call setup_env.bat --no-pause
     if errorlevel 1 exit /b 1
 )
 
