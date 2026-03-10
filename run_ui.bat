@@ -3,7 +3,8 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "PORT=%~1"
-if not defined PORT set "PORT=8501"
+rem Default UI port changed from 8501 to 8502 to avoid common Streamlit conflicts.
+if not defined PORT set "PORT=8502"
 
 if not exist ".venv\Scripts\python.exe" if not exist ".venv\bin\python" (
     call setup_env.bat

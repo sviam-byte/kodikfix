@@ -4,7 +4,8 @@ cd /d "%~dp0"
 
 rem One-step local startup: setup venv + run UI.
 set "PORT=%~1"
-if not defined PORT set "PORT=8501"
+rem Keep default in sync with run_ui.bat.
+if not defined PORT set "PORT=8502"
 
 call setup_env.bat
 if errorlevel 1 exit /b 1
