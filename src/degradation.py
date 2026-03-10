@@ -294,7 +294,7 @@ def _run_noise_trajectory(
         H = _rebuild_graph_from_ranked_edges(H0, ranked, keep_k=keep_k)
         if keep_all_edges:
             # In pure-noise mode we keep topology fixed and only perturb weights.
-            for u, v, d, noisy in ranked:
+            for u, v, _d, noisy in ranked:
                 if H.has_edge(u, v):
                     H[u][v]["weight"] = float(noisy)
 
