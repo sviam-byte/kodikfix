@@ -343,12 +343,12 @@ def _pm_write_json(path: Path, payload: dict) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _pm_load_run_result(run_dir: Path) -> dict:
+def _pm_load_run_result(run_dir: Path, *, include_trajectory: bool = True) -> dict:
     """Load aggregate run artifacts into phenotype-matching result structure."""
     agg = run_dir / "aggregate"
     subject_df = _pm_read_csv_if_exists(agg / "subject_results.csv")
     winners_df = _pm_read_csv_if_exists(agg / "winner_results.csv")
-    traj_df = _pm_read_csv_if_exists(agg / "trajectory_results.csv")
+    traj_df = _pm_read_csv_if_exists(agg / "trajectory_results.csv") if include_trajectory else pd.DataFrame()
     scalar_subject_df = _pm_read_csv_if_exists(agg / "scalar_subject_results.csv")
     scalar_winners_df = _pm_read_csv_if_exists(agg / "scalar_winners.csv")
     scalar_summary_df = _pm_read_csv_if_exists(agg / "scalar_summary.csv")
@@ -374,6 +374,42 @@ def _pm_load_run_result(run_dir: Path) -> dict:
         "metric_families": dict(cfg.get("metric_families", {}) or {}),
         "distance_mode": str(cfg.get("distance_mode", "raw")),
     }
+
+
+def _pm_finalize_scalar_aggregates(run_dir: Path, *, metrics: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Recompute run-level scalar winners/summary from aggregate scalar_subject_results."""
+    agg = run_dir / "aggregate"
+    scalar_subject_df = build_scalar_subject_results(
+        _pm_read_csv_if_exists(agg / "scalar_subject_results.csv"),
+        metrics=metrics,
+    )
+    scalar_winners_df = build_scalar_winners(scalar_subject_df)
+    scalar_summary_df = build_scalar_summary(scalar_subject_df, scalar_winners_df)
+
+    for path, df in [
+        (agg / "scalar_winners.csv", scalar_winners_df),
+        (agg / "scalar_summary.csv", scalar_summary_df),
+    ]:
+        if path.exists():
+            path.unlink()
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df.to_csv(path, index=False)
+
+    return scalar_winners_df, scalar_summary_df
+
+
+def _pm_write_run_location_note(run_dir: Path) -> None:
+    """Write a tiny human-readable note with absolute save path."""
+    note = textwrap.dedent(
+        f"""\
+        Phenotype matching run
+        run_dir: {run_dir}
+        aggregate_dir: {run_dir / 'aggregate'}
+        per_subject_dir: {run_dir / 'per_subject'}
+        written_at: {time.strftime('%Y-%m-%d %H:%M:%S')}
+        """
+    ).strip() + "\n"
+    (run_dir / "SAVE_LOCATION.txt").write_text(note, encoding="utf-8")
 
 
 def _pm_save_run_inputs(
@@ -436,6 +472,8 @@ def _pm_stream_subject(
     subject_meta: dict | None = None,
     timeout_seconds: float = 0.0,
     progress_cb=None,
+    export_subject_excel: bool = False,
+    include_subject_trajectory_in_return: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Process one subject in streaming mode and persist intermediate outputs."""
     sdir = _pm_subject_dir(run_dir, subject_id)
@@ -641,27 +679,23 @@ def _pm_stream_subject(
             _pm_append_csv(run_dir / "aggregate" / "winner_results.csv", winner_row)
 
     scalar_subject_df = build_scalar_subject_results(pd.DataFrame(scalar_rows), metrics=metric_list)
-    scalar_winners_df = build_scalar_winners(scalar_subject_df)
-    scalar_summary_df = build_scalar_summary(scalar_subject_df, scalar_winners_df)
-
-    _pm_append_csv(run_dir / "aggregate" / "scalar_winners.csv", scalar_winners_df)
-    _pm_append_csv(run_dir / "aggregate" / "scalar_summary.csv", scalar_summary_df)
-
-    result = {
-        "target_vector": target_vector,
-        "scales": scales,
-        "subject_results": subject_df,
-        "winner_results": pd.DataFrame(winner_rows),
-        "trajectory_results": _pm_read_csv_if_exists(traj_path),
-        "scalar_subject_results": scalar_subject_df,
-        "scalar_winners": scalar_winners_df,
-        "scalar_summary": scalar_summary_df,
-        "metrics_used": metric_list,
-        "metric_families": normalized_families,
-        "distance_mode": "raw",
-    }
-
-    export_phenotype_match_excel(result, sdir / "subject_bundle.xlsx")
+    if bool(export_subject_excel):
+        scalar_winners_df = build_scalar_winners(scalar_subject_df)
+        scalar_summary_df = build_scalar_summary(scalar_subject_df, scalar_winners_df)
+        result = {
+            "target_vector": target_vector,
+            "scales": scales,
+            "subject_results": subject_df,
+            "winner_results": pd.DataFrame(winner_rows),
+            "trajectory_results": _pm_read_csv_if_exists(traj_path),
+            "scalar_subject_results": scalar_subject_df,
+            "scalar_winners": scalar_winners_df,
+            "scalar_summary": scalar_summary_df,
+            "metrics_used": metric_list,
+            "metric_families": normalized_families,
+            "distance_mode": "raw",
+        }
+        export_phenotype_match_excel(result, sdir / "subject_bundle.xlsx")
 
     _pm_write_json(
         sdir / "done.json",
@@ -677,7 +711,7 @@ def _pm_stream_subject(
         subject_df,
         pd.DataFrame(winner_rows),
         scalar_subject_df,
-        _pm_read_csv_if_exists(traj_path),
+        _pm_read_csv_if_exists(traj_path) if bool(include_subject_trajectory_in_return) else pd.DataFrame(),
     )
 
 
@@ -1150,6 +1184,24 @@ def render_phenotype_matching_tab(
                 index=0,
                 key="pm_removal_mode",
             )
+            pm_strict_streaming = st.checkbox(
+                "Жёсткая потоковость (без автозагрузки trajectory в UI)",
+                value=True,
+                key="pm_strict_streaming",
+                help="Быстрее и стабильнее на больших run: UI не перечитывает trajectory целиком после завершения.",
+            )
+            pm_export_subject_xlsx = st.checkbox(
+                "Экспортировать subject_bundle.xlsx для каждого HC",
+                value=False,
+                key="pm_export_subject_xlsx",
+                help="Замедляет run, потому что в конце каждого HC приходится перечитывать trajectory и собирать Excel.",
+            )
+            pm_export_run_xlsx = st.checkbox(
+                "Экспортировать общий run_bundle.xlsx",
+                value=False,
+                key="pm_export_run_xlsx",
+                help="Полезно для отчёта, но это не потоковая операция и может тормозить на больших trajectory.",
+            )
 
         pm_meta = None
         pm_meta_info = {}
@@ -1284,6 +1336,7 @@ def render_phenotype_matching_tab(
                 run_dir = out_root / run_name
                 (run_dir / "aggregate").mkdir(parents=True, exist_ok=True)
                 (run_dir / "per_subject").mkdir(parents=True, exist_ok=True)
+                _pm_write_run_location_note(run_dir)
                 st.session_state["last_degmatch_run_dir"] = str(run_dir)
 
                 _pm_save_run_inputs(
@@ -1442,6 +1495,8 @@ def render_phenotype_matching_tab(
                             subject_meta=subject_meta,
                             timeout_seconds=float(pm_timeout_per_subject or 0),
                             progress_cb=_ui_progress,
+                            export_subject_excel=bool(pm_export_subject_xlsx),
+                            include_subject_trajectory_in_return=False,
                         )
 
                         elapsed = float(time.perf_counter() - t0)
@@ -1505,11 +1560,19 @@ def render_phenotype_matching_tab(
                         },
                     )
 
-                pm_res = _pm_load_run_result(run_dir)
-                try:
-                    export_phenotype_match_excel(pm_res, run_dir / "aggregate" / "run_bundle.xlsx")
-                except Exception as exc:
-                    logger.warning("Failed to export aggregate phenotype workbook: %s", exc)
+                _pm_finalize_scalar_aggregates(run_dir, metrics=metric_list)
+                pm_res = _pm_load_run_result(
+                    run_dir,
+                    include_trajectory=not bool(pm_strict_streaming),
+                )
+                if bool(pm_export_run_xlsx):
+                    try:
+                        export_phenotype_match_excel(
+                            _pm_load_run_result(run_dir, include_trajectory=True),
+                            run_dir / "aggregate" / "run_bundle.xlsx",
+                        )
+                    except Exception as exc:
+                        logger.warning("Failed to export aggregate phenotype workbook: %s", exc)
                 _pm_write_progress_snapshot(
                     run_dir,
                     {
@@ -1523,6 +1586,7 @@ def render_phenotype_matching_tab(
                 st.session_state["last_degmatch_result"] = pm_res
                 st.session_state["last_degmatch_run_dir"] = str(run_dir)
                 st.success(f"Готово. Результаты сохранены в: {run_dir}")
+                st.info(f"Абсолютный путь записи: {run_dir}")
 
     with pm_col2:
         pm_res = st.session_state.get("last_degmatch_result")
