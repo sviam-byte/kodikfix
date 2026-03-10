@@ -328,8 +328,19 @@ def _compute_baseline_metrics_df(args, paths: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, pd.DataFrame]:
-    """Execute one attack experiment for an already constructed graph."""
+def _attack_payload_from_graph(
+    args,
+    graph,
+    *,
+    input_label: str,
+    progress_cb=None,
+    row_cb=None,
+) -> tuple[dict, pd.DataFrame]:
+    """Execute one attack experiment for an already constructed graph.
+
+    Optional callbacks are forwarded into attack engines to support live UI
+    progress and incremental row-level persistence in long-running batches.
+    """
     family = str(args.family)
 
     if family == "node":
@@ -342,6 +353,8 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             int(args.eff_k),
             compute_heavy_every=int(args.heavy_every),
             fast_mode=bool(args.fast_mode),
+            progress_cb=progress_cb,
+            row_cb=row_cb,
         )
 
     elif family == "edge":
@@ -355,6 +368,8 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             compute_heavy_every=int(args.heavy_every),
             compute_curvature=bool(args.compute_curvature),
             curvature_sample_edges=int(args.curvature_sample_edges),
+            progress_cb=progress_cb,
+            row_cb=row_cb,
         )
 
     elif family == "mix":
@@ -370,6 +385,8 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             swaps_per_edge=float(args.swaps_per_edge),
             replace_from=str(args.replace_from),
             fast_mode=bool(args.fast_mode),
+            progress_cb=progress_cb,
+            row_cb=row_cb,
         )
 
     elif family == "degradation":
@@ -389,6 +406,8 @@ def _attack_payload_from_graph(args, graph, *, input_label: str) -> tuple[dict, 
             module_resolution=float(args.module_resolution),
             removal_mode=str(args.removal_mode),
             fast_mode=bool(args.fast_mode),
+            progress_cb=progress_cb,
+            row_cb=row_cb,
         )
 
     else:

@@ -1070,6 +1070,8 @@ def _run_research_workspace_plan(
     total = max(1, len(valid_graph_ids))
     bar = st.progress(0.0)
     msg = st.empty()
+    graph_bar = st.progress(0.0)
+    graph_msg = st.empty()
 
     if not valid_graph_ids:
         msg.caption("Нет доступных графов для расчёта")
@@ -1108,6 +1110,42 @@ def _run_research_workspace_plan(
             bar.progress(idx / total)
             continue
         msg.caption(f"[{idx}/{total}] {entry.name}")
+        graph_bar.progress(0.0)
+        graph_msg.caption(f"Текущий граф: {entry.name}")
+
+        enabled_stage_names = [
+            stage_name
+            for stage_name, enabled in [
+                ("metrics", any(flags.get(k, False) for k in [
+                    "basic", "efficiency", "spectral",
+                    "clustering", "assortativity",
+                    "entropy", "curvature"
+                ])),
+                ("resistance", bool(flags.get("resistance", False))),
+                ("attack", bool(flags.get("attack", False))),
+                ("energy", bool(flags.get("energy", False))),
+            ]
+            if enabled
+        ]
+        stage_count = max(1, len(enabled_stage_names))
+
+        def _graph_stage_base(stage_name: str) -> float:
+            try:
+                pos = enabled_stage_names.index(stage_name)
+            except ValueError:
+                pos = 0
+            return float(pos) / float(stage_count)
+
+        def _set_graph_progress(stage_name: str, frac: float, detail: str = "") -> None:
+            """Update per-graph progress bar with stage-local fraction."""
+            base = _graph_stage_base(stage_name)
+            frac = min(1.0, max(0.0, float(frac)))
+            graph_bar.progress(min(1.0, base + frac / float(stage_count)))
+            suffix = f" — {detail}" if str(detail).strip() else ""
+            graph_msg.caption(
+                f"Текущий граф: {entry.name} · {stage_name} · {frac * 100:.0f}%{suffix}"
+            )
+
         graph_manifest = {
             "idx": int(idx),
             "graph_id": getattr(entry, "id", gid),
@@ -1201,6 +1239,7 @@ def _run_research_workspace_plan(
                 if keep_compact_results_in_memory:
                     results["research_metrics"].append(row)
                 per_graph_frames["research_metrics"] = pd.DataFrame([row])
+                _set_graph_progress("metrics", 1.0, "готово")
                 _check_timeout("after metrics+curvature")
 
             if flags.get("resistance", False):
@@ -1209,6 +1248,7 @@ def _run_research_workspace_plan(
                 if keep_compact_results_in_memory:
                     results["research_resistance"].append(row)
                 per_graph_frames["research_resistance"] = pd.DataFrame([row])
+                _set_graph_progress("resistance", 1.0, "готово")
                 _check_timeout("after resistance")
 
             if flags.get("attack", False):
@@ -1226,7 +1266,47 @@ def _run_research_workspace_plan(
                     curvature_max_support=int(curv_max_support),
                     n_jobs=1,
                 )
-                attack_payload, history = _attack_payload_from_graph(args_attack, graph, input_label=entry.name)
+                attack_history_stream_path = None
+                if run_dir is not None:
+                    attack_history_stream_path = _research_table_csv_path(run_dir, entry, "attack_history_stream")
+                    attack_history_stream_path.parent.mkdir(parents=True, exist_ok=True)
+                    if attack_history_stream_path.exists():
+                        attack_history_stream_path.unlink()
+
+                def _attack_inner_progress(i: int, total_steps: int, current_value=None) -> None:
+                    denom = max(1, int(total_steps))
+                    frac = float(i) / float(denom)
+                    detail = f"step {int(i)}/{int(total_steps)}"
+                    if current_value is not None:
+                        detail += f" · target={current_value}"
+                    _set_graph_progress("attack", frac, detail)
+                    _check_timeout("during attack")
+
+                def _attack_row_cb(row: dict, i: int, total_steps: int) -> None:
+                    if attack_history_stream_path is None:
+                        return
+                    row_out = dict(row)
+                    row_out.update({
+                        "graph_id": entry.id,
+                        "graph_name": entry.name,
+                        "source": entry.source,
+                        "family": attack_family,
+                        "kind": attack_kind,
+                        "step_idx": i,
+                        "step_total": total_steps,
+                    })
+                    _append_research_csv_rows(
+                        attack_history_stream_path,
+                        pd.DataFrame([row_out]),
+                    )
+
+                attack_payload, history = _attack_payload_from_graph(
+                    args_attack,
+                    graph,
+                    input_label=entry.name,
+                    progress_cb=_attack_inner_progress,
+                    row_cb=_attack_row_cb,
+                )
                 attack_row = attack_trajectory_summary(history, attack_kind=str(attack_kind))
                 attack_row.update({
                     "graph_id": entry.id,
@@ -1243,8 +1323,16 @@ def _run_research_workspace_plan(
                 if keep_compact_results_in_memory:
                     results["research_attacks"].append(attack_row)
                 per_graph_frames["research_attacks"] = pd.DataFrame([attack_row])
-                per_graph_extras[f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"] = history.to_csv(index=False).encode("utf-8")
+                if attack_history_stream_path is None:
+                    per_graph_extras[
+                        f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"
+                    ] = history.to_csv(index=False).encode("utf-8")
+                else:
+                    per_graph_extras[
+                        f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"
+                    ] = attack_history_stream_path.read_bytes()
                 per_graph_extras[f"attack_payloads/{entry.id}__{attack_family}__{attack_kind}.json"] = json.dumps(attack_payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+                _set_graph_progress("attack", 1.0, "готово")
                 _check_timeout("after attack")
 
             if flags.get("energy", False):
@@ -1290,6 +1378,7 @@ def _run_research_workspace_plan(
                 workbook_frames_local["energy_run_summary"] = pd.DataFrame([energy_run_summary])
                 # Free heavy intermediate objects to reduce peak memory in long runs.
                 del node_frames, edge_frames, energy_nodes_long, energy_edges_long, energy_steps_summary
+                _set_graph_progress("energy", 1.0, "готово")
                 gc.collect()
 
             graph_manifest["status"] = "done"
