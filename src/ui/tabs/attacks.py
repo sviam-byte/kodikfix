@@ -4,6 +4,7 @@ import textwrap
 import time
 import json
 import re
+import gc
 from pathlib import Path
 
 import networkx as nx
@@ -24,8 +25,19 @@ from src.config_loader import load_metrics_info
 from src.metrics import calculate_metrics
 from src.mix_frac_estimator import estimate_mix_frac_star
 from src.degradation import run_degradation_trajectory
-from src.phenotype_matching import compare_degradation_models
-from src.phenotype_reporting import build_paper_ready_summary
+from src.phenotype_matching import (
+    build_group_target_vector,
+    build_scale_vector,
+    find_best_match_to_target,
+    normalize_metric_families,
+)
+from src.phenotype_reporting import build_paper_ready_summary, export_phenotype_match_excel
+from src.phenotype_scalar import (
+    build_scalar_subject_results,
+    build_scalar_summary,
+    build_scalar_winners,
+    find_best_scalar_match,
+)
 from src.plotting import fig_metrics_over_steps, fig_compare_attacks
 from src.services.graph_service import GraphService
 from src.robustness import attack_trajectory_summary, graph_resistance_summary
@@ -259,6 +271,198 @@ def _metadata_match_candidates(entry: GraphEntry | None, gid: str) -> list[str]:
             _push(token)
 
     return out
+
+
+def _pm_safe_stem(name: str, fallback: str = "phenotype_match") -> str:
+    """Build a filesystem-safe stem for result files/folders."""
+    s = str(name or "").strip()
+    s = re.sub(r"[^\w\-.]+", "_", s, flags=re.UNICODE)
+    s = re.sub(r"_+", "_", s).strip("_.")
+    return s or fallback
+
+
+def _pm_append_csv(path: Path, df: pd.DataFrame) -> None:
+    """Append a dataframe to CSV, writing header only for a new file."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    df.to_csv(path, mode="a", header=not exists, index=False)
+
+
+def _pm_subject_done(per_subject_dir: Path, subject_id: str) -> bool:
+    """Check if per-subject workbook already exists for resumable runs."""
+    p = per_subject_dir / f"{_pm_safe_stem(subject_id)}.xlsx"
+    return p.exists()
+
+
+def _pm_build_single_subject_result(
+    *,
+    G: nx.Graph,
+    subject_id: str,
+    subject_idx: int,
+    attack_kinds: list[str],
+    metric_list: list[str],
+    target_vector: dict[str, float],
+    scales: dict[str, float],
+    normalized_families: dict[str, list[str]],
+    steps: int,
+    frac: float,
+    seed: int,
+    eff_sources_k: int,
+    compute_heavy_every: int,
+    compute_curvature: bool,
+    curvature_sample_edges: int,
+    noise_sigma_max: float,
+    keep_density_from_baseline: bool,
+    recompute_modules: bool,
+    module_resolution: float,
+    removal_mode: str,
+    fast_mode: bool,
+    subject_metadata_row: dict | None = None,
+    progress_cb=None,
+) -> dict:
+    """Compute phenotype matching for one HC graph and all chosen attacks.
+
+    The function isolates single-subject processing to support:
+    - immediate per-subject persistence,
+    - resumable execution,
+    - timeouts and error isolation.
+    """
+    subject_rows: list[dict] = []
+    all_traj: list[pd.DataFrame] = []
+    scalar_rows: list[dict] = []
+
+    G0 = nx.Graph(G)
+    module_info = None
+    if any(k in {"inter_module_removal", "intra_module_removal"} for k in attack_kinds):
+        from src.degradation import prepare_module_info
+
+        module_info = prepare_module_info(
+            G0,
+            seed=int(seed) + int(subject_idx),
+            resolution=float(module_resolution),
+        )
+
+    n_attacks = max(1, len(attack_kinds))
+    for attack_pos, kind in enumerate(attack_kinds, start=1):
+        if callable(progress_cb):
+            progress_cb(attack_pos - 1, n_attacks, f"{subject_id} · {kind}")
+
+        traj_df, _aux = run_degradation_trajectory(
+            G0,
+            kind=str(kind),
+            steps=int(steps),
+            frac=float(frac),
+            seed=int(seed) + int(subject_idx),
+            eff_sources_k=int(eff_sources_k),
+            compute_heavy_every=int(compute_heavy_every),
+            compute_curvature=bool(compute_curvature),
+            curvature_sample_edges=int(curvature_sample_edges),
+            metric_names=metric_list,
+            noise_sigma_max=float(noise_sigma_max),
+            keep_density_from_baseline=bool(keep_density_from_baseline),
+            module_info=module_info,
+            recompute_modules=bool(recompute_modules),
+            module_resolution=float(module_resolution),
+            removal_mode=str(removal_mode),
+            fast_mode=bool(fast_mode),
+        )
+
+        best = find_best_match_to_target(
+            traj_df,
+            target_vector=target_vector,
+            metrics=metric_list,
+            scales=scales,
+            distance_mode="raw",
+            metric_families=normalized_families,
+        )
+
+        scored = best["scored_trajectory"].copy()
+        scored["subject_idx"] = int(subject_idx)
+        scored["subject_id"] = str(subject_id)
+        scored["attack_kind"] = str(kind)
+        if subject_metadata_row:
+            for k, v in subject_metadata_row.items():
+                if k not in scored.columns:
+                    scored[k] = v
+        all_traj.append(scored)
+
+        best_row = best.get("best_row", {}) or {}
+        row = {
+            "subject_idx": int(subject_idx),
+            "subject_id": str(subject_id),
+            "attack_kind": str(kind),
+            "best_step": best["best_step"],
+            "best_damage_frac": float(best["best_damage_frac"]),
+            "best_distance": float(best["best_distance"]),
+            "n_used_metrics": int(best["n_used_metrics"]),
+            "distance_mode": str(best.get("distance_mode", "raw")),
+            "best_delta_density": float(best_row.get("delta_density", np.nan)),
+            "best_delta_total_weight": float(best_row.get("delta_total_weight", best_row.get("delta_E", np.nan))),
+            "best_delta_E": float(best_row.get("delta_E", np.nan)),
+            "best_removed_edge_fraction_from_baseline": float(best_row.get("removed_edge_fraction_from_baseline", np.nan)),
+        }
+        if subject_metadata_row:
+            row.update(subject_metadata_row)
+        subject_rows.append(row)
+
+        scalar_best = find_best_scalar_match(
+            traj_df,
+            target_vector=target_vector,
+            metrics=metric_list,
+            scales=scales,
+            absolute=True,
+        )
+        for m in metric_list:
+            info = scalar_best.get(m, {})
+            srow = {
+                "subject_idx": int(subject_idx),
+                "subject_id": str(subject_id),
+                "attack_kind": str(kind),
+                "metric": str(m),
+                "metric_family": next((fam for fam, fam_metrics in normalized_families.items() if m in fam_metrics), "singleton"),
+                "best_step": info.get("best_step", None),
+                "best_damage_frac": float(info.get("best_damage_frac", np.nan)),
+                "best_scalar_error": float(info.get("best_scalar_error", np.nan)),
+                "best_value": float(info.get("best_value", np.nan)),
+            }
+            if subject_metadata_row:
+                srow.update(subject_metadata_row)
+            scalar_rows.append(srow)
+
+        if callable(progress_cb):
+            progress_cb(attack_pos, n_attacks, f"{subject_id} · {kind}")
+
+    subject_df = pd.DataFrame(subject_rows)
+    traj_df = pd.concat(all_traj, ignore_index=True) if all_traj else pd.DataFrame()
+    scalar_subject_df = build_scalar_subject_results(pd.DataFrame(scalar_rows), metrics=metric_list)
+    scalar_winners_df = build_scalar_winners(scalar_subject_df)
+    scalar_summary_df = build_scalar_summary(scalar_subject_df, scalar_winners_df)
+
+    winners = []
+    if not subject_df.empty:
+        valid = subject_df[np.isfinite(pd.to_numeric(subject_df["best_distance"], errors="coerce"))].copy()
+        if not valid.empty:
+            idx = int(valid["best_distance"].astype(float).idxmin())
+            wr = valid.loc[idx].to_dict()
+            wr["is_subject_winner"] = True
+            winners.append(wr)
+    winners_df = pd.DataFrame(winners)
+
+    return {
+        "target_vector": dict(target_vector),
+        "scales": dict(scales),
+        "subject_results": subject_df,
+        "winner_results": winners_df,
+        "trajectory_results": traj_df,
+        "scalar_subject_results": scalar_subject_df,
+        "scalar_winners": scalar_winners_df,
+        "scalar_summary": scalar_summary_df,
+        "metrics_used": list(metric_list),
+        "metric_families": dict(normalized_families),
+        "distance_mode": "raw",
+    }
 
 
 def _match_workspace_graphs_to_metadata(
@@ -622,6 +826,39 @@ def render_phenotype_matching_tab(
             key="pm_hc_base_file",
         )
 
+        st.markdown("#### Вывод и контроль выполнения")
+        pm_out_dir = st.text_input(
+            "Папка вывода",
+            value=str(st.session_state.get("pm_out_dir", "phenotype_runs")),
+            key="pm_out_dir",
+            help="Локальная папка Streamlit-процесса для run-артефактов.",
+        )
+        pm_run_label = st.text_input(
+            "Название run",
+            value=str(st.session_state.get("pm_run_label", f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")),
+            key="pm_run_label",
+        )
+        pm_skip_done = st.checkbox(
+            "Проверять, сделано ли уже",
+            value=True,
+            key="pm_skip_done",
+            help="Пропускает HC, для которых уже есть per_subject/<subject>.xlsx.",
+        )
+        pm_start_index = st.number_input(
+            "Начать с HC-индекса",
+            min_value=0,
+            value=int(st.session_state.get("pm_start_index", 0)),
+            step=1,
+            key="pm_start_index",
+        )
+        pm_timeout_per_subject = st.number_input(
+            "Лимит времени на один HC-граф (сек, 0 = без лимита)",
+            min_value=0,
+            value=int(st.session_state.get("pm_timeout_per_subject", 0)),
+            step=10,
+            key="pm_timeout_per_subject",
+        )
+
         pm_attack_kinds = st.multiselect(
             "Модели деградации",
             options=DEGRADATION_KIND_OPTIONS,
@@ -746,16 +983,6 @@ def render_phenotype_matching_tab(
                         st.error("Не найдено HC-графов: ни по metadata, ни вручную.")
                         st.stop()
 
-                    hc_graphs = [
-                        _build_current_graph_for_entry(
-                            graphs[gid],
-                            min_conf=float(min_conf),
-                            min_weight=float(min_weight),
-                            analysis_mode=str(analysis_mode),
-                        )
-                        for gid in hc_gids_effective
-                    ]
-
                     if use_metadata_mode:
                         sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
                             sz_gids_effective,
@@ -787,60 +1014,245 @@ def render_phenotype_matching_tab(
                             compute_curvature=bool(pm_compute_curv),
                         )
 
-                    subject_ids = []
-                    subject_meta_rows = []
+                    target_vector = build_group_target_vector(sz_group_metrics_df, metrics=pm_metrics)
+                    scales = build_scale_vector(hc_baseline_metrics_df, metrics=pm_metrics)
+                    normalized_families = normalize_metric_families(pm_metrics, None)
+
+                    out_root = Path(str(pm_out_dir or "phenotype_runs")).expanduser()
+                    run_name = _pm_safe_stem(str(pm_run_label or "") or f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")
+                    run_dir = out_root / run_name
+                    per_subject_dir = run_dir / "per_subject"
+                    aggregate_dir = run_dir / "aggregate"
+                    per_subject_dir.mkdir(parents=True, exist_ok=True)
+                    aggregate_dir.mkdir(parents=True, exist_ok=True)
+
+                    overall_bar = st.progress(0.0)
+                    subject_bar = st.progress(0.0)
+                    status_box = st.empty()
+
+                    manifest_rows = []
+                    all_winners = []
+                    all_subject = []
+                    all_traj = []
+                    all_scalar_subject = []
+                    all_scalar_winners = []
+                    all_scalar_summary = []
+
+                    hc_meta_lookup = {}
                     if use_metadata_mode:
                         hc_meta_df = pm_match.get("hc_meta_df", pd.DataFrame()).copy()
-                        for gid in hc_gids_effective:
-                            sub = hc_meta_df.loc[hc_meta_df["graph_id"] == gid]
-                            if sub.empty:
-                                subject_id = str(gid)
-                                group_value = ""
-                            else:
-                                row = sub.iloc[0]
-                                subject_id = str(row.get("subject_id", gid))
-                                group_value = row.get("group_value_raw", "")
-                            subject_ids.append(subject_id)
-                            subject_meta_rows.append(
-                                {
+                        for _, row in hc_meta_df.iterrows():
+                            graph_id = str(row.get("graph_id", ""))
+                            hc_meta_lookup[graph_id] = {
+                                "subject_id": str(row.get("subject_id", graph_id)),
+                                "graph_id": graph_id,
+                                "graph_name": str(graphs[graph_id].name) if graph_id in graphs else "",
+                                "group_value": row.get("group_value_raw", ""),
+                            }
+
+                    start_idx = int(pm_start_index or 0)
+                    skip_done = bool(pm_skip_done)
+                    timeout_per_subject = float(pm_timeout_per_subject or 0)
+
+                    hc_gids_effective = hc_gids_effective[start_idx:]
+                    total_subjects = max(1, len(hc_gids_effective))
+
+                    for pos, gid in enumerate(hc_gids_effective, start=1):
+                        entry = graphs[gid]
+                        if use_metadata_mode:
+                            meta_row = dict(hc_meta_lookup.get(str(gid), {}))
+                            subject_id = str(meta_row.get("subject_id", gid))
+                            if not meta_row:
+                                meta_row = {
                                     "subject_id": subject_id,
                                     "graph_id": str(gid),
-                                    "graph_name": str(graphs[gid].name),
-                                    "group_value": group_value,
+                                    "graph_name": str(entry.name),
+                                    "group_value": "",
                                 }
+                        else:
+                            subject_id = str(gid)
+                            meta_row = {
+                                "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "graph_name": str(entry.name),
+                            }
+
+                        overall_bar.progress(float(pos - 1) / float(total_subjects))
+                        subject_bar.progress(0.0)
+                        status_box.caption(f"[{pos}/{total_subjects}] {subject_id}")
+
+                        if skip_done and _pm_subject_done(per_subject_dir, subject_id):
+                            manifest_rows.append({
+                                "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "status": "skipped_done",
+                                "elapsed_sec": 0.0,
+                                "saved_path": str(per_subject_dir / f'{_pm_safe_stem(subject_id)}.xlsx'),
+                            })
+                            pd.DataFrame(manifest_rows).to_csv(run_dir / "manifest.csv", index=False)
+                            overall_bar.progress(float(pos) / float(total_subjects))
+                            subject_bar.progress(1.0)
+                            continue
+
+                        t0 = time.perf_counter()
+                        try:
+                            G = _build_current_graph_for_entry(
+                                entry,
+                                min_conf=float(min_conf),
+                                min_weight=float(min_weight),
+                                analysis_mode=str(analysis_mode),
                             )
-                    else:
-                        subject_ids = [str(gid) for gid in hc_gids_effective]
 
-                    subject_metadata_df = pd.DataFrame(subject_meta_rows) if subject_meta_rows else None
+                            def _subject_progress(done_attacks: int, total_attacks: int, detail: str = "") -> None:
+                                frac_val = 0.0 if total_attacks <= 0 else float(done_attacks) / float(total_attacks)
+                                subject_bar.progress(min(1.0, max(0.0, frac_val)))
+                                status_box.caption(f"[{pos}/{total_subjects}] {detail}")
+                                if timeout_per_subject > 0 and (time.perf_counter() - t0) > timeout_per_subject:
+                                    raise TimeoutError(f"subject timeout > {timeout_per_subject:.1f}s")
 
-                    pm_res = compare_degradation_models(
-                        hc_graphs=hc_graphs,
-                        sz_group_metrics_df=sz_group_metrics_df,
-                        hc_baseline_metrics_df=hc_baseline_metrics_df,
-                        attack_kinds=pm_attack_kinds,
-                        metrics=pm_metrics,
-                        steps=int(pm_steps),
-                        frac=float(pm_frac),
-                        seed=int(pm_seed),
-                        eff_sources_k=int(pm_effk),
-                        compute_heavy_every=int(pm_heavy),
-                        compute_curvature=bool(pm_compute_curv),
-                        curvature_sample_edges=80,
-                        noise_sigma_max=float(pm_sigma),
-                        keep_density_from_baseline=bool(pm_keep_density),
-                        recompute_modules=bool(pm_recompute_modules),
-                        module_resolution=float(pm_module_resolution),
-                        removal_mode=str(pm_removal_mode),
-                        subject_ids=subject_ids,
-                        subject_metadata=subject_metadata_df,
-                    )
+                            single_res = _pm_build_single_subject_result(
+                                G=G,
+                                subject_id=subject_id,
+                                subject_idx=pos - 1 + start_idx,
+                                attack_kinds=[str(x) for x in pm_attack_kinds],
+                                metric_list=[str(x) for x in pm_metrics],
+                                target_vector=target_vector,
+                                scales=scales,
+                                normalized_families=normalized_families,
+                                steps=int(pm_steps),
+                                frac=float(pm_frac),
+                                seed=int(pm_seed),
+                                eff_sources_k=int(pm_effk),
+                                compute_heavy_every=int(pm_heavy),
+                                compute_curvature=bool(pm_compute_curv),
+                                curvature_sample_edges=80,
+                                noise_sigma_max=float(pm_sigma),
+                                keep_density_from_baseline=bool(pm_keep_density),
+                                recompute_modules=bool(pm_recompute_modules),
+                                module_resolution=float(pm_module_resolution),
+                                removal_mode=str(pm_removal_mode),
+                                fast_mode=False,
+                                subject_metadata_row=meta_row,
+                                progress_cb=_subject_progress,
+                            )
+
+                            subject_path = per_subject_dir / f"{_pm_safe_stem(subject_id)}.xlsx"
+                            export_phenotype_match_excel(single_res, subject_path)
+
+                            _pm_append_csv(aggregate_dir / "winner_results.csv", single_res.get("winner_results", pd.DataFrame()))
+                            _pm_append_csv(aggregate_dir / "subject_results.csv", single_res.get("subject_results", pd.DataFrame()))
+                            _pm_append_csv(aggregate_dir / "trajectory_results.csv", single_res.get("trajectory_results", pd.DataFrame()))
+                            _pm_append_csv(aggregate_dir / "scalar_subject_results.csv", single_res.get("scalar_subject_results", pd.DataFrame()))
+                            _pm_append_csv(aggregate_dir / "scalar_winners.csv", single_res.get("scalar_winners", pd.DataFrame()))
+                            _pm_append_csv(aggregate_dir / "scalar_summary.csv", single_res.get("scalar_summary", pd.DataFrame()))
+
+                            all_winners.append(single_res.get("winner_results", pd.DataFrame()))
+                            all_subject.append(single_res.get("subject_results", pd.DataFrame()))
+                            all_traj.append(single_res.get("trajectory_results", pd.DataFrame()))
+                            all_scalar_subject.append(single_res.get("scalar_subject_results", pd.DataFrame()))
+                            all_scalar_winners.append(single_res.get("scalar_winners", pd.DataFrame()))
+                            all_scalar_summary.append(single_res.get("scalar_summary", pd.DataFrame()))
+
+                            manifest_rows.append({
+                                "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "status": "ok",
+                                "elapsed_sec": float(time.perf_counter() - t0),
+                                "saved_path": str(subject_path),
+                            })
+                            del G
+                            del single_res
+                            gc.collect()
+                        except TimeoutError as exc:
+                            manifest_rows.append({
+                                "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "status": "timeout",
+                                "elapsed_sec": float(time.perf_counter() - t0),
+                                "error": str(exc),
+                            })
+                            gc.collect()
+                        except Exception as exc:
+                            manifest_rows.append({
+                                "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "status": "error",
+                                "elapsed_sec": float(time.perf_counter() - t0),
+                                "error": f"{type(exc).__name__}: {exc}",
+                            })
+                            gc.collect()
+
+                        pd.DataFrame(manifest_rows).to_csv(run_dir / "manifest.csv", index=False)
+                        overall_bar.progress(float(pos) / float(total_subjects))
+                        subject_bar.progress(1.0)
+
+                    winners_df = pd.concat(all_winners, ignore_index=True) if all_winners else pd.DataFrame()
+                    subject_df = pd.concat(all_subject, ignore_index=True) if all_subject else pd.DataFrame()
+                    traj_df = pd.concat(all_traj, ignore_index=True) if all_traj else pd.DataFrame()
+                    scalar_subject_df = pd.concat(all_scalar_subject, ignore_index=True) if all_scalar_subject else pd.DataFrame()
+                    scalar_winners_df = pd.concat(all_scalar_winners, ignore_index=True) if all_scalar_winners else pd.DataFrame()
+                    scalar_summary_df = pd.concat(all_scalar_summary, ignore_index=True) if all_scalar_summary else pd.DataFrame()
+
+                    pm_res = {
+                        "target_vector": target_vector,
+                        "scales": scales,
+                        "subject_results": subject_df,
+                        "winner_results": winners_df,
+                        "trajectory_results": traj_df,
+                        "scalar_subject_results": scalar_subject_df,
+                        "scalar_winners": scalar_winners_df,
+                        "scalar_summary": scalar_summary_df,
+                        "metrics_used": [str(x) for x in pm_metrics],
+                        "metric_families": normalized_families,
+                        "distance_mode": "raw",
+                    }
+
+                    # Keep full export and analysis summary in run root for compatibility
+                    export_phenotype_match_excel(pm_res, run_dir / "phenotype_match_full.xlsx")
+                    summary_pack = build_paper_ready_summary(pm_res)
+                    for name, df in {
+                        "summary_attack": summary_pack.get("summary_attack", pd.DataFrame()),
+                        "summary_winners": summary_pack.get("summary_winners", pd.DataFrame()),
+                        "target_vector": summary_pack.get("target_vector", pd.DataFrame()),
+                        "scales": summary_pack.get("scales", pd.DataFrame()),
+                        "stats_overall": summary_pack.get("stats_overall", pd.DataFrame()),
+                        "stats_pairwise": summary_pack.get("stats_pairwise", pd.DataFrame()),
+                    }.items():
+                        if isinstance(df, pd.DataFrame):
+                            df.to_csv(run_dir / f"{_pm_safe_stem(name)}.csv", index=False)
+
+                    with open(run_dir / "config.json", "w", encoding="utf-8") as f:
+                        json.dump({
+                            "run_dir": str(run_dir),
+                            "attack_kinds": [str(x) for x in pm_attack_kinds],
+                            "metrics": [str(x) for x in pm_metrics],
+                            "steps": int(pm_steps),
+                            "frac": float(pm_frac),
+                            "seed": int(pm_seed),
+                            "eff_k": int(pm_effk),
+                            "heavy_every": int(pm_heavy),
+                            "sigma_max": float(pm_sigma),
+                            "keep_density_from_baseline": bool(pm_keep_density),
+                            "recompute_modules": bool(pm_recompute_modules),
+                            "module_resolution": float(pm_module_resolution),
+                            "removal_mode": str(pm_removal_mode),
+                            "compute_curvature": bool(pm_compute_curv),
+                            "use_metadata_mode": bool(use_metadata_mode),
+                            "hc_count_total": int(len(hc_gids_effective)),
+                            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        }, f, ensure_ascii=False, indent=2)
 
                     st.session_state["last_degmatch_result"] = pm_res
+                    st.session_state["last_degmatch_run_dir"] = str(run_dir)
                 st.success("Готово.")
+                if st.session_state.get("last_degmatch_run_dir"):
+                    st.info(f"Сохранено в: {st.session_state['last_degmatch_run_dir']}")
 
     with pm_col2:
         pm_res = st.session_state.get("last_degmatch_result")
+        last_saved_run = str(st.session_state.get("last_degmatch_run_dir", "") or "").strip()
+        if last_saved_run:
+            st.caption(f"Последний сохранённый run: {last_saved_run}")
         if pm_res:
             st.markdown("### Winner attacks per HC")
             winners_df = pm_res.get("winner_results", pd.DataFrame())
