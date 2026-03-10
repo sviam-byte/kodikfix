@@ -381,6 +381,351 @@ def render_null_models(G_view: nx.Graph | None, G_full: nx.Graph | None, met: di
         })
         st.dataframe(cmp_df, width="stretch")
 
+def render_phenotype_matching_tab(
+    *,
+    active_entry: GraphEntry,
+    seed_val: int,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+) -> None:
+    """Render standalone HC→SZ phenotype-matching UI tab."""
+    st.header("🧬 HC → SZ phenotype matching")
+    st.caption(
+        "Отдельная вкладка для: разрушать HC-графы, считать trajectory по всем выбранным атакам "
+        "и сравнивать с целевым SZ-профилем."
+    )
+
+    graphs = st.session_state["graphs"]
+    active_gid = st.session_state.get("active_graph_id")
+    hc_guess = _guess_hc_like_graph_ids(graphs, active_gid)
+
+    pm_col1, pm_col2 = st.columns([1, 2])
+
+    with pm_col1:
+        st.caption("HC-графы берём из workspace. SZ-метрики — из CSV/XLSX.")
+        pm_hc_gids = st.multiselect(
+            "HC графы",
+            options=list(graphs.keys()),
+            default=hc_guess,
+            format_func=lambda gid: f"{graphs[gid].name} ({graphs[gid].source})",
+            key="pm_hc_gids",
+        )
+
+        pm_sz_file = st.file_uploader(
+            "SZ metrics table (CSV/XLSX)",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="pm_sz_file",
+        )
+        pm_hc_base_file = st.file_uploader(
+            "HC baseline metrics table (optional)",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="pm_hc_base_file",
+        )
+
+        pm_attack_kinds = st.multiselect(
+            "Модели деградации",
+            options=DEGRADATION_KIND_OPTIONS,
+            default=[
+                "weight_noise",
+                "inter_module_removal",
+                "intra_module_removal",
+                "weak_edges_by_weight",
+                "strong_edges_by_weight",
+            ],
+            key="pm_attack_kinds",
+        )
+
+        pm_metrics = st.multiselect(
+            "Метрики distance",
+            options=DEGRADATION_METRIC_OPTIONS,
+            default=[
+                "density",
+                "clustering",
+                "mod",
+                "l2_lcc",
+                "H_rw",
+                "fragility_H",
+                "eff_w",
+                "lcc_frac",
+            ],
+            key="pm_metrics",
+        )
+
+        with st.expander("Phenotype matching advanced"):
+            pm_compute_curv = st.checkbox(
+                "Считать curvature в baseline",
+                value=_needs_curvature_for_metrics(pm_metrics),
+                key="pm_compute_curv",
+            )
+            pm_steps = st.slider("Шаги trajectory", 5, 40, 12, key="pm_steps")
+            pm_frac = st.slider("Макс damage frac", 0.05, 0.95, 0.5, 0.05, key="pm_frac")
+            pm_seed = st.number_input("Seed (matching)", value=int(seed_val), step=1, key="pm_seed")
+            pm_effk = st.slider("Efficiency k (matching)", 8, 256, 32, key="pm_effk")
+            pm_heavy = st.slider("Heavy every N (matching)", 1, 10, 2, key="pm_heavy")
+            pm_sigma = st.slider("sigma_max (weight_noise)", 0.01, 2.0, 0.5, 0.01, key="pm_sigma")
+            pm_keep_density = st.checkbox("Keep density from baseline", value=True, key="pm_keep_density")
+            pm_recompute_modules = st.checkbox("Recompute modules each step", value=False, key="pm_recompute_modules")
+            pm_module_resolution = st.slider("Module resolution", 0.2, 3.0, 1.0, 0.1, key="pm_module_resolution")
+            pm_removal_mode = st.selectbox(
+                "Removal mode",
+                ["random", "weak_weight", "strong_weight"],
+                index=0,
+                key="pm_removal_mode",
+            )
+
+        if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
+            if not pm_hc_gids:
+                st.error("Выбери хотя бы один HC-граф.")
+            elif pm_sz_file is None:
+                st.error("Загрузи таблицу метрик SZ-группы.")
+            elif not pm_attack_kinds:
+                st.error("Выбери хотя бы одну модель деградации.")
+            elif not pm_metrics:
+                st.error("Выбери хотя бы одну метрику.")
+            else:
+                with st.spinner("HC → SZ phenotype matching..."):
+                    hc_graphs = [
+                        _build_current_graph_for_entry(
+                            graphs[gid],
+                            min_conf=float(min_conf),
+                            min_weight=float(min_weight),
+                            analysis_mode=str(analysis_mode),
+                        )
+                        for gid in pm_hc_gids
+                    ]
+                    sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
+
+                    if pm_hc_base_file is not None:
+                        hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
+                    else:
+                        hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
+                            pm_hc_gids,
+                            graphs=graphs,
+                            min_conf=float(min_conf),
+                            min_weight=float(min_weight),
+                            analysis_mode=str(analysis_mode),
+                            eff_k=int(pm_effk),
+                            seed=int(pm_seed),
+                            compute_curvature=bool(pm_compute_curv),
+                        )
+
+                    pm_res = compare_degradation_models(
+                        hc_graphs=hc_graphs,
+                        sz_group_metrics_df=sz_group_metrics_df,
+                        hc_baseline_metrics_df=hc_baseline_metrics_df,
+                        attack_kinds=pm_attack_kinds,
+                        metrics=pm_metrics,
+                        steps=int(pm_steps),
+                        frac=float(pm_frac),
+                        seed=int(pm_seed),
+                        eff_sources_k=int(pm_effk),
+                        compute_heavy_every=int(pm_heavy),
+                        compute_curvature=bool(pm_compute_curv),
+                        curvature_sample_edges=80,
+                        noise_sigma_max=float(pm_sigma),
+                        keep_density_from_baseline=bool(pm_keep_density),
+                        recompute_modules=bool(pm_recompute_modules),
+                        module_resolution=float(pm_module_resolution),
+                        removal_mode=str(pm_removal_mode),
+                    )
+
+                    st.session_state["last_degmatch_result"] = pm_res
+                st.success("Готово.")
+
+    with pm_col2:
+        pm_res = st.session_state.get("last_degmatch_result")
+        if pm_res:
+            st.markdown("### Winner attacks per HC")
+            winners_df = pm_res.get("winner_results", pd.DataFrame())
+            subject_df = pm_res.get("subject_results", pd.DataFrame())
+            traj_df = pm_res.get("trajectory_results", pd.DataFrame())
+            summary_pack = build_paper_ready_summary(pm_res)
+            summary_attack_df = summary_pack["summary_attack"]
+            summary_winners_df = summary_pack["summary_winners"]
+            target_vector_df = summary_pack["target_vector"]
+            scales_df = summary_pack["scales"]
+            stats_overall_df = summary_pack["stats_overall"]
+            stats_pairwise_df = summary_pack["stats_pairwise"]
+            stats_winner_df = summary_pack["stats_winners"]
+            scalar_subject_df = summary_pack["scalar_subject_results"]
+            scalar_winners_df = summary_pack["scalar_winners"]
+            scalar_summary_df = summary_pack["scalar_summary"]
+            scalar_inference_df = summary_pack.get("scalar_inference", pd.DataFrame())
+            family_inference_df = summary_pack.get("family_inference", pd.DataFrame())
+            claim_readiness_df = summary_pack.get("core_claim_readiness", pd.DataFrame())
+
+            if isinstance(summary_winners_df, pd.DataFrame) and not summary_winners_df.empty:
+                st.markdown("#### Winner summary")
+                st.dataframe(summary_winners_df, width="stretch")
+
+            if isinstance(summary_attack_df, pd.DataFrame) and not summary_attack_df.empty:
+                st.markdown("#### Attack summary")
+                st.dataframe(summary_attack_df, width="stretch")
+
+            if isinstance(scalar_summary_df, pd.DataFrame) and not scalar_summary_df.empty:
+                st.markdown("#### Scalar metric-wise summary")
+                st.dataframe(scalar_summary_df, width="stretch")
+
+            if isinstance(scalar_winners_df, pd.DataFrame) and not scalar_winners_df.empty:
+                with st.expander("Scalar winners (best attack per subject × metric)"):
+                    st.dataframe(scalar_winners_df, width="stretch")
+
+            if isinstance(scalar_subject_df, pd.DataFrame) and not scalar_subject_df.empty:
+                with st.expander("Scalar subject results"):
+                    st.dataframe(scalar_subject_df, width="stretch")
+
+            if isinstance(stats_overall_df, pd.DataFrame) and not stats_overall_df.empty:
+                st.markdown("#### Overall stats")
+                st.dataframe(stats_overall_df, width="stretch")
+
+            if isinstance(stats_pairwise_df, pd.DataFrame) and not stats_pairwise_df.empty:
+                with st.expander("Pairwise comparisons"):
+                    st.dataframe(stats_pairwise_df, width="stretch")
+
+            if isinstance(scalar_inference_df, pd.DataFrame) and not scalar_inference_df.empty:
+                with st.expander("Scalar inference (FDR + effect size)"):
+                    st.dataframe(scalar_inference_df, width="stretch")
+
+            if isinstance(family_inference_df, pd.DataFrame) and not family_inference_df.empty:
+                with st.expander("Family inference (FDR + effect size)"):
+                    st.dataframe(family_inference_df, width="stretch")
+
+            if isinstance(stats_winner_df, pd.DataFrame) and not stats_winner_df.empty:
+                with st.expander("Winner-count stats"):
+                    st.dataframe(stats_winner_df, width="stretch")
+
+            if isinstance(winners_df, pd.DataFrame) and not winners_df.empty:
+                with st.expander("Winner rows"):
+                    st.dataframe(winners_df, width="stretch")
+
+            if isinstance(subject_df, pd.DataFrame) and not subject_df.empty:
+                with st.expander("Subject results"):
+                    st.dataframe(subject_df, width="stretch")
+
+            if isinstance(traj_df, pd.DataFrame) and not traj_df.empty:
+                with st.expander("Trajectory results"):
+                    st.dataframe(traj_df.head(500), width="stretch")
+
+            export_col1, export_col2, export_col3 = st.columns(3)
+
+            with export_col1:
+                if isinstance(summary_winners_df, pd.DataFrame) and not summary_winners_df.empty:
+                    st.download_button(
+                        "Скачать summary_winners.csv",
+                        summary_winners_df.to_csv(index=False).encode("utf-8"),
+                        file_name="phenotype_match_summary_winners.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+
+            with export_col2:
+                if isinstance(summary_attack_df, pd.DataFrame) and not summary_attack_df.empty:
+                    st.download_button(
+                        "Скачать summary_attack.csv",
+                        summary_attack_df.to_csv(index=False).encode("utf-8"),
+                        file_name="phenotype_match_summary_attack.csv",
+                        mime="text/csv",
+                        width="stretch",
+                    )
+
+            with export_col3:
+                import io
+
+                bio = io.BytesIO()
+                with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                    (winners_df if isinstance(winners_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="winners"
+                    )
+                    (subject_df if isinstance(subject_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="subject_results"
+                    )
+                    (traj_df if isinstance(traj_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="trajectories"
+                    )
+                    (summary_attack_df if isinstance(summary_attack_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="summary_attack"
+                    )
+                    (summary_winners_df if isinstance(summary_winners_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="summary_winners"
+                    )
+                    (target_vector_df if isinstance(target_vector_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="target_vector"
+                    )
+                    (scales_df if isinstance(scales_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="scales"
+                    )
+                    (stats_overall_df if isinstance(stats_overall_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="stats_overall"
+                    )
+                    (stats_pairwise_df if isinstance(stats_pairwise_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="stats_pairwise"
+                    )
+                    (stats_winner_df if isinstance(stats_winner_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="stats_winners"
+                    )
+                    (scalar_subject_df if isinstance(scalar_subject_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="scalar_subject"
+                    )
+                    (scalar_winners_df if isinstance(scalar_winners_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="scalar_winners"
+                    )
+                    (scalar_summary_df if isinstance(scalar_summary_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="scalar_summary"
+                    )
+                    (scalar_inference_df if isinstance(scalar_inference_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="scalar_inference"
+                    )
+                    (family_inference_df if isinstance(family_inference_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="family_inference"
+                    )
+                    (claim_readiness_df if isinstance(claim_readiness_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="claim_readiness"
+                    )
+                bio.seek(0)
+
+                st.download_button(
+                    "Скачать один XLSX",
+                    data=bio.getvalue(),
+                    file_name="phenotype_match_full.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                )
+
+            with st.expander("Target vector / scales"):
+                tv_col, sc_col = st.columns(2)
+                with tv_col:
+                    st.markdown("**Target vector (SZ median)**")
+                    st.dataframe(target_vector_df, width="stretch")
+                with sc_col:
+                    st.markdown("**Scales**")
+                    st.dataframe(scales_df, width="stretch")
+
+            if isinstance(traj_df, pd.DataFrame) and not traj_df.empty and {"attack_kind", "step", "distance_to_target"}.issubset(traj_df.columns):
+                plot_df = traj_df.copy()
+                plot_df["step"] = pd.to_numeric(plot_df["step"], errors="coerce")
+                plot_df["distance_to_target"] = pd.to_numeric(plot_df["distance_to_target"], errors="coerce")
+                plot_df = plot_df.dropna(subset=["step", "distance_to_target"])
+                if not plot_df.empty:
+                    agg = (
+                        plot_df.groupby(["attack_kind", "step"], dropna=False)["distance_to_target"]
+                        .median()
+                        .reset_index()
+                    )
+                    fig_pm = px.line(
+                        agg,
+                        x="step",
+                        y="distance_to_target",
+                        color="attack_kind",
+                        title="Median distance to SZ target vs step",
+                    )
+                    fig_pm.update_layout(template="plotly_dark")
+                    fig_pm = _apply_plot_defaults(fig_pm, height=520)
+                    st.plotly_chart(fig_pm, width="stretch", key="plot_pm_distance")
+        else:
+            st.info("Запусти HC→SZ matching слева.")
+
+
 def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src_col: str, dst_col: str, min_conf: float, min_weight: float, analysis_mode: str, save_experiment_callback) -> None:
     """Render the Attack Lab tab."""
     if G_view is None:
@@ -794,336 +1139,7 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             )
 
     st.markdown("---")
-    st.subheader("HC → SZ phenotype matching")
-
-    graphs = st.session_state["graphs"]
-    active_gid = st.session_state.get("active_graph_id")
-    hc_guess = _guess_hc_like_graph_ids(graphs, active_gid)
-
-    pm_col1, pm_col2 = st.columns([1, 2])
-
-    with pm_col1:
-        st.caption("HC-графы берём из уже загруженных в workspace. SZ-метрики — из CSV/XLSX таблицы.")
-        pm_hc_gids = st.multiselect(
-            "HC графы",
-            options=list(graphs.keys()),
-            default=hc_guess,
-            format_func=lambda gid: f"{graphs[gid].name} ({graphs[gid].source})",
-            key="pm_hc_gids",
-        )
-
-        pm_sz_file = st.file_uploader(
-            "SZ metrics table (CSV/XLSX)",
-            type=["csv", "tsv", "xlsx", "xls"],
-            key="pm_sz_file",
-        )
-        pm_hc_base_file = st.file_uploader(
-            "HC baseline metrics table (optional)",
-            type=["csv", "tsv", "xlsx", "xls"],
-            key="pm_hc_base_file",
-        )
-
-        pm_attack_kinds = st.multiselect(
-            "Модели деградации",
-            options=DEGRADATION_KIND_OPTIONS,
-            default=[
-                "weight_noise",
-                "inter_module_removal",
-                "intra_module_removal",
-                "weak_edges_by_weight",
-                "strong_edges_by_weight",
-            ],
-            key="pm_attack_kinds",
-        )
-
-        pm_metrics = st.multiselect(
-            "Метрики distance",
-            options=DEGRADATION_METRIC_OPTIONS,
-            default=[
-                "density",
-                "clustering",
-                "mod",
-                "l2_lcc",
-                "H_rw",
-                "fragility_H",
-                "eff_w",
-                "lcc_frac",
-            ],
-            key="pm_metrics",
-        )
-
-        with st.expander("Phenotype matching advanced"):
-            pm_compute_curv = st.checkbox(
-                "Считать curvature в baseline",
-                value=_needs_curvature_for_metrics(pm_metrics),
-                key="pm_compute_curv",
-            )
-            pm_steps = st.slider("Шаги trajectory", 5, 40, 12, key="pm_steps")
-            pm_frac = st.slider("Макс damage frac", 0.05, 0.95, 0.5, 0.05, key="pm_frac")
-            pm_seed = st.number_input("Seed (matching)", value=int(seed_val), step=1, key="pm_seed")
-            pm_effk = st.slider("Efficiency k (matching)", 8, 256, 32, key="pm_effk")
-            pm_heavy = st.slider("Heavy every N (matching)", 1, 10, 2, key="pm_heavy")
-            pm_sigma = st.slider("sigma_max (weight_noise)", 0.01, 2.0, 0.5, 0.01, key="pm_sigma")
-            pm_keep_density = st.checkbox("Keep density from baseline", value=True, key="pm_keep_density")
-            pm_recompute_modules = st.checkbox("Recompute modules each step", value=False, key="pm_recompute_modules")
-            pm_module_resolution = st.slider("Module resolution", 0.2, 3.0, 1.0, 0.1, key="pm_module_resolution")
-            pm_removal_mode = st.selectbox(
-                "Removal mode",
-                ["random", "weak_weight", "strong_weight"],
-                index=0,
-                key="pm_removal_mode",
-            )
-
-        if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
-            if not pm_hc_gids:
-                st.error("Выбери хотя бы один HC-граф.")
-            elif pm_sz_file is None:
-                st.error("Загрузи таблицу метрик SZ-группы.")
-            elif not pm_attack_kinds:
-                st.error("Выбери хотя бы одну модель деградации.")
-            elif not pm_metrics:
-                st.error("Выбери хотя бы одну метрику.")
-            else:
-                with st.spinner("HC → SZ phenotype matching..."):
-                    hc_graphs = [
-                        _build_current_graph_for_entry(
-                            graphs[gid],
-                            min_conf=float(min_conf),
-                            min_weight=float(min_weight),
-                            analysis_mode=str(analysis_mode),
-                        )
-                        for gid in pm_hc_gids
-                    ]
-                    sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
-
-                    if pm_hc_base_file is not None:
-                        hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
-                    else:
-                        hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
-                            pm_hc_gids,
-                            graphs=graphs,
-                            min_conf=float(min_conf),
-                            min_weight=float(min_weight),
-                            analysis_mode=str(analysis_mode),
-                            eff_k=int(pm_effk),
-                            seed=int(pm_seed),
-                            compute_curvature=bool(pm_compute_curv),
-                        )
-
-                    pm_res = compare_degradation_models(
-                        hc_graphs=hc_graphs,
-                        sz_group_metrics_df=sz_group_metrics_df,
-                        hc_baseline_metrics_df=hc_baseline_metrics_df,
-                        attack_kinds=pm_attack_kinds,
-                        metrics=pm_metrics,
-                        steps=int(pm_steps),
-                        frac=float(pm_frac),
-                        seed=int(pm_seed),
-                        eff_sources_k=int(pm_effk),
-                        compute_heavy_every=int(pm_heavy),
-                        compute_curvature=bool(pm_compute_curv),
-                        curvature_sample_edges=80,
-                        noise_sigma_max=float(pm_sigma),
-                        keep_density_from_baseline=bool(pm_keep_density),
-                        recompute_modules=bool(pm_recompute_modules),
-                        module_resolution=float(pm_module_resolution),
-                        removal_mode=str(pm_removal_mode),
-                    )
-
-                    st.session_state["last_degmatch_result"] = pm_res
-                st.success("Готово.")
-
-    with pm_col2:
-        pm_res = st.session_state.get("last_degmatch_result")
-        if pm_res:
-            st.markdown("### Winner attacks per HC")
-            winners_df = pm_res.get("winner_results", pd.DataFrame())
-            subject_df = pm_res.get("subject_results", pd.DataFrame())
-            traj_df = pm_res.get("trajectory_results", pd.DataFrame())
-            summary_pack = build_paper_ready_summary(pm_res)
-            summary_attack_df = summary_pack["summary_attack"]
-            summary_winners_df = summary_pack["summary_winners"]
-            target_vector_df = summary_pack["target_vector"]
-            scales_df = summary_pack["scales"]
-            stats_overall_df = summary_pack["stats_overall"]
-            stats_pairwise_df = summary_pack["stats_pairwise"]
-            stats_winner_df = summary_pack["stats_winners"]
-            scalar_subject_df = summary_pack["scalar_subject_results"]
-            scalar_winners_df = summary_pack["scalar_winners"]
-            scalar_summary_df = summary_pack["scalar_summary"]
-            scalar_inference_df = summary_pack.get("scalar_inference", pd.DataFrame())
-            family_inference_df = summary_pack.get("family_inference", pd.DataFrame())
-            claim_readiness_df = summary_pack.get("core_claim_readiness", pd.DataFrame())
-
-            if isinstance(summary_winners_df, pd.DataFrame) and not summary_winners_df.empty:
-                st.markdown("#### Winner summary")
-                st.dataframe(summary_winners_df, width="stretch")
-
-            if isinstance(summary_attack_df, pd.DataFrame) and not summary_attack_df.empty:
-                st.markdown("#### Attack summary")
-                st.dataframe(summary_attack_df, width="stretch")
-
-            if isinstance(scalar_summary_df, pd.DataFrame) and not scalar_summary_df.empty:
-                st.markdown("#### Scalar metric-wise summary")
-                st.dataframe(scalar_summary_df, width="stretch")
-
-            if isinstance(scalar_winners_df, pd.DataFrame) and not scalar_winners_df.empty:
-                with st.expander("Scalar winners (best attack per subject × metric)"):
-                    st.dataframe(scalar_winners_df, width="stretch")
-
-            if isinstance(scalar_subject_df, pd.DataFrame) and not scalar_subject_df.empty:
-                with st.expander("Scalar subject results"):
-                    st.dataframe(scalar_subject_df, width="stretch")
-
-            if isinstance(stats_overall_df, pd.DataFrame) and not stats_overall_df.empty:
-                st.markdown("#### Overall stats")
-                st.dataframe(stats_overall_df, width="stretch")
-
-            if isinstance(stats_pairwise_df, pd.DataFrame) and not stats_pairwise_df.empty:
-                with st.expander("Pairwise comparisons"):
-                    st.dataframe(stats_pairwise_df, width="stretch")
-
-            if isinstance(scalar_inference_df, pd.DataFrame) and not scalar_inference_df.empty:
-                with st.expander("Scalar inference (FDR + effect size)"):
-                    st.dataframe(scalar_inference_df, width="stretch")
-
-            if isinstance(family_inference_df, pd.DataFrame) and not family_inference_df.empty:
-                with st.expander("Family inference (FDR + effect size)"):
-                    st.dataframe(family_inference_df, width="stretch")
-
-            if isinstance(stats_winner_df, pd.DataFrame) and not stats_winner_df.empty:
-                with st.expander("Winner-count stats"):
-                    st.dataframe(stats_winner_df, width="stretch")
-
-            if isinstance(winners_df, pd.DataFrame) and not winners_df.empty:
-                with st.expander("Winner rows"):
-                    st.dataframe(winners_df, width="stretch")
-
-            if isinstance(subject_df, pd.DataFrame) and not subject_df.empty:
-                with st.expander("Subject results"):
-                    st.dataframe(subject_df, width="stretch")
-
-            if isinstance(traj_df, pd.DataFrame) and not traj_df.empty:
-                with st.expander("Trajectory results"):
-                    st.dataframe(traj_df.head(500), width="stretch")
-
-            export_col1, export_col2, export_col3 = st.columns(3)
-
-            with export_col1:
-                if isinstance(summary_winners_df, pd.DataFrame) and not summary_winners_df.empty:
-                    st.download_button(
-                        "Скачать summary_winners.csv",
-                        summary_winners_df.to_csv(index=False).encode("utf-8"),
-                        file_name="phenotype_match_summary_winners.csv",
-                        mime="text/csv",
-                        width="stretch",
-                    )
-
-            with export_col2:
-                if isinstance(summary_attack_df, pd.DataFrame) and not summary_attack_df.empty:
-                    st.download_button(
-                        "Скачать summary_attack.csv",
-                        summary_attack_df.to_csv(index=False).encode("utf-8"),
-                        file_name="phenotype_match_summary_attack.csv",
-                        mime="text/csv",
-                        width="stretch",
-                    )
-
-            with export_col3:
-                import io
-
-                bio = io.BytesIO()
-                with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-                    (winners_df if isinstance(winners_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="winners"
-                    )
-                    (subject_df if isinstance(subject_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="subject_results"
-                    )
-                    (traj_df if isinstance(traj_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="trajectories"
-                    )
-                    (summary_attack_df if isinstance(summary_attack_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="summary_attack"
-                    )
-                    (summary_winners_df if isinstance(summary_winners_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="summary_winners"
-                    )
-                    (target_vector_df if isinstance(target_vector_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="target_vector"
-                    )
-                    (scales_df if isinstance(scales_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="scales"
-                    )
-                    (stats_overall_df if isinstance(stats_overall_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="stats_overall"
-                    )
-                    (stats_pairwise_df if isinstance(stats_pairwise_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="stats_pairwise"
-                    )
-                    (stats_winner_df if isinstance(stats_winner_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="stats_winners"
-                    )
-                    (scalar_subject_df if isinstance(scalar_subject_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="scalar_subject"
-                    )
-                    (scalar_winners_df if isinstance(scalar_winners_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="scalar_winners"
-                    )
-                    (scalar_summary_df if isinstance(scalar_summary_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="scalar_summary"
-                    )
-                    (scalar_inference_df if isinstance(scalar_inference_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="scalar_inference"
-                    )
-                    (family_inference_df if isinstance(family_inference_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="family_inference"
-                    )
-                    (claim_readiness_df if isinstance(claim_readiness_df, pd.DataFrame) else pd.DataFrame()).to_excel(
-                        writer, index=False, sheet_name="claim_readiness"
-                    )
-                bio.seek(0)
-
-                st.download_button(
-                    "Скачать один XLSX",
-                    data=bio.getvalue(),
-                    file_name="phenotype_match_full.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
-                )
-
-            with st.expander("Target vector / scales"):
-                tv_col, sc_col = st.columns(2)
-                with tv_col:
-                    st.markdown("**Target vector (SZ median)**")
-                    st.dataframe(target_vector_df, width="stretch")
-                with sc_col:
-                    st.markdown("**Scales**")
-                    st.dataframe(scales_df, width="stretch")
-
-            if isinstance(traj_df, pd.DataFrame) and not traj_df.empty and {"attack_kind", "step", "distance_to_target"}.issubset(traj_df.columns):
-                plot_df = traj_df.copy()
-                plot_df["step"] = pd.to_numeric(plot_df["step"], errors="coerce")
-                plot_df["distance_to_target"] = pd.to_numeric(plot_df["distance_to_target"], errors="coerce")
-                plot_df = plot_df.dropna(subset=["step", "distance_to_target"])
-                if not plot_df.empty:
-                    agg = (
-                        plot_df.groupby(["attack_kind", "step"], dropna=False)["distance_to_target"]
-                        .median()
-                        .reset_index()
-                    )
-                    fig_pm = px.line(
-                        agg,
-                        x="step",
-                        y="distance_to_target",
-                        color="attack_kind",
-                        title="Median distance to SZ target vs step",
-                    )
-                    fig_pm.update_layout(template="plotly_dark")
-                    fig_pm = _apply_plot_defaults(fig_pm, height=520)
-                    st.plotly_chart(fig_pm, width="stretch", key="plot_pm_distance")
-        else:
-            st.info("Запусти HC→SZ matching слева.")
+    st.info("HC → SZ phenotype matching вынесен в отдельную вкладку «🧬 HC→SZ».")
 
     # Визуализация "Последний результат" работает только по стандартным атакам.
     exps_here = [
