@@ -3,6 +3,7 @@ from __future__ import annotations
 import textwrap
 import time
 import json
+import re
 from pathlib import Path
 
 import networkx as nx
@@ -211,6 +212,55 @@ def _token_set(raw: str) -> set[str]:
     return {_norm_meta_token(x) for x in _split_tokens(raw) if _norm_meta_token(x)}
 
 
+def _metadata_match_candidates(entry: GraphEntry | None, gid: str) -> list[str]:
+    """Build tolerant metadata keys for one workspace graph.
+
+    MAT imports often store subject ids inside labels like
+    ``cobre_resolution_325 :: szxxx0040000`` while workspace ids look like
+    ``G_ab12cd``. We therefore try both whole labels and extracted suffixes.
+    """
+    raw_candidates: list[str] = [str(gid)]
+    if entry is not None:
+        raw_candidates.extend([
+            str(getattr(entry, "name", "") or ""),
+            str(getattr(entry, "source", "") or ""),
+            Path(str(getattr(entry, "source", "") or "")).stem,
+            Path(str(getattr(entry, "source", "") or "")).name,
+        ])
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _push(value: str) -> None:
+        key = _norm_meta_token(value)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+
+    for raw in raw_candidates:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        _push(txt)
+
+        parts = [seg.strip() for seg in txt.split("::") if str(seg).strip()]
+        for seg in parts:
+            _push(seg)
+        if parts:
+            _push(parts[-1])
+
+        p = Path(txt)
+        _push(p.stem)
+        _push(p.name)
+
+        # Loose token extraction helps with labels like
+        # "cobre_resolution_325 :: szxxx0040000".
+        for token in re.findall(r"[A-Za-z]+[A-Za-z0-9_-]*\d+[A-Za-z0-9_-]*", txt):
+            _push(token)
+
+    return out
+
+
 def _match_workspace_graphs_to_metadata(
     graphs: dict,
     meta_df: pd.DataFrame,
@@ -228,31 +278,39 @@ def _match_workspace_graphs_to_metadata(
     sz_gids: list[str] = []
     unmatched_gids: list[str] = []
 
-    for gid, entry in graphs.items():
-        # Candidate list supports matching by graph name, source path, file stem and id.
-        candidates = [
-            str(entry.name or ""),
-            str(entry.source or ""),
-            Path(str(entry.source or "")).stem,
-            Path(str(entry.source or "")).name,
-            str(gid),
-        ]
+    meta_key_to_row = {
+        str(row["__meta_subject_key"]): row
+        for row in meta_df.to_dict(orient="records")
+        if str(row.get("__meta_subject_key", "")).strip()
+    }
 
-        seen = set()
+    for gid, entry in graphs.items():
+        candidates = _metadata_match_candidates(entry, str(gid))
+
         row = None
         matched_key = ""
-        for raw in candidates:
-            key = _norm_meta_token(raw)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            hit = meta_df.loc[meta_df["__meta_subject_key"] == key]
-            if not hit.empty:
-                row = hit.iloc[0].to_dict()
+        for key in candidates:
+            hit = meta_key_to_row.get(key)
+            if hit is not None:
+                row = dict(hit)
                 matched_key = key
                 break
 
-        if not row:
+        if row is None:
+            # Final fallback: allow metadata subject id to appear as a suffix/token inside
+            # the graph label. This is slower, so we only do it after exact-key attempts.
+            cand_set = set(candidates)
+            for meta_key, meta_row in meta_key_to_row.items():
+                if meta_key in cand_set:
+                    row = dict(meta_row)
+                    matched_key = meta_key
+                    break
+                if any(meta_key and (meta_key in cand or cand in meta_key) for cand in cand_set):
+                    row = dict(meta_row)
+                    matched_key = meta_key
+                    break
+
+        if row is None:
             unmatched_gids.append(gid)
             continue
 
