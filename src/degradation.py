@@ -135,7 +135,9 @@ def _rank_edges_with_noise(
     for u, v, d in H.edges(data=True):
         w = _safe_float(d.get("weight", 1.0), 1.0)
         eps = float(rng.normal(loc=0.0, scale=float(sigma) * scale))
-        noisy = max(0.0, w + eps)
+        # Keep strictly positive weights to avoid accidental zero-weight degeneracies
+        # in shortest-path and spectral routines during noisy trajectories.
+        noisy = max(1e-12, w + eps)
         ranked.append((u, v, d, noisy))
 
     ranked.sort(key=lambda x: x[3], reverse=True)
@@ -192,35 +194,16 @@ def _metrics_row(
         "N": int(m.get("N", G.number_of_nodes())),
         "E": int(m.get("E", G.number_of_edges())),
         "total_weight": total_weight,
-        "C": int(m.get("C", np.nan)) if "C" in m else np.nan,
-        "lcc_size": int(m.get("lcc_size", np.nan)) if "lcc_size" in m else np.nan,
-        "lcc_frac": float(m.get("lcc_frac", np.nan)) if "lcc_frac" in m else np.nan,
-        "density": float(m.get("density", np.nan)) if "density" in m else np.nan,
-        "avg_degree": float(m.get("avg_degree", np.nan)) if "avg_degree" in m else np.nan,
-        "clustering": float(m.get("clustering", np.nan)) if "clustering" in m else np.nan,
-        "assortativity": float(m.get("assortativity", np.nan)) if "assortativity" in m else np.nan,
-        "eff_w": float(m.get("eff_w", np.nan)) if "eff_w" in m else np.nan,
-        "mod": float(m.get("mod", np.nan)) if heavy else np.nan,
-        "l2_lcc": float(m.get("l2_lcc", np.nan)) if heavy else np.nan,
-        "H_rw": float(m.get("H_rw", np.nan)) if "H_rw" in m else np.nan,
-        "fragility_H": float(m.get("fragility_H", np.nan)) if "fragility_H" in m else np.nan,
-        "kappa_mean": float(m.get("kappa_mean", np.nan)) if "kappa_mean" in m else np.nan,
-        "kappa_frac_negative": float(m.get("kappa_frac_negative", np.nan))
-        if "kappa_frac_negative" in m
-        else np.nan,
     }
+    # Preserve all metrics returned by calculate_metrics() so new fields propagate
+    # automatically to trajectories (e.g. algebraic_connectivity).
+    for k, v in m.items():
+        if k in {"step", "damage_frac", "total_weight"}:
+            continue
+        row[k] = _safe_float(v, np.nan)
 
     if metric_names:
-        keep = {
-            "step",
-            "damage_frac",
-            "N",
-            "E",
-            "total_weight",
-            "C",
-            "lcc_size",
-            "lcc_frac",
-        }.union(set(metric_names))
+        keep = {"step", "damage_frac", "N", "E", "total_weight"}.union(set(metric_names))
         row = {k: v for k, v in row.items() if k in keep}
 
     return row
@@ -254,6 +237,7 @@ def _run_noise_trajectory(
     eff_sources_k: int,
     sigma_max: float,
     keep_density_from_baseline: bool,
+    keep_all_edges: bool,
     compute_heavy_every: int,
     compute_curvature: bool,
     curvature_sample_edges: int,
@@ -297,7 +281,9 @@ def _run_noise_trajectory(
             except TypeError:
                 progress_cb(i, len(xs) - 1)
 
-        if keep_density_from_baseline:
+        if keep_all_edges:
+            keep_k = e0
+        elif keep_density_from_baseline:
             remove_k = int(round(float(x) * total_remove))
             keep_k = max(0, e0 - remove_k)
         else:
@@ -306,12 +292,17 @@ def _run_noise_trajectory(
         sigma = float(x) * float(sigma_max)
         ranked = _rank_edges_with_noise(H0, sigma=sigma, seed=int(seed) + i)
         H = _rebuild_graph_from_ranked_edges(H0, ranked, keep_k=keep_k)
+        if keep_all_edges:
+            # In pure-noise mode we keep topology fixed and only perturb weights.
+            for u, v, d, noisy in ranked:
+                if H.has_edge(u, v):
+                    H[u][v]["weight"] = float(noisy)
 
         heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == len(xs) - 1)
         row = _metrics_row(
             H,
             step=i,
-            damage_frac=(e0 - H.number_of_edges()) / float(max(1, e0)),
+            damage_frac=(float(x) if keep_all_edges else (e0 - H.number_of_edges()) / float(max(1, e0))),
             eff_sources_k=eff_sources_k,
             seed=int(seed) + i,
             heavy=heavy,
@@ -329,11 +320,12 @@ def _run_noise_trajectory(
     df = pd.DataFrame(rows)
     df = _forward_fill_heavy_columns(df)
     aux = {
-        "kind": "weight_noise",
+        "kind": "weight_noise_pure" if keep_all_edges else "weight_noise",
         "baseline_edges": int(e0),
         "baseline_density": float(base_density),
         "sigma_max": float(sigma_max),
         "keep_density_from_baseline": bool(keep_density_from_baseline),
+        "keep_all_edges": bool(keep_all_edges),
     }
     return df, aux
 
@@ -348,6 +340,7 @@ def _run_module_selective_edge_removal(
     eff_sources_k: int,
     module_info: ModuleInfo | None,
     recompute_modules: bool,
+    module_resolution: float,
     removal_mode: str,
     compute_heavy_every: int,
     compute_curvature: bool,
@@ -380,18 +373,24 @@ def _run_module_selective_edge_removal(
             "candidate_edges_total": 0,
         }
 
-    current_info = prepare_module_info(H0, seed=int(seed)) if recompute_modules else module_info
-
-    inter_edges, intra_edges = _classify_edges_by_modules(H0, current_info.membership)
-    candidate_edges = inter_edges if kind == "inter_module_removal" else intra_edges
-    ranked = _sort_edges_for_removal(candidate_edges, mode=removal_mode, rng=rng)
-
-    total_candidates = len(ranked)
+    if recompute_modules:
+        base_candidates = _classify_edges_by_modules(
+            H0,
+            prepare_module_info(H0, seed=int(seed), resolution=float(module_resolution)).membership,
+        )
+        total_candidates = len(base_candidates[0] if kind == "inter_module_removal" else base_candidates[1])
+    else:
+        inter_edges, intra_edges = _classify_edges_by_modules(H0, module_info.membership)
+        candidate_edges = inter_edges if kind == "inter_module_removal" else intra_edges
+        ranked = _sort_edges_for_removal(candidate_edges, mode=removal_mode, rng=rng)
+        total_candidates = len(ranked)
     remove_total = int(round(float(frac) * float(total_candidates)))
     remove_total = max(0, min(remove_total, total_candidates))
     ks = np.linspace(0, remove_total, int(max(1, steps)) + 1).round().astype(int).tolist()
 
-    removed_order = [(u, v) for (u, v, _d) in ranked[:remove_total]]
+    removed_order: list[tuple[int, int]] = []
+    if not recompute_modules:
+        removed_order = [(u, v) for (u, v, _d) in ranked[:remove_total]]
     H = H0.copy()
     rows = []
 
@@ -404,9 +403,26 @@ def _run_module_selective_edge_removal(
 
         if i > 0:
             prev = ks[i - 1]
-            for (u, v) in removed_order[prev:k]:
-                if H.has_edge(u, v):
-                    H.remove_edge(u, v)
+            if recompute_modules:
+                for local_seed in range(prev, k):
+                    current_info = prepare_module_info(
+                        H,
+                        seed=int(seed) + local_seed,
+                        resolution=float(module_resolution),
+                    )
+                    inter_edges, intra_edges = _classify_edges_by_modules(H, current_info.membership)
+                    candidate_edges = inter_edges if kind == "inter_module_removal" else intra_edges
+                    ranked_step = _sort_edges_for_removal(candidate_edges, mode=removal_mode, rng=rng)
+                    if not ranked_step:
+                        break
+                    u, v, _d = ranked_step[0]
+                    if H.has_edge(u, v):
+                        H.remove_edge(u, v)
+                        removed_order.append((u, v))
+            else:
+                for (u, v) in removed_order[prev:k]:
+                    if H.has_edge(u, v):
+                        H.remove_edge(u, v)
 
         heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == len(ks) - 1)
         row = _metrics_row(
@@ -436,7 +452,8 @@ def _run_module_selective_edge_removal(
         "candidate_edges_total": int(total_candidates),
         "recompute_modules": bool(recompute_modules),
         "removal_mode": str(removal_mode),
-        "n_modules": int(len(module_info.communities)),
+        "module_resolution": float(module_resolution),
+        "n_modules": int(len(module_info.communities)) if module_info is not None else np.nan,
     }
     return df, aux
 
@@ -584,7 +601,7 @@ def run_degradation_trajectory(
             progress_cb=progress_cb,
         )
 
-    if kind == "weight_noise":
+    if kind in {"weight_noise", "weight_noise_pure"}:
         return _run_noise_trajectory(
             H,
             steps=int(steps),
@@ -593,6 +610,7 @@ def run_degradation_trajectory(
             eff_sources_k=int(eff_sources_k),
             sigma_max=float(noise_sigma_max),
             keep_density_from_baseline=bool(keep_density_from_baseline),
+            keep_all_edges=bool(kind == "weight_noise_pure"),
             compute_heavy_every=int(compute_heavy_every),
             compute_curvature=bool(compute_curvature),
             curvature_sample_edges=int(curvature_sample_edges),
@@ -618,6 +636,7 @@ def run_degradation_trajectory(
             eff_sources_k=int(eff_sources_k),
             module_info=mi,
             recompute_modules=bool(recompute_modules),
+            module_resolution=float(module_resolution),
             removal_mode=str(removal_mode),
             compute_heavy_every=int(compute_heavy_every),
             compute_curvature=bool(compute_curvature),

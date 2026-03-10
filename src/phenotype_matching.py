@@ -271,6 +271,7 @@ def compare_degradation_models(
     recompute_modules: bool = False,
     module_resolution: float = 1.0,
     removal_mode: str = "random",
+    fast_mode: bool = False,
     subject_ids: Sequence[str] | None = None,
     subject_metadata: pd.DataFrame | None = None,
     distance_mode: str = "raw",
@@ -320,6 +321,7 @@ def compare_degradation_models(
                 recompute_modules=bool(recompute_modules),
                 module_resolution=float(module_resolution),
                 removal_mode=str(removal_mode),
+                fast_mode=bool(fast_mode),
             )
             best = find_best_match_to_target(
                 traj_df,
