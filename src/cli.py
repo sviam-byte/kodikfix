@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Iterable
 
 import networkx as nx
-import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 
@@ -29,8 +28,12 @@ from .mix_frac_estimator import estimate_mix_frac_star
 from .phenotype_controls import effective_metrics_for_run_type, run_control_suite
 from .phenotype_matching import compare_degradation_models, summarize_best_attack
 from .phenotype_preflight import build_run_manifest, run_phenotype_preflight, save_run_bundle
+from .phenotype_reporting import (
+    build_paper_ready_summary,
+    build_warning_flags,
+    export_phenotype_match_excel,
+)
 from .preprocess import coerce_fixed_format, filter_edges
-from .phenotype_reporting import build_paper_ready_summary, build_warning_flags, export_phenotype_match_excel
 
 SUPPORTED_EDGE_EXTS = {".csv", ".tsv", ".txt", ".xlsx", ".xls"}
 SUPPORTED_MATRIX_EXTS = {".mat", ".npy", ".npz"}

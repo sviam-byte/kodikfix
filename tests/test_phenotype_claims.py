@@ -1,6 +1,11 @@
 import pandas as pd
 
-from src.phenotype_claims import benjamini_hochberg, build_core_claim_readiness, build_family_inference_table, build_scalar_inference_table
+from src.phenotype_claims import (
+    benjamini_hochberg,
+    build_core_claim_readiness,
+    build_family_inference_table,
+    build_scalar_inference_table,
+)
 
 
 def _toy_result():

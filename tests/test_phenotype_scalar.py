@@ -1,10 +1,9 @@
 import pandas as pd
 
 from src.phenotype_scalar import (
-    annotate_scalar_errors,
-    find_best_scalar_match,
-    build_scalar_winners,
     build_scalar_summary,
+    build_scalar_winners,
+    find_best_scalar_match,
 )
 
 

@@ -1,6 +1,6 @@
-from __future__ import annotations
+"""Inference helpers for phenotype scalar/family claim-readiness tables."""
 
-"""Inference helpers for phenotype scalar/family claim readiness tables."""
+from __future__ import annotations
 
 from itertools import combinations
 from math import comb
@@ -84,7 +84,7 @@ def _paired_table(df: pd.DataFrame, group_cols: list[str], value_col: str) -> pd
                 continue
             a_better = int((diff < 0).sum())
             b_better = int((diff > 0).sum())
-            row = {col: val for col, val in zip(group_cols, key)}
+            row = {col: val for col, val in zip(group_cols, key, strict=False)}
             row.update({
                 "attack_a": a,
                 "attack_b": b,

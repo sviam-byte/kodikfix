@@ -5,7 +5,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .phenotype_claims import build_core_claim_readiness, build_family_inference_table, build_scalar_inference_table
+from .phenotype_claims import (
+    build_core_claim_readiness,
+    build_family_inference_table,
+    build_scalar_inference_table,
+)
 from .phenotype_stats import build_stats_tables
 
 

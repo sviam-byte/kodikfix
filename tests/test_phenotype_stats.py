@@ -1,10 +1,10 @@
 import pandas as pd
 
 from src.phenotype_stats import (
-    friedman_test_from_subject_results,
-    pairwise_wilcoxon_like,
-    matched_severity_pairwise_stats,
     build_stats_tables,
+    friedman_test_from_subject_results,
+    matched_severity_pairwise_stats,
+    pairwise_wilcoxon_like,
 )
 
 
