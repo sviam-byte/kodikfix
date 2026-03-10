@@ -35,13 +35,18 @@ except Exception:
 class _GraphTimeoutError(Exception):
     """Raised when a single graph exceeds the time limit."""
 
+
+APP_PAGE_TITLE = os.environ.get("APP_PAGE_TITLE", "Kodik Lab")
+APP_MAIN_TITLE = os.environ.get("APP_MAIN_TITLE", "Graph Lab")
+DEFAULT_ACTIVE_TAB = os.environ.get("DEFAULT_ACTIVE_TAB", "📊 Дэшборд")
+
 st.set_page_config(
-    page_title="Kodik Lab",
+    page_title=APP_PAGE_TITLE,
     layout="wide",
     page_icon="🕸️",
     initial_sidebar_state="expanded",
 )
-st.title("Graph Lab")
+st.title(APP_MAIN_TITLE)
 
 from src.config import GRAPH_TIMEOUT_SEC, settings
 from src.io_load import load_edges
@@ -2848,11 +2853,24 @@ st.markdown("---")
 # ============================================================
 # 7) TABS ROUTER
 # ============================================================
+TAB_OPTIONS = [
+    "📊 Дэшборд",
+    "🧠 Research",
+    "⚡ Energy",
+    "🕸️ 3D",
+    "🧪 Null",
+    "💥 Attack",
+    "🧬 HC→SZ",
+    "🆚 Compare",
+]
+default_tab_index = TAB_OPTIONS.index(DEFAULT_ACTIVE_TAB) if DEFAULT_ACTIVE_TAB in TAB_OPTIONS else 0
+
 active_tab = st.radio(
     "Раздел",
-    ["📊 Дэшборд", "🧠 Research", "⚡ Energy", "🕸️ 3D", "🧪 Null", "💥 Attack", "🆚 Compare"],
+    TAB_OPTIONS,
     horizontal=True,
     key="main_active_tab",
+    index=default_tab_index,
 )
 
 if active_tab == "📊 Дэшборд":
@@ -2913,6 +2931,15 @@ elif active_tab == "💥 Attack":
         min_weight,
         analysis_mode,
         save_experiment_callback=save_experiment_to_state,
+    )
+
+elif active_tab == "🧬 HC→SZ":
+    tab_attacks.render_phenotype_matching_tab(
+        active_entry=active_entry,
+        seed_val=seed_val,
+        min_conf=min_conf,
+        min_weight=min_weight,
+        analysis_mode=analysis_mode,
     )
 
 elif active_tab == "🆚 Compare":
