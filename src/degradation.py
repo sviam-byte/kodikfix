@@ -184,11 +184,14 @@ def _metrics_row(
         diameter_samples=16 if heavy else 6,
     )
 
+    total_weight = float(sum(_safe_float(d.get("weight", 1.0), 1.0) for _u, _v, d in G.edges(data=True)))
+
     row = {
         "step": int(step),
         "damage_frac": float(damage_frac),
         "N": int(m.get("N", G.number_of_nodes())),
         "E": int(m.get("E", G.number_of_edges())),
+        "total_weight": total_weight,
         "C": int(m.get("C", np.nan)) if "C" in m else np.nan,
         "lcc_size": int(m.get("lcc_size", np.nan)) if "lcc_size" in m else np.nan,
         "lcc_frac": float(m.get("lcc_frac", np.nan)) if "lcc_frac" in m else np.nan,
@@ -213,6 +216,7 @@ def _metrics_row(
             "damage_frac",
             "N",
             "E",
+            "total_weight",
             "C",
             "lcc_size",
             "lcc_frac",
@@ -437,6 +441,61 @@ def _run_module_selective_edge_removal(
     return df, aux
 
 
+def _run_random_edge_removal(
+    G: nx.Graph,
+    *,
+    steps: int,
+    frac: float,
+    seed: int,
+    eff_sources_k: int,
+    compute_heavy_every: int,
+    compute_curvature: bool,
+    curvature_sample_edges: int,
+    metric_names: Sequence[str] | None,
+    row_cb=None,
+    progress_cb=None,
+) -> tuple[pd.DataFrame, dict]:
+    H0 = as_simple_undirected(G).copy()
+    edges = list(H0.edges(data=True))
+    total_e = len(edges)
+    if total_e == 0:
+        row = _metrics_row(H0, step=0, damage_frac=0.0, eff_sources_k=eff_sources_k, seed=seed, heavy=True, compute_curvature=compute_curvature, curvature_sample_edges=curvature_sample_edges, metric_names=metric_names)
+        return pd.DataFrame([row]), {"kind": "random_edges", "total_edges": 0, "removed_edges_order": []}
+
+    rng = np.random.default_rng(int(seed))
+    rng.shuffle(edges)
+    remove_total = int(round(float(frac) * total_e))
+    remove_total = max(0, min(remove_total, total_e))
+    ks = np.linspace(0, remove_total, int(max(1, steps)) + 1).round().astype(int).tolist()
+    removed_order = [(u, v) for (u, v, _d) in edges[:remove_total]]
+
+    H = H0.copy()
+    rows = []
+    for i, k in enumerate(ks):
+        if progress_cb is not None:
+            try:
+                progress_cb(i, len(ks) - 1, k)
+            except TypeError:
+                progress_cb(i, len(ks) - 1)
+        if i > 0:
+            prev = ks[i - 1]
+            for (u, v) in removed_order[prev:k]:
+                if H.has_edge(u, v):
+                    H.remove_edge(u, v)
+        heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == len(ks) - 1)
+        row = _metrics_row(H, step=i, damage_frac=(k / float(max(1, total_e))), eff_sources_k=eff_sources_k, seed=int(seed) + i, heavy=heavy, compute_curvature=compute_curvature, curvature_sample_edges=curvature_sample_edges, metric_names=metric_names)
+        row["removed_k"] = int(k)
+        row["candidate_edges_total"] = int(total_e)
+        rows.append(row)
+        if row_cb is not None:
+            row_cb(dict(row), i, len(ks) - 1)
+
+    df = pd.DataFrame(rows)
+    df = _forward_fill_heavy_columns(df)
+    df["attack_kind"] = "random_edges"
+    return df, {"kind": "random_edges", "total_edges": int(total_e), "removed_edges_order": removed_order}
+
+
 def _normalize_legacy_trajectory(df: pd.DataFrame, *, source_kind: str) -> pd.DataFrame:
     out = df.copy()
     if "damage_frac" not in out.columns:
@@ -509,6 +568,21 @@ def run_degradation_trajectory(
             row_cb=row_cb,
         )
         return _normalize_legacy_trajectory(df, source_kind=mix_kind), aux
+
+    if kind == "random_edges":
+        return _run_random_edge_removal(
+            H,
+            steps=int(steps),
+            frac=float(frac),
+            seed=int(seed),
+            eff_sources_k=int(eff_sources_k),
+            compute_heavy_every=int(compute_heavy_every),
+            compute_curvature=bool(compute_curvature),
+            curvature_sample_edges=int(curvature_sample_edges),
+            metric_names=metric_names,
+            row_cb=row_cb,
+            progress_cb=progress_cb,
+        )
 
     if kind == "weight_noise":
         return _run_noise_trajectory(

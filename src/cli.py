@@ -26,9 +26,11 @@ from .graph_build import build_graph_from_edges, graph_summary, lcc_subgraph
 from .matrix_import import load_matrix, matrix_to_graph
 from .metrics import calculate_metrics
 from .mix_frac_estimator import estimate_mix_frac_star
+from .phenotype_controls import effective_metrics_for_run_type, run_control_suite
 from .phenotype_matching import compare_degradation_models, summarize_best_attack
+from .phenotype_preflight import build_run_manifest, run_phenotype_preflight, save_run_bundle
 from .preprocess import coerce_fixed_format, filter_edges
-from .phenotype_reporting import export_phenotype_match_excel, build_paper_ready_summary
+from .phenotype_reporting import build_paper_ready_summary, build_warning_flags, export_phenotype_match_excel
 
 SUPPORTED_EDGE_EXTS = {".csv", ".tsv", ".txt", ".xlsx", ".xls"}
 SUPPORTED_MATRIX_EXTS = {".mat", ".npy", ".npz"}
@@ -540,37 +542,97 @@ def _cmd_phenotype_match(args) -> int:
     if not metrics:
         raise ValueError("--metrics must contain at least one metric")
 
+    metric_families = None
+    distance_mode = str(getattr(args, "distance_mode", "raw"))
+    if bool(getattr(args, "family_balance", False)) and distance_mode == "raw":
+        distance_mode = "family_balanced"
+    run_type = str(getattr(args, "run_type", "primary_run"))
+
     sz_group_metrics_df = _load_metrics_table(Path(args.sz_metrics))
     if args.hc_baseline_metrics:
         hc_baseline_metrics_df = _load_metrics_table(Path(args.hc_baseline_metrics))
     else:
         hc_baseline_metrics_df = _compute_baseline_metrics_df(args, list(args.hc))
 
-    hc_graphs = _build_graphs_for_paths(args, list(args.hc))
+    hc_paths = [Path(x) for x in args.hc]
+    sid_source = str(getattr(args, "subject_id_source", "basename"))
+    if sid_source == "fullpath":
+        subject_ids = [str(p) for p in hc_paths]
+    elif sid_source == "index":
+        subject_ids = [f"hc_{i:04d}" for i, _ in enumerate(hc_paths)]
+    else:
+        subject_ids = [_safe_stem(p.stem) for p in hc_paths]
 
-    result = compare_degradation_models(
-        hc_graphs=hc_graphs,
-        sz_group_metrics_df=sz_group_metrics_df,
-        hc_baseline_metrics_df=hc_baseline_metrics_df,
+    effective_metrics_requested = effective_metrics_for_run_type(metrics, run_type=run_type, metric_families=metric_families)
+    manifest = build_run_manifest(
+        run_type=run_type,
+        hc_paths=[str(p) for p in hc_paths],
+        sz_metrics_path=str(args.sz_metrics),
+        hc_baseline_metrics_path=str(getattr(args, "hc_baseline_metrics", "")),
+        metric_list=effective_metrics_requested,
+        metric_families=metric_families,
         attack_kinds=attack_kinds,
-        metrics=metrics,
         steps=int(args.steps),
         frac=float(args.frac),
         seed=int(args.seed),
-        eff_sources_k=int(args.eff_k),
-        compute_heavy_every=int(args.heavy_every),
-        compute_curvature=bool(args.compute_curvature),
-        curvature_sample_edges=int(args.curvature_sample_edges),
-        noise_sigma_max=float(args.noise_sigma_max),
-        keep_density_from_baseline=bool(args.keep_density_from_baseline),
-        recompute_modules=bool(args.recompute_modules),
+        distance_mode=distance_mode,
         module_resolution=float(args.module_resolution),
+        recompute_modules=bool(args.recompute_modules),
         removal_mode=str(args.removal_mode),
+        notes=str(getattr(args, "notes", "")),
     )
+    preflight = run_phenotype_preflight(
+        sz_group_metrics_df=sz_group_metrics_df,
+        hc_baseline_metrics_df=hc_baseline_metrics_df,
+        metrics=effective_metrics_requested,
+        subject_ids=subject_ids,
+        metric_families=metric_families,
+    )
+    if not preflight.get("ok", False):
+        raise ValueError("Phenotype preflight failed: " + "; ".join(preflight.get("fatal_errors", [])))
+    effective_metrics = list(preflight.get("metrics_effective", effective_metrics_requested))
+
+    hc_graphs = _build_graphs_for_paths(args, [str(p) for p in hc_paths])
+    compare_kwargs = dict(
+        steps=int(args.steps), frac=float(args.frac), seed=int(args.seed), eff_sources_k=int(args.eff_k),
+        compute_heavy_every=int(args.heavy_every), compute_curvature=bool(args.compute_curvature),
+        curvature_sample_edges=int(args.curvature_sample_edges), noise_sigma_max=float(args.noise_sigma_max),
+        keep_density_from_baseline=bool(args.keep_density_from_baseline), recompute_modules=bool(args.recompute_modules),
+        module_resolution=float(args.module_resolution), removal_mode=str(args.removal_mode),
+        subject_ids=subject_ids, distance_mode=distance_mode,
+    )
+
+    if bool(getattr(args, "control_suite", False)):
+        resolution_tokens = [x.strip() for x in str(getattr(args, "modularity_resolutions", "0.5,1.0,1.5")).split(",") if x.strip()]
+        resolutions = [float(x) for x in resolution_tokens] if resolution_tokens else [0.5, 1.0, 1.5]
+        recompute_modes = [bool(int(x.strip())) for x in str(getattr(args, "modularity_recompute_options", "0,1")).split(",") if x.strip()]
+        suite = run_control_suite(
+            hc_graphs=hc_graphs,
+            sz_group_metrics_df=sz_group_metrics_df,
+            hc_baseline_metrics_df=hc_baseline_metrics_df,
+            metrics=effective_metrics,
+            attack_kinds=attack_kinds,
+            metric_families=metric_families,
+            compare_kwargs=compare_kwargs,
+            modularity_resolutions=resolutions,
+            modularity_recompute_options=recompute_modes,
+            target_bootstrap_reps=int(getattr(args, "target_bootstrap_reps", 16)),
+        )
+        result = suite["primary_result"]
+    else:
+        result = compare_degradation_models(
+            hc_graphs=hc_graphs,
+            sz_group_metrics_df=sz_group_metrics_df,
+            hc_baseline_metrics_df=hc_baseline_metrics_df,
+            attack_kinds=attack_kinds,
+            metrics=effective_metrics,
+            metric_families=metric_families,
+            **compare_kwargs,
+        )
+        suite = None
 
     compact = summarize_best_attack(result)
     paper_summary = build_paper_ready_summary(result)
-
     winners_df = result["winner_results"]
     subject_df = result["subject_results"]
     traj_df = result["trajectory_results"]
@@ -578,42 +640,95 @@ def _cmd_phenotype_match(args) -> int:
     if args.winners_out:
         Path(args.winners_out).parent.mkdir(parents=True, exist_ok=True)
         winners_df.to_csv(args.winners_out, index=False)
-
     if args.subject_out:
         Path(args.subject_out).parent.mkdir(parents=True, exist_ok=True)
         subject_df.to_csv(args.subject_out, index=False)
-
     if args.traj_out:
         Path(args.traj_out).parent.mkdir(parents=True, exist_ok=True)
         traj_df.to_csv(args.traj_out, index=False)
-
     if args.xlsx_out:
         export_phenotype_match_excel(result, args.xlsx_out)
 
+    if getattr(args, "out_dir", ""):
+        extra_tables = {
+            "summary_attack.csv": paper_summary["summary_attack"],
+            "summary_winners.csv": paper_summary["summary_winners"],
+            "target_vector.csv": paper_summary["target_vector"],
+            "scales.csv": paper_summary["scales"],
+            "metric_families.csv": paper_summary["metric_families"],
+            "family_summary.csv": paper_summary["family_summary"],
+            "warning_flags.csv": suite.get("warning_flags", paper_summary["warning_flags"]) if suite is not None else paper_summary["warning_flags"],
+            "stats_overall.csv": paper_summary["stats_overall"],
+            "stats_pairwise.csv": paper_summary["stats_pairwise"],
+            "stats_pairwise_matched_delta_density.csv": paper_summary.get("stats_pairwise_matched_delta_density", pd.DataFrame()),
+            "stats_pairwise_matched_delta_total_weight.csv": paper_summary.get("stats_pairwise_matched_delta_total_weight", pd.DataFrame()),
+            "stats_winners.csv": paper_summary["stats_winners"],
+        }
+        if suite is not None:
+            extra_tables["control_suite_summary.csv"] = suite.get("suite_summary", pd.DataFrame())
+            extra_tables["modularity_sensitivity_summary.csv"] = suite.get("modularity_sensitivity_summary", pd.DataFrame())
+            extra_tables["target_stability_summary.csv"] = suite.get("target_stability_summary", pd.DataFrame())
+            extra_tables["target_winner_stability_summary.csv"] = suite.get("target_winner_stability_summary", pd.DataFrame())
+            extra_tables["target_attack_distance_stability_summary.csv"] = suite.get("target_attack_distance_stability_summary", pd.DataFrame())
+            extra_tables["target_family_stability_summary.csv"] = suite.get("target_family_stability_summary", pd.DataFrame())
+            extra_tables["target_scalar_stability_summary.csv"] = suite.get("target_scalar_stability_summary", pd.DataFrame())
+            extra_tables["null_severity_density_summary.csv"] = suite.get("null_severity_density_summary", pd.DataFrame())
+            extra_tables["null_severity_density_detail.csv"] = suite.get("null_severity_density_detail", pd.DataFrame())
+            extra_tables["null_severity_total_weight_summary.csv"] = suite.get("null_severity_total_weight_summary", pd.DataFrame())
+            extra_tables["null_severity_total_weight_detail.csv"] = suite.get("null_severity_total_weight_detail", pd.DataFrame())
+            for name, df in suite.get("modularity_detail_tables", {}).items():
+                extra_tables[name] = df
+            for name, df in suite.get("target_stability_detail_tables", {}).items():
+                extra_tables[name] = df
+        save_run_bundle(
+            out_dir=args.out_dir,
+            result=result,
+            manifest=manifest,
+            preflight_report=preflight,
+            extra_tables=extra_tables,
+        )
+
     payload = {
         "mode": "phenotype-match",
+        "run_type": manifest["run_type"],
+        "distance_mode": distance_mode,
         "hc_n": int(len(hc_graphs)),
         "attack_kinds": attack_kinds,
-        "metrics": metrics,
+        "metrics_requested": metrics,
+        "metrics_effective": effective_metrics,
         "target_vector": result["target_vector"],
         "scales": result["scales"],
+        "preflight": preflight,
         "winner_rows": winners_df.to_dict(orient="records"),
         "subject_rows_n": int(len(subject_df)),
         "trajectory_rows_n": int(len(traj_df)),
+        "control_suite": bool(getattr(args, "control_suite", False)),
         "compact_summary": compact,
         "summary_attack_rows": paper_summary["summary_attack"].to_dict(orient="records"),
         "summary_winner_rows": paper_summary["summary_winners"].to_dict(orient="records"),
+        "family_summary_rows": paper_summary["family_summary"].to_dict(orient="records"),
         "stats_overall_rows": paper_summary["stats_overall"].to_dict(orient="records"),
         "stats_pairwise_rows": paper_summary["stats_pairwise"].to_dict(orient="records"),
+        "stats_pairwise_matched_delta_density_rows": paper_summary.get("stats_pairwise_matched_delta_density", pd.DataFrame()).to_dict(orient="records"),
+        "stats_pairwise_matched_delta_total_weight_rows": paper_summary.get("stats_pairwise_matched_delta_total_weight", pd.DataFrame()).to_dict(orient="records"),
         "stats_winner_rows": paper_summary["stats_winners"].to_dict(orient="records"),
         "scalar_subject_rows_n": int(len(result.get("scalar_subject_results", pd.DataFrame()))),
         "scalar_winner_rows_n": int(len(result.get("scalar_winners", pd.DataFrame()))),
-        "scalar_summary_rows": result.get("scalar_summary", pd.DataFrame()).to_dict(orient="records")
-        if isinstance(result.get("scalar_summary", pd.DataFrame()), pd.DataFrame)
-        else [],
+        "scalar_summary_rows": result.get("scalar_summary", pd.DataFrame()).to_dict(orient="records") if isinstance(result.get("scalar_summary", pd.DataFrame()), pd.DataFrame) else [],
+        "control_suite_rows": suite.get("suite_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "modularity_sensitivity_rows": suite.get("modularity_sensitivity_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "target_stability_rows": suite.get("target_stability_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "target_winner_stability_rows": suite.get("target_winner_stability_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "target_attack_distance_stability_rows": suite.get("target_attack_distance_stability_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "target_family_stability_rows": suite.get("target_family_stability_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "target_scalar_stability_rows": suite.get("target_scalar_stability_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "null_severity_density_rows": suite.get("null_severity_density_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "null_severity_total_weight_rows": suite.get("null_severity_total_weight_summary", pd.DataFrame()).to_dict(orient="records") if suite is not None else [],
+        "warning_flags_rows": suite.get("warning_flags", build_warning_flags(result)).to_dict(orient="records") if suite is not None else build_warning_flags(result).to_dict(orient="records"),
     }
     _write_json(payload, args.out)
     return 0
+
 
 def _cmd_batch_metrics(args) -> int:
     """Run metrics for many inputs from a folder and save per-item + summary files."""
@@ -827,7 +942,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_pm.add_argument("--recompute-modules", action="store_true")
     p_pm.add_argument("--module-resolution", type=float, default=1.0)
     p_pm.add_argument("--removal-mode", choices=["random", "weak_weight", "strong_weight"], default="random")
+    p_pm.add_argument("--distance-mode", type=str, default="raw", choices=["raw", "family_balanced"], help="Distance aggregation mode")
+    p_pm.add_argument("--family-balance", action="store_true", help="Shortcut for --distance-mode family_balanced")
+    p_pm.add_argument("--subject-id-source", type=str, default="basename", choices=["basename", "fullpath", "index"], help="How to derive subject IDs for HC inputs")
+    p_pm.add_argument("--run-type", type=str, default="primary_run")
+    p_pm.add_argument("--notes", type=str, default="")
+    p_pm.add_argument("--control-suite", action="store_true", help="Run primary + density-control + random-edge null + modularity sensitivity suite")
+    p_pm.add_argument("--modularity-resolutions", type=str, default="0.5,1.0,1.5", help="Comma-separated module resolutions for control suite")
+    p_pm.add_argument("--modularity-recompute-options", type=str, default="0,1", help="Comma-separated booleans (0/1) for recompute-modules in control suite")
+    p_pm.add_argument("--target-bootstrap-reps", type=int, default=16, help="Bootstrap repetitions for target stability control suite")
     p_pm.add_argument("--out", type=str, default="-")
+    p_pm.add_argument("--out-dir", type=str, default="", help="Optional directory for manifest, preflight, and CSV bundle")
     p_pm.add_argument("--winners-out", type=str, default="")
     p_pm.add_argument("--subject-out", type=str, default="")
     p_pm.add_argument("--traj-out", type=str, default="")
