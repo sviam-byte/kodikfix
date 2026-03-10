@@ -6,7 +6,7 @@ set "PORT=%~1"
 if not defined PORT set "PORT=8503"
 
 if not exist ".venv\Scripts\python.exe" if not exist ".venv\bin\python" (
-    call setup_env.bat
+    call setup_env.bat --no-pause
     if errorlevel 1 exit /b 1
 )
 
