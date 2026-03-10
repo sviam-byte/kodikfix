@@ -6,6 +6,7 @@ import time
 import json
 import re
 import gc
+import traceback
 from pathlib import Path
 
 import networkx as nx
@@ -301,6 +302,163 @@ def _pm_resolve_out_dir(raw_value: str | Path | None) -> Path:
 def _pm_write_progress_snapshot(run_dir: Path, payload: dict) -> None:
     """Persist current run progress for debugging/resume visibility."""
     _pm_write_json(run_dir / "progress.json", payload)
+
+
+def _pm_append_event_log(run_dir: Path, payload: dict) -> None:
+    """Append one structured event line to run_dir/events.log."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    row = dict(payload or {})
+    row.setdefault("ts", time.strftime("%Y-%m-%d %H:%M:%S"))
+    with open(run_dir / "events.log", "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _pm_emit_progress(run_dir: Path, payload: dict, *, write_event: bool = False) -> None:
+    """Write progress snapshot with heartbeat and optionally mirror to event log."""
+    row = dict(payload or {})
+    row["heartbeat_ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    row["heartbeat_unix"] = time.time()
+    _pm_write_progress_snapshot(run_dir, row)
+    if write_event:
+        _pm_append_event_log(run_dir, row)
+
+
+def _pm_has_curvature_metrics(metrics: list[str]) -> bool:
+    """Whether selected metric set implies curvature/Ricci calculations."""
+    toks = {str(x).strip() for x in (metrics or [])}
+    return any(
+        t.startswith("kappa_") or t in {"fragility_kappa"}
+        for t in toks
+    )
+
+
+def _pm_has_curvature_attacks(attack_kinds: list[str]) -> bool:
+    """Whether selected attacks imply Ricci/curvature usage."""
+    toks = {str(x).strip() for x in (attack_kinds or [])}
+    ricci_like = {
+        "ricci_most_negative",
+        "ricci_most_positive",
+        "ricci_abs_max",
+        "flux_high_rw_x_neg_ricci",
+        "edge_ricci",
+    }
+    return any(t in ricci_like or "ricci" in t.lower() for t in toks)
+
+
+def _pm_heavy_metrics(metrics: list[str]) -> list[str]:
+    """Return selected metrics that are relatively expensive."""
+    heavy = {"mod", "eff_w", "H_rw", "H_evo", "fragility_H", "fragility_kappa"}
+    return [str(x) for x in (metrics or []) if str(x) in heavy]
+
+
+def _pm_heavy_attacks(attack_kinds: list[str]) -> list[str]:
+    """Return selected degradation models that are relatively expensive."""
+    heavy = {
+        "inter_module_removal",
+        "intra_module_removal",
+        "mix_default",
+        "mix_degree_preserving",
+    }
+    out = []
+    for x in (attack_kinds or []):
+        s = str(x)
+        if s in heavy or "ricci" in s.lower():
+            out.append(s)
+    return out
+
+
+def _pm_cost_level(
+    *,
+    hc_n: int,
+    sz_n: int,
+    attacks_n: int,
+    steps_n: int,
+    heavy_metrics_n: int,
+    heavy_attacks_n: int,
+    curvature_baseline: bool,
+    curvature_trajectory: bool,
+    export_subject_xlsx: bool,
+    export_run_xlsx: bool,
+) -> str:
+    """Very rough qualitative estimate of run heaviness."""
+    score = 0
+    score += max(0, hc_n + sz_n) // 20
+    score += max(0, hc_n * max(1, attacks_n) * max(1, steps_n)) // 800
+    score += int(heavy_metrics_n >= 2)
+    score += int(heavy_metrics_n >= 4)
+    score += int(heavy_attacks_n >= 1)
+    score += int(heavy_attacks_n >= 2)
+    score += 3 if curvature_baseline else 0
+    score += 3 if curvature_trajectory else 0
+    score += 1 if export_subject_xlsx else 0
+    score += 1 if export_run_xlsx else 0
+
+    if score <= 2:
+        return "cheap"
+    if score <= 5:
+        return "medium"
+    return "heavy"
+
+
+def _pm_build_preflight_summary(
+    *,
+    hc_n: int,
+    sz_n: int,
+    attack_kinds: list[str],
+    metrics: list[str],
+    steps: int,
+    compute_curv: bool,
+    export_subject_xlsx: bool,
+    export_run_xlsx: bool,
+) -> dict:
+    """Prepare a transparent summary of what exactly will be computed."""
+    attacks_n = len(list(attack_kinds or []))
+    metrics_n = len(list(metrics or []))
+    traj_steps_total = int(hc_n) * int(attacks_n) * int(steps)
+    baseline_graph_builds = int(hc_n) + int(sz_n)
+    baseline_metric_passes = int(hc_n) + int(sz_n)
+
+    curvature_from_metrics = _pm_has_curvature_metrics(metrics)
+    curvature_from_attacks = _pm_has_curvature_attacks(attack_kinds)
+    curvature_baseline = bool(compute_curv) and bool(curvature_from_metrics)
+    curvature_trajectory = bool(compute_curv) and bool(curvature_from_attacks)
+
+    heavy_metrics = _pm_heavy_metrics(metrics)
+    heavy_attacks = _pm_heavy_attacks(attack_kinds)
+
+    total_cost = _pm_cost_level(
+        hc_n=int(hc_n),
+        sz_n=int(sz_n),
+        attacks_n=int(attacks_n),
+        steps_n=int(steps),
+        heavy_metrics_n=len(heavy_metrics),
+        heavy_attacks_n=len(heavy_attacks),
+        curvature_baseline=curvature_baseline,
+        curvature_trajectory=curvature_trajectory,
+        export_subject_xlsx=bool(export_subject_xlsx),
+        export_run_xlsx=bool(export_run_xlsx),
+    )
+
+    return {
+        "hc_n": int(hc_n),
+        "sz_n": int(sz_n),
+        "attacks_n": int(attacks_n),
+        "metrics_n": int(metrics_n),
+        "steps": int(steps),
+        "baseline_graph_builds": int(baseline_graph_builds),
+        "baseline_metric_passes": int(baseline_metric_passes),
+        "trajectory_steps_total": int(traj_steps_total),
+        "curvature_from_metrics": bool(curvature_from_metrics),
+        "curvature_from_attacks": bool(curvature_from_attacks),
+        "curvature_baseline": bool(curvature_baseline),
+        "curvature_trajectory": bool(curvature_trajectory),
+        "heavy_metrics": list(heavy_metrics),
+        "heavy_attacks": list(heavy_attacks),
+        "export_subject_xlsx": bool(export_subject_xlsx),
+        "export_run_xlsx": bool(export_run_xlsx),
+        "estimated_cost": str(total_cost),
+    }
+
 
 
 def _pm_append_csv(path: Path, rows: pd.DataFrame | list[dict] | dict) -> None:
@@ -1236,6 +1394,54 @@ def render_phenotype_matching_tab(
             except Exception as exc:
                 st.error(f"Metadata parse/match error: {type(exc).__name__}: {exc}")
 
+        use_metadata_preview = (
+            pm_match is not None
+            and len(pm_match.get("hc_gids", [])) > 0
+            and len(pm_match.get("sz_gids", [])) > 0
+        )
+
+        preview_hc_n = len(pm_match.get("hc_gids", [])) if use_metadata_preview else len(pm_hc_gids)
+        preview_sz_n = len(pm_match.get("sz_gids", [])) if use_metadata_preview else (0 if pm_sz_file is not None else 0)
+
+        preflight = _pm_build_preflight_summary(
+            hc_n=int(preview_hc_n),
+            sz_n=int(preview_sz_n),
+            attack_kinds=[str(x) for x in pm_attack_kinds],
+            metrics=[str(x) for x in pm_metrics],
+            steps=int(pm_steps),
+            compute_curv=bool(pm_compute_curv),
+            export_subject_xlsx=bool(pm_export_subject_xlsx),
+            export_run_xlsx=bool(pm_export_run_xlsx),
+        )
+
+        with st.expander("Что будет посчитано / preflight", expanded=True):
+            st.markdown(
+                "\n".join(
+                    [
+                        f"- HC графов: **{preflight['hc_n']}**",
+                        f"- SZ графов: **{preflight['sz_n']}**",
+                        f"- Моделей деградации: **{preflight['attacks_n']}**",
+                        f"- Метрик distance: **{preflight['metrics_n']}**",
+                        f"- Шагов trajectory на атаку: **{preflight['steps']}**",
+                        f"- Prepare graph builds: **{preflight['baseline_graph_builds']}**",
+                        f"- Prepare metric passes: **{preflight['baseline_metric_passes']}**",
+                        f"- Всего trajectory steps: **{preflight['trajectory_steps_total']}**",
+                        f"- Curvature/Ricci в baseline: **{'ON' if preflight['curvature_baseline'] else 'OFF'}**",
+                        f"- Curvature/Ricci в trajectory: **{'ON' if preflight['curvature_trajectory'] else 'OFF'}**",
+                        f"- Тяжёлые метрики: **{', '.join(preflight['heavy_metrics']) if preflight['heavy_metrics'] else 'нет'}**",
+                        f"- Тяжёлые атаки: **{', '.join(preflight['heavy_attacks']) if preflight['heavy_attacks'] else 'нет'}**",
+                        f"- subject_bundle.xlsx: **{'ON' if preflight['export_subject_xlsx'] else 'OFF'}**",
+                        f"- run_bundle.xlsx: **{'ON' if preflight['export_run_xlsx'] else 'OFF'}**",
+                        f"- Оценка нагрузки: **{preflight['estimated_cost'].upper()}**",
+                    ]
+                )
+            )
+
+            if preflight["curvature_baseline"] or preflight["curvature_trajectory"]:
+                st.warning("Curvature/Ricci включён. Такой run будет заметно тяжелее.")
+            else:
+                st.info("Curvature/Ricci сейчас не должен считаться, если ты не включила его другими настройками/атаками.")
+
         if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
             if not pm_attack_kinds:
                 st.error("Выбери хотя бы одну модель деградации.")
@@ -1259,7 +1465,111 @@ def render_phenotype_matching_tab(
                     st.error("Не найдено HC-графов: ни по metadata, ни вручную.")
                     st.stop()
 
+                metric_list = [str(x) for x in pm_metrics]
+
+                out_root = _pm_resolve_out_dir(pm_out_dir)
+                out_root.mkdir(parents=True, exist_ok=True)
+                run_name = _pm_safe_stem(str(pm_run_label), f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")
+                run_dir = out_root / run_name
+                (run_dir / "aggregate").mkdir(parents=True, exist_ok=True)
+                (run_dir / "per_subject").mkdir(parents=True, exist_ok=True)
+                _pm_write_run_location_note(run_dir)
+                st.session_state["last_degmatch_run_dir"] = str(run_dir)
+
+                overall_bar = st.progress(0.0, text="Общий прогресс: prepare 0%")
+                subject_bar = st.progress(0.0, text="Текущий HC: ожидание")
+                phase_box = st.empty()
+                status_box = st.empty()
+                save_box = st.empty()
+                files_box = st.empty()
+                event_box = st.empty()
+
+                ui_events: list[str] = []
+
+                def _push_ui_event(msg: str) -> None:
+                    stamp = time.strftime("%H:%M:%S")
+                    line = f"[{stamp}] {msg}"
+                    ui_events.append(line)
+                    event_box.code("\n".join(ui_events[-14:]))
+
+                save_box.info(f"Run dir: {run_dir}")
+                _push_ui_event(f"Run created: {run_dir}")
+
+                _pm_emit_progress(
+                    run_dir,
+                    {
+                        "status": "running",
+                        "phase": "prepare_init",
+                        "run_dir": str(run_dir),
+                        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "total_subjects": 0,
+                        "completed_subjects": 0,
+                        "current_subject_id": "",
+                        "current_attack_kind": "",
+                        "current_step": 0,
+                        "current_step_total": 0,
+                        "phase_progress": 0.0,
+                    },
+                    write_event=True,
+                )
+
+                phase_box.info("Prepare phase: инициализация run")
+                status_box.caption("Подготовка конфигурации и входов...")
+                overall_bar.progress(0.02, text="Общий прогресс: prepare 2%")
+                subject_bar.progress(0.0, text="Текущий HC: ожидание")
+
+                _pm_save_run_inputs(
+                    run_dir,
+                    config={
+                        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "run_dir": str(run_dir),
+                        "metrics": metric_list,
+                        "metric_families": normalize_metric_families(metric_list, None),
+                        "attack_kinds": [str(x) for x in pm_attack_kinds],
+                        "steps": int(pm_steps),
+                        "frac": float(pm_frac),
+                        "seed": int(pm_seed),
+                        "eff_k": int(pm_effk),
+                        "heavy_every": int(pm_heavy),
+                        "sigma_max": float(pm_sigma),
+                        "keep_density_from_baseline": bool(pm_keep_density),
+                        "recompute_modules": bool(pm_recompute_modules),
+                        "module_resolution": float(pm_module_resolution),
+                        "removal_mode": str(pm_removal_mode),
+                        "compute_curvature": bool(pm_compute_curv),
+                        "distance_mode": "raw",
+                    },
+                    metadata_upload=pm_meta_file,
+                    sz_upload=pm_sz_file,
+                    hc_baseline_upload=pm_hc_base_file,
+                )
+
+                # ---------------- PREPARE: SZ baseline ----------------
                 if use_metadata_mode:
+                    phase_box.info("Prepare phase: SZ baseline metrics")
+                    status_box.caption(f"Считаю baseline-метрики для SZ-группы ({len(sz_gids_effective)} графов)")
+                    _push_ui_event(f"Prepare SZ baseline: {len(sz_gids_effective)} graphs")
+                    overall_bar.progress(0.07, text="Общий прогресс: prepare 7%")
+
+                    _pm_emit_progress(
+                        run_dir,
+                        {
+                            "status": "running",
+                            "phase": "prepare_sz_baseline",
+                            "run_dir": str(run_dir),
+                            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "total_subjects": 0,
+                            "completed_subjects": 0,
+                            "current_subject_id": "",
+                            "current_attack_kind": "",
+                            "current_step": 0,
+                            "current_step_total": 0,
+                            "phase_progress": 0.35,
+                            "prepare_note": f"compute SZ baseline for {len(sz_gids_effective)} graphs",
+                        },
+                        write_event=True,
+                    )
+
                     sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
                         sz_gids_effective,
                         graphs=graphs,
@@ -1274,7 +1584,36 @@ def render_phenotype_matching_tab(
                     if pm_sz_file is None:
                         st.error("Либо загрузи metadata, либо загрузи таблицу метрик SZ-группы.")
                         st.stop()
+                    phase_box.info("Prepare phase: reading uploaded SZ metrics")
+                    status_box.caption("Читаю загруженную таблицу метрик SZ")
+                    _push_ui_event("Read uploaded SZ metrics table")
+                    overall_bar.progress(0.07, text="Общий прогресс: prepare 7%")
                     sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
+
+                # ---------------- PREPARE: HC baseline ----------------
+                phase_box.info("Prepare phase: HC baseline metrics")
+                status_box.caption(f"Считаю baseline-метрики для HC-группы ({len(hc_gids_effective)} графов)")
+                _push_ui_event(f"Prepare HC baseline: {len(hc_gids_effective)} graphs")
+                overall_bar.progress(0.14, text="Общий прогресс: prepare 14%")
+
+                _pm_emit_progress(
+                    run_dir,
+                    {
+                        "status": "running",
+                        "phase": "prepare_hc_baseline",
+                        "run_dir": str(run_dir),
+                        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "total_subjects": 0,
+                        "completed_subjects": 0,
+                        "current_subject_id": "",
+                        "current_attack_kind": "",
+                        "current_step": 0,
+                        "current_step_total": 0,
+                        "phase_progress": 0.70,
+                        "prepare_note": f"compute HC baseline for {len(hc_gids_effective)} graphs",
+                    },
+                    write_event=True,
+                )
 
                 if pm_hc_base_file is not None:
                     hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
@@ -1289,6 +1628,43 @@ def render_phenotype_matching_tab(
                         seed=int(pm_seed),
                         compute_curvature=bool(pm_compute_curv),
                     )
+
+                phase_box.info("Prepare phase: target/scales")
+                status_box.caption("Собираю target vector, scales и metric families")
+                _push_ui_event("Build target vector and scales")
+                overall_bar.progress(0.18, text="Общий прогресс: prepare 18%")
+
+                target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
+                scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
+                normalized_families = normalize_metric_families(metric_list, None)
+
+                _pm_save_run_inputs(
+                    run_dir,
+                    config={
+                        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "run_dir": str(run_dir),
+                        "metrics": metric_list,
+                        "metric_families": normalized_families,
+                        "attack_kinds": [str(x) for x in pm_attack_kinds],
+                        "steps": int(pm_steps),
+                        "frac": float(pm_frac),
+                        "seed": int(pm_seed),
+                        "eff_k": int(pm_effk),
+                        "heavy_every": int(pm_heavy),
+                        "sigma_max": float(pm_sigma),
+                        "keep_density_from_baseline": bool(pm_keep_density),
+                        "recompute_modules": bool(pm_recompute_modules),
+                        "module_resolution": float(pm_module_resolution),
+                        "removal_mode": str(pm_removal_mode),
+                        "compute_curvature": bool(pm_compute_curv),
+                        "distance_mode": "raw",
+                        "target_vector": target_vector,
+                        "scales": scales,
+                    },
+                    metadata_upload=pm_meta_file,
+                    sz_upload=pm_sz_file,
+                    hc_baseline_upload=pm_hc_base_file,
+                )
 
                 subject_ids: list[str] = []
                 subject_meta_map: dict[str, dict] = {}
@@ -1325,63 +1701,20 @@ def render_phenotype_matching_tab(
                             "graph_name": str(graphs[gid].name),
                         }
 
-                metric_list = [str(x) for x in pm_metrics]
-                target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
-                scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
-                normalized_families = normalize_metric_families(metric_list, None)
-
-                out_root = _pm_resolve_out_dir(pm_out_dir)
-                out_root.mkdir(parents=True, exist_ok=True)
-                run_name = _pm_safe_stem(str(pm_run_label), f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")
-                run_dir = out_root / run_name
-                (run_dir / "aggregate").mkdir(parents=True, exist_ok=True)
-                (run_dir / "per_subject").mkdir(parents=True, exist_ok=True)
-                _pm_write_run_location_note(run_dir)
-                st.session_state["last_degmatch_run_dir"] = str(run_dir)
-
-                _pm_save_run_inputs(
-                    run_dir,
-                    config={
-                        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "run_dir": str(run_dir),
-                        "metrics": metric_list,
-                        "metric_families": normalized_families,
-                        "attack_kinds": [str(x) for x in pm_attack_kinds],
-                        "steps": int(pm_steps),
-                        "frac": float(pm_frac),
-                        "seed": int(pm_seed),
-                        "eff_k": int(pm_effk),
-                        "heavy_every": int(pm_heavy),
-                        "sigma_max": float(pm_sigma),
-                        "keep_density_from_baseline": bool(pm_keep_density),
-                        "recompute_modules": bool(pm_recompute_modules),
-                        "module_resolution": float(pm_module_resolution),
-                        "removal_mode": str(pm_removal_mode),
-                        "compute_curvature": bool(pm_compute_curv),
-                        "distance_mode": "raw",
-                        "target_vector": target_vector,
-                        "scales": scales,
-                    },
-                    metadata_upload=pm_meta_file,
-                    sz_upload=pm_sz_file,
-                    hc_baseline_upload=pm_hc_base_file,
-                )
-
-                overall_bar = st.progress(0.0, text="Общий прогресс: 0%")
-                subject_bar = st.progress(0.0, text="Текущий HC: 0%")
-                status_box = st.empty()
-                save_box = st.empty()
-                files_box = st.empty()
-
                 start_idx = int(pm_start_index or 0)
                 selected_pairs = list(zip(hc_gids_effective, subject_ids))[start_idx:]
                 total_subjects = max(1, len(selected_pairs))
                 manifest_path = run_dir / "manifest.csv"
-                save_box.info(f"Run dir: {run_dir}")
-                _pm_write_progress_snapshot(
+
+                phase_box.success("Run phase: processing HC subjects")
+                status_box.caption(f"Будет обработано HC-графов: {len(selected_pairs)}")
+                _push_ui_event(f"Run phase started: {len(selected_pairs)} HC subjects")
+
+                _pm_emit_progress(
                     run_dir,
                     {
                         "status": "running",
+                        "phase": "run_subjects",
                         "run_dir": str(run_dir),
                         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "total_subjects": int(len(selected_pairs)),
@@ -1390,7 +1723,9 @@ def render_phenotype_matching_tab(
                         "current_attack_kind": "",
                         "current_step": 0,
                         "current_step_total": 0,
+                        "phase_progress": 1.0,
                     },
+                    write_event=True,
                 )
 
                 for pos, (gid, subject_id) in enumerate(selected_pairs, start=1):
@@ -1406,11 +1741,35 @@ def render_phenotype_matching_tab(
                         )
                     )
 
-                    overall_frac = float(pos - 1) / float(total_subjects)
-                    overall_bar.progress(overall_frac, text=f"Общий прогресс: {pos - 1}/{total_subjects} ({int(round(overall_frac * 100))}%)")
+                    overall_frac = 0.20 + 0.75 * (float(pos - 1) / float(total_subjects))
+                    overall_bar.progress(
+                        overall_frac,
+                        text=f"Общий прогресс: {pos - 1}/{total_subjects} HC ({int(round(overall_frac * 100))}%)",
+                    )
                     subject_bar.progress(0.0, text=f"Текущий HC: {subject_id} · 0%")
-                    status_box.caption(f"[{pos}/{total_subjects}] {subject_id}")
+                    phase_box.info(f"Run phase: subject {pos}/{total_subjects}")
+                    status_box.caption(f"[{pos}/{total_subjects}] {subject_id} · build graph")
                     files_box.caption(f"Сохранение: {run_dir} · subject dir: {_pm_subject_dir(run_dir, subject_id)}")
+                    _push_ui_event(f"Start subject {subject_id} ({pos}/{total_subjects})")
+
+                    _pm_emit_progress(
+                        run_dir,
+                        {
+                            "status": "running",
+                            "phase": "subject_build_graph",
+                            "run_dir": str(run_dir),
+                            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "total_subjects": int(len(selected_pairs)),
+                            "completed_subjects": int(pos - 1),
+                            "current_subject_id": str(subject_id),
+                            "current_attack_kind": "",
+                            "current_step": 0,
+                            "current_step_total": 0,
+                            "subject_position": int(pos),
+                            "phase_progress": 0.0,
+                        },
+                        write_event=True,
+                    )
 
                     if bool(pm_skip_done) and _pm_subject_done(run_dir, subject_id):
                         _pm_append_csv(
@@ -1423,8 +1782,12 @@ def render_phenotype_matching_tab(
                                 "saved_dir": str(_pm_subject_dir(run_dir, subject_id)),
                             },
                         )
-                        overall_bar.progress(float(pos) / float(total_subjects))
-                        subject_bar.progress(1.0)
+                        _push_ui_event(f"Skip already done: {subject_id}")
+                        overall_bar.progress(
+                            0.20 + 0.75 * (float(pos) / float(total_subjects)),
+                            text=f"Общий прогресс: {pos}/{total_subjects} HC",
+                        )
+                        subject_bar.progress(1.0, text=f"Текущий HC: {subject_id} · skipped")
                         continue
 
                     t0 = time.perf_counter()
@@ -1437,6 +1800,9 @@ def render_phenotype_matching_tab(
                             analysis_mode=str(analysis_mode),
                         )
 
+                        status_box.caption(f"[{pos}/{total_subjects}] {subject_id} · trajectory")
+                        _push_ui_event(f"Graph built: {subject_id}")
+
                         def _ui_progress(done_attacks: int, total_attacks: int, step_i: int, step_total: int, attack_kind: str, current_value=None) -> None:
                             attack_frac = 0.0 if total_attacks <= 0 else float(done_attacks) / float(total_attacks)
                             step_frac = 0.0 if step_total <= 0 else float(step_i) / float(step_total)
@@ -1448,14 +1814,24 @@ def render_phenotype_matching_tab(
                                     f"{int(round(total_frac * 100))}%"
                                 ),
                             )
+
                             suffix = f" · value={current_value}" if current_value is not None else ""
                             status_box.caption(
                                 f"[{pos}/{total_subjects}] {subject_id} · {attack_kind} · step {step_i}/{step_total}{suffix}"
                             )
-                            _pm_write_progress_snapshot(
+
+                            # Не спамим events.log на каждый шаг: пишем начало/конец и редкие heartbeat.
+                            should_log = (
+                                int(step_i) <= 1
+                                or int(step_i) >= int(step_total)
+                                or (int(step_i) % max(1, int(step_total) // 4) == 0)
+                            )
+
+                            _pm_emit_progress(
                                 run_dir,
                                 {
                                     "status": "running",
+                                    "phase": "subject_trajectory",
                                     "run_dir": str(run_dir),
                                     "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                                     "total_subjects": int(len(selected_pairs)),
@@ -1465,7 +1841,10 @@ def render_phenotype_matching_tab(
                                     "current_step": int(step_i),
                                     "current_step_total": int(step_total),
                                     "current_value": None if current_value is None else float(current_value),
+                                    "subject_position": int(pos),
+                                    "subject_progress": float(total_frac),
                                 },
+                                write_event=bool(should_log),
                             )
                             time.sleep(0.01)
 
@@ -1501,6 +1880,7 @@ def render_phenotype_matching_tab(
 
                         elapsed = float(time.perf_counter() - t0)
                         saved_subject_dir = _pm_subject_dir(run_dir, subject_id)
+
                         _pm_append_csv(
                             manifest_path,
                             {
@@ -1511,44 +1891,96 @@ def render_phenotype_matching_tab(
                                 "saved_dir": str(saved_subject_dir),
                             },
                         )
+
                         files_box.caption(f"Сохранено: {saved_subject_dir}")
+                        _push_ui_event(f"Done subject {subject_id} in {elapsed:.1f}s")
 
                         del G
                         gc.collect()
 
                     except TimeoutError as exc:
+                        elapsed = float(time.perf_counter() - t0)
                         _pm_append_csv(
                             manifest_path,
                             {
                                 "subject_id": str(subject_id),
                                 "graph_id": str(gid),
                                 "status": "timeout",
-                                "elapsed_sec": float(time.perf_counter() - t0),
+                                "elapsed_sec": elapsed,
                                 "error": str(exc),
                             },
+                        )
+                        (_pm_subject_dir(run_dir, subject_id) / "traceback.txt").write_text(
+                            f"TimeoutError: {exc}\n",
+                            encoding="utf-8",
+                        )
+                        _push_ui_event(f"TIMEOUT subject {subject_id}: {exc}")
+                        _pm_emit_progress(
+                            run_dir,
+                            {
+                                "status": "running",
+                                "phase": "subject_timeout",
+                                "run_dir": str(run_dir),
+                                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "total_subjects": int(len(selected_pairs)),
+                                "completed_subjects": int(pos - 1),
+                                "current_subject_id": str(subject_id),
+                                "current_attack_kind": "",
+                                "current_step": 0,
+                                "current_step_total": 0,
+                                "error": str(exc),
+                            },
+                            write_event=True,
                         )
                         gc.collect()
 
                     except Exception as exc:
+                        elapsed = float(time.perf_counter() - t0)
+                        tb = traceback.format_exc()
+
                         _pm_append_csv(
                             manifest_path,
                             {
                                 "subject_id": str(subject_id),
                                 "graph_id": str(gid),
                                 "status": "error",
-                                "elapsed_sec": float(time.perf_counter() - t0),
+                                "elapsed_sec": elapsed,
                                 "error": f"{type(exc).__name__}: {exc}",
                             },
                         )
+                        (_pm_subject_dir(run_dir, subject_id) / "traceback.txt").write_text(tb, encoding="utf-8")
+                        _push_ui_event(f"ERROR subject {subject_id}: {type(exc).__name__}: {exc}")
+                        _pm_emit_progress(
+                            run_dir,
+                            {
+                                "status": "running",
+                                "phase": "subject_error",
+                                "run_dir": str(run_dir),
+                                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "total_subjects": int(len(selected_pairs)),
+                                "completed_subjects": int(pos - 1),
+                                "current_subject_id": str(subject_id),
+                                "current_attack_kind": "",
+                                "current_step": 0,
+                                "current_step_total": 0,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                            write_event=True,
+                        )
                         gc.collect()
 
-                    overall_frac = float(pos) / float(total_subjects)
-                    overall_bar.progress(overall_frac, text=f"Общий прогресс: {pos}/{total_subjects} ({int(round(overall_frac * 100))}%)")
+                    overall_frac = 0.20 + 0.75 * (float(pos) / float(total_subjects))
+                    overall_bar.progress(
+                        overall_frac,
+                        text=f"Общий прогресс: {pos}/{total_subjects} HC ({int(round(overall_frac * 100))}%)",
+                    )
                     subject_bar.progress(1.0, text=f"Текущий HC: {subject_id} · 100%")
-                    _pm_write_progress_snapshot(
+
+                    _pm_emit_progress(
                         run_dir,
                         {
                             "status": "running",
+                            "phase": "subject_done",
                             "run_dir": str(run_dir),
                             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                             "total_subjects": int(len(selected_pairs)),
@@ -1557,32 +1989,70 @@ def render_phenotype_matching_tab(
                             "current_attack_kind": "",
                             "current_step": 0,
                             "current_step_total": 0,
+                            "subject_position": int(pos),
                         },
+                        write_event=True,
                     )
+
+                # ---------------- FINALIZE ----------------
+                phase_box.info("Finalize phase: aggregate + export")
+                status_box.caption("Финализирую aggregate-таблицы и optional export")
+                _push_ui_event("Finalize aggregate results")
+                overall_bar.progress(0.96, text="Общий прогресс: finalize 96%")
+                subject_bar.progress(1.0, text="Текущий HC: завершение")
+
+                _pm_emit_progress(
+                    run_dir,
+                    {
+                        "status": "running",
+                        "phase": "finalize",
+                        "run_dir": str(run_dir),
+                        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "total_subjects": int(len(selected_pairs)),
+                        "completed_subjects": int(len(selected_pairs)),
+                        "current_subject_id": "",
+                        "current_attack_kind": "",
+                        "current_step": 0,
+                        "current_step_total": 0,
+                    },
+                    write_event=True,
+                )
 
                 _pm_finalize_scalar_aggregates(run_dir, metrics=metric_list)
                 pm_res = _pm_load_run_result(
                     run_dir,
                     include_trajectory=not bool(pm_strict_streaming),
                 )
+
                 if bool(pm_export_run_xlsx):
                     try:
                         export_phenotype_match_excel(
                             _pm_load_run_result(run_dir, include_trajectory=True),
                             run_dir / "aggregate" / "run_bundle.xlsx",
                         )
+                        _push_ui_event("run_bundle.xlsx exported")
                     except Exception as exc:
                         logger.warning("Failed to export aggregate phenotype workbook: %s", exc)
-                _pm_write_progress_snapshot(
+                        _push_ui_event(f"run_bundle.xlsx export failed: {type(exc).__name__}: {exc}")
+
+                overall_bar.progress(1.0, text="Общий прогресс: 100%")
+                subject_bar.progress(1.0, text="Текущий HC: done")
+                phase_box.success("Run finished")
+                status_box.caption("Готово")
+
+                _pm_emit_progress(
                     run_dir,
                     {
                         "status": "done",
+                        "phase": "done",
                         "run_dir": str(run_dir),
                         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "total_subjects": int(len(selected_pairs)),
                         "completed_subjects": int(len(selected_pairs)),
                     },
+                    write_event=True,
                 )
+
                 st.session_state["last_degmatch_result"] = pm_res
                 st.session_state["last_degmatch_run_dir"] = str(run_dir)
                 st.success(f"Готово. Результаты сохранены в: {run_dir}")
