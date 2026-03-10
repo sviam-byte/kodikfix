@@ -24,20 +24,16 @@ from src.core_math import classify_phase_transition
 from src.config_loader import load_metrics_info
 from src.metrics import calculate_metrics
 from src.mix_frac_estimator import estimate_mix_frac_star
-from src.degradation import run_degradation_trajectory
+from src.degradation import run_degradation_trajectory, prepare_module_info
 from src.phenotype_matching import (
+    compare_degradation_models,
     build_group_target_vector,
     build_scale_vector,
-    find_best_match_to_target,
     normalize_metric_families,
+    compute_profile_distance,
 )
 from src.phenotype_reporting import build_paper_ready_summary, export_phenotype_match_excel
-from src.phenotype_scalar import (
-    build_scalar_subject_results,
-    build_scalar_summary,
-    build_scalar_winners,
-    find_best_scalar_match,
-)
+from src.phenotype_scalar import build_scalar_subject_results, build_scalar_summary, build_scalar_winners
 from src.plotting import fig_metrics_over_steps, fig_compare_attacks
 from src.services.graph_service import GraphService
 from src.robustness import attack_trajectory_summary, graph_resistance_summary
@@ -274,30 +270,122 @@ def _metadata_match_candidates(entry: GraphEntry | None, gid: str) -> list[str]:
 
 
 def _pm_safe_stem(name: str, fallback: str = "phenotype_match") -> str:
-    """Build a filesystem-safe stem for result files/folders."""
+    """Normalize arbitrary names to filesystem-safe stems."""
     s = str(name or "").strip()
     s = re.sub(r"[^\w\-.]+", "_", s, flags=re.UNICODE)
     s = re.sub(r"_+", "_", s).strip("_.")
     return s or fallback
 
 
-def _pm_append_csv(path: Path, df: pd.DataFrame) -> None:
-    """Append a dataframe to CSV, writing header only for a new file."""
-    if not isinstance(df, pd.DataFrame) or df.empty:
+def _pm_append_csv(path: Path, rows: pd.DataFrame | list[dict] | dict) -> None:
+    """Append rows to CSV, accepting dict/list/DataFrame inputs."""
+    if isinstance(rows, dict):
+        df = pd.DataFrame([rows])
+    elif isinstance(rows, list):
+        df = pd.DataFrame(rows)
+    else:
+        df = rows.copy()
+    if df.empty:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()
     df.to_csv(path, mode="a", header=not exists, index=False)
 
 
-def _pm_subject_done(per_subject_dir: Path, subject_id: str) -> bool:
-    """Check if per-subject workbook already exists for resumable runs."""
-    p = per_subject_dir / f"{_pm_safe_stem(subject_id)}.xlsx"
-    return p.exists()
+def _pm_read_csv_if_exists(path: Path) -> pd.DataFrame:
+    """Read CSV if present and non-empty; otherwise return empty frame."""
+    if path.exists() and path.stat().st_size > 0:
+        return pd.read_csv(path)
+    return pd.DataFrame()
 
 
-def _pm_build_single_subject_result(
+def _pm_subject_dir(run_dir: Path, subject_id: str) -> Path:
+    """Return the canonical per-subject folder path for a run."""
+    return run_dir / "per_subject" / _pm_safe_stem(subject_id, "subject")
+
+
+def _pm_subject_done(run_dir: Path, subject_id: str) -> bool:
+    """Check resumable marker file for a processed subject."""
+    sdir = _pm_subject_dir(run_dir, subject_id)
+    return (sdir / "done.json").exists()
+
+
+def _pm_write_json(path: Path, payload: dict) -> None:
+    """Write UTF-8 JSON with deterministic formatting."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _pm_load_run_result(run_dir: Path) -> dict:
+    """Load aggregate run artifacts into phenotype-matching result structure."""
+    agg = run_dir / "aggregate"
+    subject_df = _pm_read_csv_if_exists(agg / "subject_results.csv")
+    winners_df = _pm_read_csv_if_exists(agg / "winner_results.csv")
+    traj_df = _pm_read_csv_if_exists(agg / "trajectory_results.csv")
+    scalar_subject_df = _pm_read_csv_if_exists(agg / "scalar_subject_results.csv")
+    scalar_winners_df = _pm_read_csv_if_exists(agg / "scalar_winners.csv")
+    scalar_summary_df = _pm_read_csv_if_exists(agg / "scalar_summary.csv")
+
+    cfg = {}
+    cfg_path = run_dir / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+
+    return {
+        "target_vector": dict(cfg.get("target_vector", {}) or {}),
+        "scales": dict(cfg.get("scales", {}) or {}),
+        "subject_results": subject_df,
+        "winner_results": winners_df,
+        "trajectory_results": traj_df,
+        "scalar_subject_results": scalar_subject_df,
+        "scalar_winners": scalar_winners_df,
+        "scalar_summary": scalar_summary_df,
+        "metrics_used": list(cfg.get("metrics", []) or []),
+        "metric_families": dict(cfg.get("metric_families", {}) or {}),
+        "distance_mode": str(cfg.get("distance_mode", "raw")),
+    }
+
+
+def _pm_save_run_inputs(
+    run_dir: Path,
     *,
+    config: dict,
+    metadata_upload=None,
+    sz_upload=None,
+    hc_baseline_upload=None,
+) -> None:
+    """Persist run config and raw uploaded files for reproducibility."""
+    raw_dir = run_dir / "raw_inputs"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    _pm_write_json(run_dir / "config.json", config)
+
+    for upload, fallback in [
+        (metadata_upload, "metadata"),
+        (sz_upload, "sz_metrics"),
+        (hc_baseline_upload, "hc_baseline"),
+    ]:
+        if upload is None:
+            continue
+        data = None
+        try:
+            data = upload.getvalue()
+        except Exception:
+            try:
+                data = upload.read()
+            except Exception:
+                data = None
+        if data:
+            name = getattr(upload, "name", "") or fallback
+            (raw_dir / _pm_safe_stem(name, fallback)).write_bytes(data)
+
+
+def _pm_stream_subject(
+    *,
+    run_dir: Path,
     G: nx.Graph,
     subject_id: str,
     subject_idx: int,
@@ -319,38 +407,152 @@ def _pm_build_single_subject_result(
     module_resolution: float,
     removal_mode: str,
     fast_mode: bool,
-    subject_metadata_row: dict | None = None,
+    subject_meta: dict | None = None,
+    timeout_seconds: float = 0.0,
     progress_cb=None,
-) -> dict:
-    """Compute phenotype matching for one HC graph and all chosen attacks.
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Process one subject in streaming mode and persist intermediate outputs."""
+    sdir = _pm_subject_dir(run_dir, subject_id)
+    sdir.mkdir(parents=True, exist_ok=True)
 
-    The function isolates single-subject processing to support:
-    - immediate per-subject persistence,
-    - resumable execution,
-    - timeouts and error isolation.
-    """
+    traj_path = sdir / "trajectory.csv"
+    scalar_path = sdir / "scalar_subject_results.csv"
+    best_path = sdir / "subject_results.csv"
+    winner_path = sdir / "winner_results.csv"
+
+    for path in [traj_path, scalar_path, best_path, winner_path]:
+        if path.exists():
+            path.unlink()
+
+    subject_meta = dict(subject_meta or {})
+    subject_meta.setdefault("subject_id", str(subject_id))
+    t0 = time.perf_counter()
+
     subject_rows: list[dict] = []
-    all_traj: list[pd.DataFrame] = []
     scalar_rows: list[dict] = []
+    winner_rows: list[dict] = []
 
-    G0 = nx.Graph(G)
     module_info = None
     if any(k in {"inter_module_removal", "intra_module_removal"} for k in attack_kinds):
-        from src.degradation import prepare_module_info
-
         module_info = prepare_module_info(
-            G0,
+            G,
             seed=int(seed) + int(subject_idx),
             resolution=float(module_resolution),
         )
 
-    n_attacks = max(1, len(attack_kinds))
     for attack_pos, kind in enumerate(attack_kinds, start=1):
-        if callable(progress_cb):
-            progress_cb(attack_pos - 1, n_attacks, f"{subject_id} · {kind}")
+        best_distance = float("inf")
+        best_row = None
+        metric_best: dict[str, dict] = {}
+        last_step = max(1, int(steps))
+        baseline_holder = {}
 
-        traj_df, _aux = run_degradation_trajectory(
-            G0,
+        def _check_timeout() -> None:
+            if timeout_seconds and (time.perf_counter() - t0) > float(timeout_seconds):
+                raise TimeoutError(f"subject timeout > {float(timeout_seconds):.1f}s")
+
+        def _row_cb(row: dict, i: int, total_steps: int) -> None:
+            nonlocal best_distance, best_row, last_step
+            _check_timeout()
+            last_step = max(1, int(total_steps))
+
+            row2 = dict(row)
+            row2["subject_idx"] = int(subject_idx)
+            row2["subject_id"] = str(subject_id)
+            row2["attack_kind"] = str(kind)
+            for k, v in subject_meta.items():
+                row2.setdefault(k, v)
+
+            info = compute_profile_distance(
+                row2,
+                target_vector=target_vector,
+                metrics=metric_list,
+                scales=scales,
+                distance_mode="raw",
+                metric_families=normalized_families,
+            )
+            row2["distance_to_target"] = float(info.get("distance", np.nan))
+            row2["n_used_metrics"] = int(info.get("n_used_metrics", 0))
+            row2["distance_mode"] = str(info.get("distance_mode", "raw"))
+            row2["used_metrics"] = ",".join(info.get("used_metrics", []) or [])
+
+            fam_d = info.get("family_distances", {}) or {}
+            for fam in normalized_families:
+                row2[f"family_dist__{fam}"] = float(fam_d.get(fam, np.nan))
+
+            if not baseline_holder:
+                baseline_holder.update(row2)
+            baseline = baseline_holder
+
+            for col in ["density", "eff_w", "lcc_frac", "E", "total_weight"]:
+                base_val = pd.to_numeric(pd.Series([baseline.get(col, np.nan)]), errors="coerce").iloc[0]
+                cur_val = pd.to_numeric(pd.Series([row2.get(col, np.nan)]), errors="coerce").iloc[0]
+                row2[f"delta_{col}"] = (
+                    float(cur_val - base_val)
+                    if pd.notna(base_val) and pd.notna(cur_val)
+                    else np.nan
+                )
+
+            base_e = pd.to_numeric(pd.Series([baseline.get("E", np.nan)]), errors="coerce").iloc[0]
+            cur_e = pd.to_numeric(pd.Series([row2.get("E", np.nan)]), errors="coerce").iloc[0]
+            row2["removed_edge_fraction_from_baseline"] = (
+                float(1.0 - (cur_e / base_e))
+                if pd.notna(base_e) and base_e > 0 and pd.notna(cur_e)
+                else np.nan
+            )
+
+            _pm_append_csv(traj_path, row2)
+            _pm_append_csv(run_dir / "aggregate" / "trajectory_results.csv", row2)
+
+            dist = float(row2.get("distance_to_target", np.nan))
+            if np.isfinite(dist) and dist < best_distance:
+                best_distance = dist
+                best_row = dict(row2)
+
+            for m in metric_list:
+                val = pd.to_numeric(pd.Series([row2.get(m, np.nan)]), errors="coerce").iloc[0]
+                tgt = pd.to_numeric(pd.Series([target_vector.get(m, np.nan)]), errors="coerce").iloc[0]
+                sc = pd.to_numeric(pd.Series([scales.get(m, 1.0)]), errors="coerce").iloc[0]
+
+                if pd.isna(val) or pd.isna(tgt):
+                    err = np.nan
+                else:
+                    if pd.isna(sc) or float(sc) <= 1e-12:
+                        sc = 1.0
+                    err = abs((float(val) - float(tgt)) / float(sc))
+
+                prev = metric_best.get(m)
+                prev_err = np.nan if prev is None else float(prev.get("best_scalar_error", np.nan))
+                if prev is None or (np.isfinite(err) and (not np.isfinite(prev_err) or err < prev_err)):
+                    metric_best[m] = {
+                        "subject_idx": int(subject_idx),
+                        "subject_id": str(subject_id),
+                        "attack_kind": str(kind),
+                        "metric": str(m),
+                        "metric_family": next(
+                            (fam for fam, fam_metrics in normalized_families.items() if m in fam_metrics),
+                            "singleton",
+                        ),
+                        "best_step": row2.get("step", None),
+                        "best_damage_frac": float(row2.get("damage_frac", np.nan)),
+                        "best_scalar_error": float(err) if np.isfinite(err) else np.nan,
+                        "best_value": float(val) if pd.notna(val) else np.nan,
+                    }
+
+        def _progress_cb(i: int, total_steps: int, current_value=None) -> None:
+            _check_timeout()
+            if callable(progress_cb):
+                progress_cb(
+                    attack_pos - 1,
+                    len(attack_kinds),
+                    i,
+                    total_steps,
+                    str(kind),
+                    current_value,
+                )
+
+        run_degradation_trajectory(
+            G,
             kind=str(kind),
             steps=int(steps),
             frac=float(frac),
@@ -367,102 +569,90 @@ def _pm_build_single_subject_result(
             module_resolution=float(module_resolution),
             removal_mode=str(removal_mode),
             fast_mode=bool(fast_mode),
+            progress_cb=_progress_cb,
+            row_cb=_row_cb,
         )
 
-        best = find_best_match_to_target(
-            traj_df,
-            target_vector=target_vector,
-            metrics=metric_list,
-            scales=scales,
-            distance_mode="raw",
-            metric_families=normalized_families,
-        )
-
-        scored = best["scored_trajectory"].copy()
-        scored["subject_idx"] = int(subject_idx)
-        scored["subject_id"] = str(subject_id)
-        scored["attack_kind"] = str(kind)
-        if subject_metadata_row:
-            for k, v in subject_metadata_row.items():
-                if k not in scored.columns:
-                    scored[k] = v
-        all_traj.append(scored)
-
-        best_row = best.get("best_row", {}) or {}
-        row = {
+        subject_row = {
             "subject_idx": int(subject_idx),
             "subject_id": str(subject_id),
             "attack_kind": str(kind),
-            "best_step": best["best_step"],
-            "best_damage_frac": float(best["best_damage_frac"]),
-            "best_distance": float(best["best_distance"]),
-            "n_used_metrics": int(best["n_used_metrics"]),
-            "distance_mode": str(best.get("distance_mode", "raw")),
-            "best_delta_density": float(best_row.get("delta_density", np.nan)),
-            "best_delta_total_weight": float(best_row.get("delta_total_weight", best_row.get("delta_E", np.nan))),
-            "best_delta_E": float(best_row.get("delta_E", np.nan)),
-            "best_removed_edge_fraction_from_baseline": float(best_row.get("removed_edge_fraction_from_baseline", np.nan)),
+            "best_step": None if best_row is None else best_row.get("step", None),
+            "best_damage_frac": np.nan if best_row is None else float(best_row.get("damage_frac", np.nan)),
+            "best_distance": np.nan if best_row is None else float(best_row.get("distance_to_target", np.nan)),
+            "n_used_metrics": 0 if best_row is None else int(best_row.get("n_used_metrics", 0)),
+            "distance_mode": "raw" if best_row is None else str(best_row.get("distance_mode", "raw")),
+            "best_delta_density": np.nan if best_row is None else float(best_row.get("delta_density", np.nan)),
+            "best_delta_total_weight": np.nan if best_row is None else float(best_row.get("delta_total_weight", best_row.get("delta_E", np.nan))),
+            "best_delta_E": np.nan if best_row is None else float(best_row.get("delta_E", np.nan)),
+            "best_removed_edge_fraction_from_baseline": np.nan if best_row is None else float(best_row.get("removed_edge_fraction_from_baseline", np.nan)),
         }
-        if subject_metadata_row:
-            row.update(subject_metadata_row)
-        subject_rows.append(row)
+        subject_row.update(subject_meta)
+        subject_rows.append(subject_row)
 
-        scalar_best = find_best_scalar_match(
-            traj_df,
-            target_vector=target_vector,
-            metrics=metric_list,
-            scales=scales,
-            absolute=True,
-        )
-        for m in metric_list:
-            info = scalar_best.get(m, {})
-            srow = {
-                "subject_idx": int(subject_idx),
-                "subject_id": str(subject_id),
-                "attack_kind": str(kind),
-                "metric": str(m),
-                "metric_family": next((fam for fam, fam_metrics in normalized_families.items() if m in fam_metrics), "singleton"),
-                "best_step": info.get("best_step", None),
-                "best_damage_frac": float(info.get("best_damage_frac", np.nan)),
-                "best_scalar_error": float(info.get("best_scalar_error", np.nan)),
-                "best_value": float(info.get("best_value", np.nan)),
-            }
-            if subject_metadata_row:
-                srow.update(subject_metadata_row)
-            scalar_rows.append(srow)
+        _pm_append_csv(best_path, subject_row)
+        _pm_append_csv(run_dir / "aggregate" / "subject_results.csv", subject_row)
+
+        scalar_block = list(metric_best.values())
+        if scalar_block:
+            scalar_rows.extend(scalar_block)
+            _pm_append_csv(scalar_path, scalar_block)
+            _pm_append_csv(run_dir / "aggregate" / "scalar_subject_results.csv", scalar_block)
 
         if callable(progress_cb):
-            progress_cb(attack_pos, n_attacks, f"{subject_id} · {kind}")
+            progress_cb(attack_pos, len(attack_kinds), last_step, last_step, str(kind), None)
 
     subject_df = pd.DataFrame(subject_rows)
-    traj_df = pd.concat(all_traj, ignore_index=True) if all_traj else pd.DataFrame()
-    scalar_subject_df = build_scalar_subject_results(pd.DataFrame(scalar_rows), metrics=metric_list)
-    scalar_winners_df = build_scalar_winners(scalar_subject_df)
-    scalar_summary_df = build_scalar_summary(scalar_subject_df, scalar_winners_df)
 
-    winners = []
     if not subject_df.empty:
         valid = subject_df[np.isfinite(pd.to_numeric(subject_df["best_distance"], errors="coerce"))].copy()
         if not valid.empty:
             idx = int(valid["best_distance"].astype(float).idxmin())
-            wr = valid.loc[idx].to_dict()
-            wr["is_subject_winner"] = True
-            winners.append(wr)
-    winners_df = pd.DataFrame(winners)
+            winner_row = valid.loc[idx].to_dict()
+            winner_row["is_subject_winner"] = True
+            winner_rows.append(winner_row)
+            _pm_append_csv(winner_path, winner_row)
+            _pm_append_csv(run_dir / "aggregate" / "winner_results.csv", winner_row)
 
-    return {
-        "target_vector": dict(target_vector),
-        "scales": dict(scales),
+    scalar_subject_df = build_scalar_subject_results(pd.DataFrame(scalar_rows), metrics=metric_list)
+    scalar_winners_df = build_scalar_winners(scalar_subject_df)
+    scalar_summary_df = build_scalar_summary(scalar_subject_df, scalar_winners_df)
+
+    _pm_append_csv(run_dir / "aggregate" / "scalar_winners.csv", scalar_winners_df)
+    _pm_append_csv(run_dir / "aggregate" / "scalar_summary.csv", scalar_summary_df)
+
+    result = {
+        "target_vector": target_vector,
+        "scales": scales,
         "subject_results": subject_df,
-        "winner_results": winners_df,
-        "trajectory_results": traj_df,
+        "winner_results": pd.DataFrame(winner_rows),
+        "trajectory_results": _pm_read_csv_if_exists(traj_path),
         "scalar_subject_results": scalar_subject_df,
         "scalar_winners": scalar_winners_df,
         "scalar_summary": scalar_summary_df,
-        "metrics_used": list(metric_list),
-        "metric_families": dict(normalized_families),
+        "metrics_used": metric_list,
+        "metric_families": normalized_families,
         "distance_mode": "raw",
     }
+
+    export_phenotype_match_excel(result, sdir / "subject_bundle.xlsx")
+
+    _pm_write_json(
+        sdir / "done.json",
+        {
+            "subject_id": str(subject_id),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_sec": float(time.perf_counter() - t0),
+            "n_attacks": int(len(attack_kinds)),
+        },
+    )
+
+    return (
+        subject_df,
+        pd.DataFrame(winner_rows),
+        scalar_subject_df,
+        _pm_read_csv_if_exists(traj_path),
+    )
 
 
 def _match_workspace_graphs_to_metadata(
@@ -826,12 +1016,12 @@ def render_phenotype_matching_tab(
             key="pm_hc_base_file",
         )
 
-        st.markdown("#### Вывод и контроль выполнения")
+        st.markdown("#### Вывод и управление")
         pm_out_dir = st.text_input(
             "Папка вывода",
             value=str(st.session_state.get("pm_out_dir", "phenotype_runs")),
             key="pm_out_dir",
-            help="Локальная папка Streamlit-процесса для run-артефактов.",
+            help="Для локального запуска: путь на твоём компьютере, куда писать run-папку.",
         )
         pm_run_label = st.text_input(
             "Название run",
@@ -842,7 +1032,6 @@ def render_phenotype_matching_tab(
             "Проверять, сделано ли уже",
             value=True,
             key="pm_skip_done",
-            help="Пропускает HC, для которых уже есть per_subject/<subject>.xlsx.",
         )
         pm_start_index = st.number_input(
             "Начать с HC-индекса",
@@ -852,7 +1041,7 @@ def render_phenotype_matching_tab(
             key="pm_start_index",
         )
         pm_timeout_per_subject = st.number_input(
-            "Лимит времени на один HC-граф (сек, 0 = без лимита)",
+            "Скип по времени на HC-граф (сек, 0=без лимита)",
             min_value=0,
             value=int(st.session_state.get("pm_timeout_per_subject", 0)),
             step=10,
@@ -969,284 +1158,265 @@ def render_phenotype_matching_tab(
             elif not pm_metrics:
                 st.error("Выбери хотя бы одну метрику.")
             else:
-                with st.spinner("HC → SZ phenotype matching..."):
-                    use_metadata_mode = pm_match is not None and len(pm_match.get("hc_gids", [])) > 0 and len(pm_match.get("sz_gids", [])) > 0
+                use_metadata_mode = (
+                    pm_match is not None
+                    and len(pm_match.get("hc_gids", [])) > 0
+                    and len(pm_match.get("sz_gids", [])) > 0
+                )
 
-                    if use_metadata_mode:
-                        hc_gids_effective = list(pm_match["hc_gids"])
-                        sz_gids_effective = list(pm_match["sz_gids"])
-                    else:
-                        hc_gids_effective = list(pm_hc_gids)
-                        sz_gids_effective = []
+                if use_metadata_mode:
+                    hc_gids_effective = list(pm_match["hc_gids"])
+                    sz_gids_effective = list(pm_match["sz_gids"])
+                else:
+                    hc_gids_effective = list(pm_hc_gids)
+                    sz_gids_effective = []
 
-                    if not hc_gids_effective:
-                        st.error("Не найдено HC-графов: ни по metadata, ни вручную.")
+                if not hc_gids_effective:
+                    st.error("Не найдено HC-графов: ни по metadata, ни вручную.")
+                    st.stop()
+
+                if use_metadata_mode:
+                    sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
+                        sz_gids_effective,
+                        graphs=graphs,
+                        min_conf=float(min_conf),
+                        min_weight=float(min_weight),
+                        analysis_mode=str(analysis_mode),
+                        eff_k=int(pm_effk),
+                        seed=int(pm_seed),
+                        compute_curvature=bool(pm_compute_curv),
+                    )
+                else:
+                    if pm_sz_file is None:
+                        st.error("Либо загрузи metadata, либо загрузи таблицу метрик SZ-группы.")
                         st.stop()
+                    sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
 
-                    if use_metadata_mode:
-                        sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
-                            sz_gids_effective,
-                            graphs=graphs,
-                            min_conf=float(min_conf),
-                            min_weight=float(min_weight),
-                            analysis_mode=str(analysis_mode),
-                            eff_k=int(pm_effk),
-                            seed=int(pm_seed),
-                            compute_curvature=bool(pm_compute_curv),
-                        )
-                    else:
-                        if pm_sz_file is None:
-                            st.error("Либо загрузи metadata, либо загрузи таблицу метрик SZ-группы.")
-                            st.stop()
-                        sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
+                if pm_hc_base_file is not None:
+                    hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
+                else:
+                    hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
+                        hc_gids_effective,
+                        graphs=graphs,
+                        min_conf=float(min_conf),
+                        min_weight=float(min_weight),
+                        analysis_mode=str(analysis_mode),
+                        eff_k=int(pm_effk),
+                        seed=int(pm_seed),
+                        compute_curvature=bool(pm_compute_curv),
+                    )
 
-                    if pm_hc_base_file is not None:
-                        hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
-                    else:
-                        hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
-                            hc_gids_effective,
-                            graphs=graphs,
-                            min_conf=float(min_conf),
-                            min_weight=float(min_weight),
-                            analysis_mode=str(analysis_mode),
-                            eff_k=int(pm_effk),
-                            seed=int(pm_seed),
-                            compute_curvature=bool(pm_compute_curv),
-                        )
+                subject_ids: list[str] = []
+                subject_meta_map: dict[str, dict] = {}
 
-                    target_vector = build_group_target_vector(sz_group_metrics_df, metrics=pm_metrics)
-                    scales = build_scale_vector(hc_baseline_metrics_df, metrics=pm_metrics)
-                    normalized_families = normalize_metric_families(pm_metrics, None)
-
-                    out_root = Path(str(pm_out_dir or "phenotype_runs")).expanduser()
-                    run_name = _pm_safe_stem(str(pm_run_label or "") or f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")
-                    run_dir = out_root / run_name
-                    per_subject_dir = run_dir / "per_subject"
-                    aggregate_dir = run_dir / "aggregate"
-                    per_subject_dir.mkdir(parents=True, exist_ok=True)
-                    aggregate_dir.mkdir(parents=True, exist_ok=True)
-
-                    overall_bar = st.progress(0.0)
-                    subject_bar = st.progress(0.0)
-                    status_box = st.empty()
-
-                    manifest_rows = []
-                    all_winners = []
-                    all_subject = []
-                    all_traj = []
-                    all_scalar_subject = []
-                    all_scalar_winners = []
-                    all_scalar_summary = []
-
-                    hc_meta_lookup = {}
-                    if use_metadata_mode:
-                        hc_meta_df = pm_match.get("hc_meta_df", pd.DataFrame()).copy()
-                        for _, row in hc_meta_df.iterrows():
-                            graph_id = str(row.get("graph_id", ""))
-                            hc_meta_lookup[graph_id] = {
-                                "subject_id": str(row.get("subject_id", graph_id)),
-                                "graph_id": graph_id,
-                                "graph_name": str(graphs[graph_id].name) if graph_id in graphs else "",
-                                "group_value": row.get("group_value_raw", ""),
-                            }
-
-                    start_idx = int(pm_start_index or 0)
-                    skip_done = bool(pm_skip_done)
-                    timeout_per_subject = float(pm_timeout_per_subject or 0)
-
-                    hc_gids_effective = hc_gids_effective[start_idx:]
-                    total_subjects = max(1, len(hc_gids_effective))
-
-                    for pos, gid in enumerate(hc_gids_effective, start=1):
-                        entry = graphs[gid]
-                        if use_metadata_mode:
-                            meta_row = dict(hc_meta_lookup.get(str(gid), {}))
-                            subject_id = str(meta_row.get("subject_id", gid))
-                            if not meta_row:
-                                meta_row = {
-                                    "subject_id": subject_id,
-                                    "graph_id": str(gid),
-                                    "graph_name": str(entry.name),
-                                    "group_value": "",
-                                }
-                        else:
+                if use_metadata_mode:
+                    hc_meta_df = pm_match.get("hc_meta_df", pd.DataFrame()).copy()
+                    for gid in hc_gids_effective:
+                        sub = hc_meta_df.loc[hc_meta_df["graph_id"] == gid]
+                        if sub.empty:
                             subject_id = str(gid)
                             meta_row = {
                                 "subject_id": subject_id,
                                 "graph_id": str(gid),
-                                "graph_name": str(entry.name),
+                                "graph_name": str(graphs[gid].name),
+                                "group_value": "",
                             }
-
-                        overall_bar.progress(float(pos - 1) / float(total_subjects))
-                        subject_bar.progress(0.0)
-                        status_box.caption(f"[{pos}/{total_subjects}] {subject_id}")
-
-                        if skip_done and _pm_subject_done(per_subject_dir, subject_id):
-                            manifest_rows.append({
+                        else:
+                            row = sub.iloc[0]
+                            subject_id = str(row.get("subject_id", gid))
+                            meta_row = {
                                 "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "graph_name": str(graphs[gid].name),
+                                "group_value": row.get("group_value_raw", ""),
+                            }
+                        subject_ids.append(subject_id)
+                        subject_meta_map[str(gid)] = meta_row
+                else:
+                    subject_ids = [str(gid) for gid in hc_gids_effective]
+                    for gid in hc_gids_effective:
+                        subject_meta_map[str(gid)] = {
+                            "subject_id": str(gid),
+                            "graph_id": str(gid),
+                            "graph_name": str(graphs[gid].name),
+                        }
+
+                metric_list = [str(x) for x in pm_metrics]
+                target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
+                scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
+                normalized_families = normalize_metric_families(metric_list, None)
+
+                out_root = Path(str(pm_out_dir)).expanduser()
+                run_name = _pm_safe_stem(str(pm_run_label), f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")
+                run_dir = out_root / run_name
+                (run_dir / "aggregate").mkdir(parents=True, exist_ok=True)
+                (run_dir / "per_subject").mkdir(parents=True, exist_ok=True)
+
+                _pm_save_run_inputs(
+                    run_dir,
+                    config={
+                        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "run_dir": str(run_dir),
+                        "metrics": metric_list,
+                        "metric_families": normalized_families,
+                        "attack_kinds": [str(x) for x in pm_attack_kinds],
+                        "steps": int(pm_steps),
+                        "frac": float(pm_frac),
+                        "seed": int(pm_seed),
+                        "eff_k": int(pm_effk),
+                        "heavy_every": int(pm_heavy),
+                        "sigma_max": float(pm_sigma),
+                        "keep_density_from_baseline": bool(pm_keep_density),
+                        "recompute_modules": bool(pm_recompute_modules),
+                        "module_resolution": float(pm_module_resolution),
+                        "removal_mode": str(pm_removal_mode),
+                        "compute_curvature": bool(pm_compute_curv),
+                        "distance_mode": "raw",
+                        "target_vector": target_vector,
+                        "scales": scales,
+                    },
+                    metadata_upload=pm_meta_file,
+                    sz_upload=pm_sz_file,
+                    hc_baseline_upload=pm_hc_base_file,
+                )
+
+                overall_bar = st.progress(0.0)
+                subject_bar = st.progress(0.0)
+                status_box = st.empty()
+
+                start_idx = int(pm_start_index or 0)
+                selected_pairs = list(zip(hc_gids_effective, subject_ids))[start_idx:]
+                total_subjects = max(1, len(selected_pairs))
+                manifest_path = run_dir / "manifest.csv"
+
+                for pos, (gid, subject_id) in enumerate(selected_pairs, start=1):
+                    entry = graphs[gid]
+                    subject_meta = dict(
+                        subject_meta_map.get(
+                            str(gid),
+                            {
+                                "subject_id": subject_id,
+                                "graph_id": str(gid),
+                                "graph_name": str(entry.name),
+                            },
+                        )
+                    )
+
+                    overall_bar.progress(float(pos - 1) / float(total_subjects))
+                    subject_bar.progress(0.0)
+                    status_box.caption(f"[{pos}/{total_subjects}] {subject_id}")
+
+                    if bool(pm_skip_done) and _pm_subject_done(run_dir, subject_id):
+                        _pm_append_csv(
+                            manifest_path,
+                            {
+                                "subject_id": str(subject_id),
                                 "graph_id": str(gid),
                                 "status": "skipped_done",
                                 "elapsed_sec": 0.0,
-                                "saved_path": str(per_subject_dir / f'{_pm_safe_stem(subject_id)}.xlsx'),
-                            })
-                            pd.DataFrame(manifest_rows).to_csv(run_dir / "manifest.csv", index=False)
-                            overall_bar.progress(float(pos) / float(total_subjects))
-                            subject_bar.progress(1.0)
-                            continue
+                                "saved_dir": str(_pm_subject_dir(run_dir, subject_id)),
+                            },
+                        )
+                        overall_bar.progress(float(pos) / float(total_subjects))
+                        subject_bar.progress(1.0)
+                        continue
 
-                        t0 = time.perf_counter()
-                        try:
-                            G = _build_current_graph_for_entry(
-                                entry,
-                                min_conf=float(min_conf),
-                                min_weight=float(min_weight),
-                                analysis_mode=str(analysis_mode),
+                    t0 = time.perf_counter()
+
+                    try:
+                        G = _build_current_graph_for_entry(
+                            entry,
+                            min_conf=float(min_conf),
+                            min_weight=float(min_weight),
+                            analysis_mode=str(analysis_mode),
+                        )
+
+                        def _ui_progress(done_attacks: int, total_attacks: int, step_i: int, step_total: int, attack_kind: str, current_value=None) -> None:
+                            attack_frac = 0.0 if total_attacks <= 0 else float(done_attacks) / float(total_attacks)
+                            step_frac = 0.0 if step_total <= 0 else float(step_i) / float(step_total)
+                            total_frac = min(1.0, attack_frac + step_frac / max(1, total_attacks))
+                            subject_bar.progress(total_frac)
+                            suffix = f" · value={current_value}" if current_value is not None else ""
+                            status_box.caption(
+                                f"[{pos}/{total_subjects}] {subject_id} · {attack_kind} · step {step_i}/{step_total}{suffix}"
                             )
 
-                            def _subject_progress(done_attacks: int, total_attacks: int, detail: str = "") -> None:
-                                frac_val = 0.0 if total_attacks <= 0 else float(done_attacks) / float(total_attacks)
-                                subject_bar.progress(min(1.0, max(0.0, frac_val)))
-                                status_box.caption(f"[{pos}/{total_subjects}] {detail}")
-                                if timeout_per_subject > 0 and (time.perf_counter() - t0) > timeout_per_subject:
-                                    raise TimeoutError(f"subject timeout > {timeout_per_subject:.1f}s")
+                        _pm_stream_subject(
+                            run_dir=run_dir,
+                            G=G,
+                            subject_id=str(subject_id),
+                            subject_idx=pos - 1 + start_idx,
+                            attack_kinds=[str(x) for x in pm_attack_kinds],
+                            metric_list=metric_list,
+                            target_vector=target_vector,
+                            scales=scales,
+                            normalized_families=normalized_families,
+                            steps=int(pm_steps),
+                            frac=float(pm_frac),
+                            seed=int(pm_seed),
+                            eff_sources_k=int(pm_effk),
+                            compute_heavy_every=int(pm_heavy),
+                            compute_curvature=bool(pm_compute_curv),
+                            curvature_sample_edges=80,
+                            noise_sigma_max=float(pm_sigma),
+                            keep_density_from_baseline=bool(pm_keep_density),
+                            recompute_modules=bool(pm_recompute_modules),
+                            module_resolution=float(pm_module_resolution),
+                            removal_mode=str(pm_removal_mode),
+                            fast_mode=False,
+                            subject_meta=subject_meta,
+                            timeout_seconds=float(pm_timeout_per_subject or 0),
+                            progress_cb=_ui_progress,
+                        )
 
-                            single_res = _pm_build_single_subject_result(
-                                G=G,
-                                subject_id=subject_id,
-                                subject_idx=pos - 1 + start_idx,
-                                attack_kinds=[str(x) for x in pm_attack_kinds],
-                                metric_list=[str(x) for x in pm_metrics],
-                                target_vector=target_vector,
-                                scales=scales,
-                                normalized_families=normalized_families,
-                                steps=int(pm_steps),
-                                frac=float(pm_frac),
-                                seed=int(pm_seed),
-                                eff_sources_k=int(pm_effk),
-                                compute_heavy_every=int(pm_heavy),
-                                compute_curvature=bool(pm_compute_curv),
-                                curvature_sample_edges=80,
-                                noise_sigma_max=float(pm_sigma),
-                                keep_density_from_baseline=bool(pm_keep_density),
-                                recompute_modules=bool(pm_recompute_modules),
-                                module_resolution=float(pm_module_resolution),
-                                removal_mode=str(pm_removal_mode),
-                                fast_mode=False,
-                                subject_metadata_row=meta_row,
-                                progress_cb=_subject_progress,
-                            )
-
-                            subject_path = per_subject_dir / f"{_pm_safe_stem(subject_id)}.xlsx"
-                            export_phenotype_match_excel(single_res, subject_path)
-
-                            _pm_append_csv(aggregate_dir / "winner_results.csv", single_res.get("winner_results", pd.DataFrame()))
-                            _pm_append_csv(aggregate_dir / "subject_results.csv", single_res.get("subject_results", pd.DataFrame()))
-                            _pm_append_csv(aggregate_dir / "trajectory_results.csv", single_res.get("trajectory_results", pd.DataFrame()))
-                            _pm_append_csv(aggregate_dir / "scalar_subject_results.csv", single_res.get("scalar_subject_results", pd.DataFrame()))
-                            _pm_append_csv(aggregate_dir / "scalar_winners.csv", single_res.get("scalar_winners", pd.DataFrame()))
-                            _pm_append_csv(aggregate_dir / "scalar_summary.csv", single_res.get("scalar_summary", pd.DataFrame()))
-
-                            all_winners.append(single_res.get("winner_results", pd.DataFrame()))
-                            all_subject.append(single_res.get("subject_results", pd.DataFrame()))
-                            all_traj.append(single_res.get("trajectory_results", pd.DataFrame()))
-                            all_scalar_subject.append(single_res.get("scalar_subject_results", pd.DataFrame()))
-                            all_scalar_winners.append(single_res.get("scalar_winners", pd.DataFrame()))
-                            all_scalar_summary.append(single_res.get("scalar_summary", pd.DataFrame()))
-
-                            manifest_rows.append({
-                                "subject_id": subject_id,
+                        elapsed = float(time.perf_counter() - t0)
+                        _pm_append_csv(
+                            manifest_path,
+                            {
+                                "subject_id": str(subject_id),
                                 "graph_id": str(gid),
                                 "status": "ok",
-                                "elapsed_sec": float(time.perf_counter() - t0),
-                                "saved_path": str(subject_path),
-                            })
-                            del G
-                            del single_res
-                            gc.collect()
-                        except TimeoutError as exc:
-                            manifest_rows.append({
-                                "subject_id": subject_id,
+                                "elapsed_sec": elapsed,
+                                "saved_dir": str(_pm_subject_dir(run_dir, subject_id)),
+                            },
+                        )
+
+                        del G
+                        gc.collect()
+
+                    except TimeoutError as exc:
+                        _pm_append_csv(
+                            manifest_path,
+                            {
+                                "subject_id": str(subject_id),
                                 "graph_id": str(gid),
                                 "status": "timeout",
                                 "elapsed_sec": float(time.perf_counter() - t0),
                                 "error": str(exc),
-                            })
-                            gc.collect()
-                        except Exception as exc:
-                            manifest_rows.append({
-                                "subject_id": subject_id,
+                            },
+                        )
+                        gc.collect()
+
+                    except Exception as exc:
+                        _pm_append_csv(
+                            manifest_path,
+                            {
+                                "subject_id": str(subject_id),
                                 "graph_id": str(gid),
                                 "status": "error",
                                 "elapsed_sec": float(time.perf_counter() - t0),
                                 "error": f"{type(exc).__name__}: {exc}",
-                            })
-                            gc.collect()
+                            },
+                        )
+                        gc.collect()
 
-                        pd.DataFrame(manifest_rows).to_csv(run_dir / "manifest.csv", index=False)
-                        overall_bar.progress(float(pos) / float(total_subjects))
-                        subject_bar.progress(1.0)
+                    overall_bar.progress(float(pos) / float(total_subjects))
+                    subject_bar.progress(1.0)
 
-                    winners_df = pd.concat(all_winners, ignore_index=True) if all_winners else pd.DataFrame()
-                    subject_df = pd.concat(all_subject, ignore_index=True) if all_subject else pd.DataFrame()
-                    traj_df = pd.concat(all_traj, ignore_index=True) if all_traj else pd.DataFrame()
-                    scalar_subject_df = pd.concat(all_scalar_subject, ignore_index=True) if all_scalar_subject else pd.DataFrame()
-                    scalar_winners_df = pd.concat(all_scalar_winners, ignore_index=True) if all_scalar_winners else pd.DataFrame()
-                    scalar_summary_df = pd.concat(all_scalar_summary, ignore_index=True) if all_scalar_summary else pd.DataFrame()
-
-                    pm_res = {
-                        "target_vector": target_vector,
-                        "scales": scales,
-                        "subject_results": subject_df,
-                        "winner_results": winners_df,
-                        "trajectory_results": traj_df,
-                        "scalar_subject_results": scalar_subject_df,
-                        "scalar_winners": scalar_winners_df,
-                        "scalar_summary": scalar_summary_df,
-                        "metrics_used": [str(x) for x in pm_metrics],
-                        "metric_families": normalized_families,
-                        "distance_mode": "raw",
-                    }
-
-                    # Keep full export and analysis summary in run root for compatibility
-                    export_phenotype_match_excel(pm_res, run_dir / "phenotype_match_full.xlsx")
-                    summary_pack = build_paper_ready_summary(pm_res)
-                    for name, df in {
-                        "summary_attack": summary_pack.get("summary_attack", pd.DataFrame()),
-                        "summary_winners": summary_pack.get("summary_winners", pd.DataFrame()),
-                        "target_vector": summary_pack.get("target_vector", pd.DataFrame()),
-                        "scales": summary_pack.get("scales", pd.DataFrame()),
-                        "stats_overall": summary_pack.get("stats_overall", pd.DataFrame()),
-                        "stats_pairwise": summary_pack.get("stats_pairwise", pd.DataFrame()),
-                    }.items():
-                        if isinstance(df, pd.DataFrame):
-                            df.to_csv(run_dir / f"{_pm_safe_stem(name)}.csv", index=False)
-
-                    with open(run_dir / "config.json", "w", encoding="utf-8") as f:
-                        json.dump({
-                            "run_dir": str(run_dir),
-                            "attack_kinds": [str(x) for x in pm_attack_kinds],
-                            "metrics": [str(x) for x in pm_metrics],
-                            "steps": int(pm_steps),
-                            "frac": float(pm_frac),
-                            "seed": int(pm_seed),
-                            "eff_k": int(pm_effk),
-                            "heavy_every": int(pm_heavy),
-                            "sigma_max": float(pm_sigma),
-                            "keep_density_from_baseline": bool(pm_keep_density),
-                            "recompute_modules": bool(pm_recompute_modules),
-                            "module_resolution": float(pm_module_resolution),
-                            "removal_mode": str(pm_removal_mode),
-                            "compute_curvature": bool(pm_compute_curv),
-                            "use_metadata_mode": bool(use_metadata_mode),
-                            "hc_count_total": int(len(hc_gids_effective)),
-                            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        }, f, ensure_ascii=False, indent=2)
-
-                    st.session_state["last_degmatch_result"] = pm_res
-                    st.session_state["last_degmatch_run_dir"] = str(run_dir)
+                pm_res = _pm_load_run_result(run_dir)
+                st.session_state["last_degmatch_result"] = pm_res
+                st.session_state["last_degmatch_run_dir"] = str(run_dir)
                 st.success("Готово.")
-                if st.session_state.get("last_degmatch_run_dir"):
-                    st.info(f"Сохранено в: {st.session_state['last_degmatch_run_dir']}")
 
     with pm_col2:
         pm_res = st.session_state.get("last_degmatch_result")
