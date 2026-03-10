@@ -16,7 +16,6 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
 
-from .config import settings
 from .cli import (
     _attack_payload_from_graph,
     _build_metrics_payload,
@@ -25,6 +24,7 @@ from .cli import (
     _metrics_payload_from_graph,
     _run_attack_payload,
 )
+from .config import settings
 from .core.physics import simulate_energy_flow
 from .energy_export import (
     energy_run_summary_dict,

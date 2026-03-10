@@ -951,6 +951,9 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             scalar_subject_df = summary_pack["scalar_subject_results"]
             scalar_winners_df = summary_pack["scalar_winners"]
             scalar_summary_df = summary_pack["scalar_summary"]
+            scalar_inference_df = summary_pack.get("scalar_inference", pd.DataFrame())
+            family_inference_df = summary_pack.get("family_inference", pd.DataFrame())
+            claim_readiness_df = summary_pack.get("core_claim_readiness", pd.DataFrame())
 
             if isinstance(summary_winners_df, pd.DataFrame) and not summary_winners_df.empty:
                 st.markdown("#### Winner summary")
@@ -979,6 +982,14 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
             if isinstance(stats_pairwise_df, pd.DataFrame) and not stats_pairwise_df.empty:
                 with st.expander("Pairwise comparisons"):
                     st.dataframe(stats_pairwise_df, width="stretch")
+
+            if isinstance(scalar_inference_df, pd.DataFrame) and not scalar_inference_df.empty:
+                with st.expander("Scalar inference (FDR + effect size)"):
+                    st.dataframe(scalar_inference_df, width="stretch")
+
+            if isinstance(family_inference_df, pd.DataFrame) and not family_inference_df.empty:
+                with st.expander("Family inference (FDR + effect size)"):
+                    st.dataframe(family_inference_df, width="stretch")
 
             if isinstance(stats_winner_df, pd.DataFrame) and not stats_winner_df.empty:
                 with st.expander("Winner-count stats"):
@@ -1061,6 +1072,15 @@ def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_va
                     )
                     (scalar_summary_df if isinstance(scalar_summary_df, pd.DataFrame) else pd.DataFrame()).to_excel(
                         writer, index=False, sheet_name="scalar_summary"
+                    )
+                    (scalar_inference_df if isinstance(scalar_inference_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="scalar_inference"
+                    )
+                    (family_inference_df if isinstance(family_inference_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="family_inference"
+                    )
+                    (claim_readiness_df if isinstance(claim_readiness_df, pd.DataFrame) else pd.DataFrame()).to_excel(
+                        writer, index=False, sheet_name="claim_readiness"
                     )
                 bio.seek(0)
 

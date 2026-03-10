@@ -135,8 +135,10 @@ def build_scalar_subject_results(
         return pd.DataFrame(
             columns=[
                 "subject_idx",
+                "subject_id",
                 "attack_kind",
                 "metric",
+                "metric_family",
                 "best_step",
                 "best_damage_frac",
                 "best_scalar_error",
@@ -146,8 +148,10 @@ def build_scalar_subject_results(
 
     cols = [
         "subject_idx",
+        "subject_id",
         "attack_kind",
         "metric",
+        "metric_family",
         "best_step",
         "best_damage_frac",
         "best_scalar_error",
@@ -166,7 +170,9 @@ def build_scalar_winners(scalar_subject_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "subject_idx",
+                "subject_id",
                 "metric",
+                "metric_family",
                 "attack_kind",
                 "best_step",
                 "best_damage_frac",
@@ -179,7 +185,7 @@ def build_scalar_winners(scalar_subject_df: pd.DataFrame) -> pd.DataFrame:
     df["best_scalar_error"] = pd.to_numeric(df["best_scalar_error"], errors="coerce")
 
     winners = []
-    for (subject_idx, metric), sub in df.groupby(["subject_idx", "metric"], dropna=False):
+    for _group_keys, sub in df.groupby([c for c in ["subject_id", "subject_idx", "metric"] if c in df.columns], dropna=False):
         valid = sub[np.isfinite(sub["best_scalar_error"])].copy()
         if valid.empty:
             continue
@@ -197,6 +203,7 @@ def build_scalar_summary(
     """Build metric x attack summary from scalar matching outputs."""
     cols = [
         "metric",
+        "metric_family",
         "attack_kind",
         "n",
         "scalar_error_median",
@@ -225,6 +232,7 @@ def build_scalar_summary(
         rows.append(
             {
                 "metric": metric,
+                "metric_family": sub["metric_family"].dropna().iloc[0] if "metric_family" in sub.columns and not sub["metric_family"].dropna().empty else np.nan,
                 "attack_kind": attack_kind,
                 "n": int(len(sub)),
                 "scalar_error_median": float(err.median()) if not err.empty else np.nan,

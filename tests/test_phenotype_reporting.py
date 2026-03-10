@@ -4,6 +4,7 @@ import pandas as pd
 
 from src.phenotype_reporting import (
     build_attack_summary,
+    build_warning_flags,
     build_winner_summary,
     export_phenotype_match_excel,
 )
@@ -60,3 +61,31 @@ def test_export_phenotype_match_excel(tmp_path: Path):
     out_path = tmp_path / "phenotype_match.xlsx"
     export_phenotype_match_excel(result, out_path)
     assert out_path.exists()
+
+
+def test_build_warning_flags_returns_expected_rows():
+    result = {
+        "subject_results": pd.DataFrame(
+            {
+                "subject_id": ["s1", "s1", "s2", "s2"],
+                "attack_kind": ["a", "b", "a", "b"],
+                "best_distance": [1.0, 2.0, 1.1, 2.1],
+                "best_step": [1, 1, 1, 1],
+                "best_damage_frac": [0.1, 0.1, 0.1, 0.1],
+            }
+        ),
+        "metric_families": {"density": ["density", "avg_degree", "clustering"], "modularity": ["mod"]},
+    }
+    flags = build_warning_flags(
+        result,
+        modularity_sensitivity_summary=pd.DataFrame({"winner_attack": ["a", "b"]}),
+        target_stability_summary=pd.DataFrame({"attack_kind": ["a"], "win_rate_std": [0.2]}),
+        null_severity_density_summary=pd.DataFrame({"attack_kind": ["a"], "distance_gap_median": [0.1], "primary_better_count": [0], "null_better_count": [2]}),
+    )
+    assert {
+        "density_axis_dominance_flag",
+        "module_partition_instability_flag",
+        "target_instability_flag",
+        "high_metric_redundancy_flag",
+        "severity_matched_null_failure_flag",
+    }.issubset(set(flags["flag"]))
