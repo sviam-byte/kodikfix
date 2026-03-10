@@ -3,6 +3,7 @@ from __future__ import annotations
 import textwrap
 import time
 import json
+from pathlib import Path
 
 import networkx as nx
 import numpy as np
@@ -28,6 +29,11 @@ from src.plotting import fig_metrics_over_steps, fig_compare_attacks
 from src.services.graph_service import GraphService
 from src.robustness import attack_trajectory_summary, graph_resistance_summary
 from src.state_models import GraphEntry
+from src.batch_ops import (
+    _infer_metadata_group_col,
+    _infer_metadata_id_col,
+    _norm_meta_token,
+)
 from src.ui.plots.charts import (
     AUC_TRAP,
     apply_plot_defaults as _apply_plot_defaults,
@@ -153,6 +159,134 @@ def _read_uploaded_metrics_table(uploaded_file) -> pd.DataFrame:
     if name.endswith(".tsv"):
         return pd.read_csv(uploaded_file, sep="	")
     return pd.read_csv(uploaded_file)
+
+
+def _read_uploaded_metadata_table(uploaded_file) -> pd.DataFrame:
+    """Read uploaded metadata CSV/XLSX."""
+    return _read_uploaded_metrics_table(uploaded_file)
+
+
+def _prepare_uploaded_metadata(
+    uploaded_file,
+    *,
+    id_col: str = "",
+    group_col: str = "",
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Normalize uploaded metadata and infer ID/group columns.
+
+    The helper keeps normalized subject/group keys used for robust matching.
+    """
+    meta = _read_uploaded_metadata_table(uploaded_file).copy()
+    if meta.empty:
+        raise ValueError("Metadata file is empty")
+
+    meta.columns = [str(col) for col in meta.columns]
+
+    id_col_resolved = str(id_col or "").strip() or _infer_metadata_id_col(meta)
+    if not id_col_resolved or id_col_resolved not in meta.columns:
+        raise ValueError("Не удалось определить колонку subject id в metadata.")
+
+    group_col_resolved = str(group_col or "").strip() or _infer_metadata_group_col(meta, exclude=str(id_col_resolved))
+    if not group_col_resolved or group_col_resolved not in meta.columns:
+        raise ValueError("Не удалось определить колонку группы в metadata.")
+
+    meta["__meta_subject_key"] = meta[id_col_resolved].map(_norm_meta_token)
+    meta["__meta_group_key"] = meta[group_col_resolved].map(_norm_meta_token)
+    meta = meta[meta["__meta_subject_key"] != ""].copy()
+    meta = meta.drop_duplicates(subset=["__meta_subject_key"], keep="first")
+
+    return meta, {
+        "id_col": str(id_col_resolved),
+        "group_col": str(group_col_resolved),
+    }
+
+
+def _split_tokens(raw: str) -> list[str]:
+    """Split comma-separated text into a list of trimmed tokens."""
+    return [str(x).strip() for x in str(raw or "").split(",") if str(x).strip()]
+
+
+def _token_set(raw: str) -> set[str]:
+    """Build a normalized token set from comma-separated values."""
+    return {_norm_meta_token(x) for x in _split_tokens(raw) if _norm_meta_token(x)}
+
+
+def _match_workspace_graphs_to_metadata(
+    graphs: dict,
+    meta_df: pd.DataFrame,
+    *,
+    group_col: str,
+    healthy_values: str,
+    sz_values: str,
+) -> dict[str, object]:
+    """Match loaded workspace graphs to metadata and split into HC / SZ."""
+    healthy_set = _token_set(healthy_values)
+    sz_set = _token_set(sz_values)
+
+    matched_rows: list[dict] = []
+    hc_gids: list[str] = []
+    sz_gids: list[str] = []
+    unmatched_gids: list[str] = []
+
+    for gid, entry in graphs.items():
+        # Candidate list supports matching by graph name, source path, file stem and id.
+        candidates = [
+            str(entry.name or ""),
+            str(entry.source or ""),
+            Path(str(entry.source or "")).stem,
+            Path(str(entry.source or "")).name,
+            str(gid),
+        ]
+
+        seen = set()
+        row = None
+        matched_key = ""
+        for raw in candidates:
+            key = _norm_meta_token(raw)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            hit = meta_df.loc[meta_df["__meta_subject_key"] == key]
+            if not hit.empty:
+                row = hit.iloc[0].to_dict()
+                matched_key = key
+                break
+
+        if not row:
+            unmatched_gids.append(gid)
+            continue
+
+        group_token = _norm_meta_token(row.get(group_col, ""))
+        subject_id = str(row.get("__meta_subject_key", matched_key or gid))
+
+        rec = {
+            "graph_id": str(gid),
+            "graph_name": str(entry.name),
+            "graph_source": str(entry.source),
+            "subject_id": subject_id,
+            "group_value_raw": row.get(group_col, ""),
+            "group_value_norm": group_token,
+        }
+
+        matched_rows.append(rec)
+
+        if group_token in healthy_set:
+            hc_gids.append(gid)
+        elif group_token in sz_set:
+            sz_gids.append(gid)
+
+    matched_df = pd.DataFrame(matched_rows)
+    hc_meta_df = matched_df[matched_df["graph_id"].isin(hc_gids)].copy() if not matched_df.empty else pd.DataFrame()
+    sz_meta_df = matched_df[matched_df["graph_id"].isin(sz_gids)].copy() if not matched_df.empty else pd.DataFrame()
+
+    return {
+        "matched_df": matched_df,
+        "hc_gids": hc_gids,
+        "sz_gids": sz_gids,
+        "unmatched_gids": unmatched_gids,
+        "hc_meta_df": hc_meta_df,
+        "sz_meta_df": sz_meta_df,
+    }
 
 
 def _compute_metrics_df_for_graph_ids(
@@ -403,9 +537,16 @@ def render_phenotype_matching_tab(
     pm_col1, pm_col2 = st.columns([1, 2])
 
     with pm_col1:
-        st.caption("HC-графы берём из workspace. SZ-метрики — из CSV/XLSX.")
+        st.caption("Можно либо выбрать HC вручную, либо дать metadata и собрать HC/SZ автоматически из workspace.")
+
+        pm_meta_file = st.file_uploader(
+            "Metadata file (CSV/XLSX)",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="pm_meta_file",
+        )
+
         pm_hc_gids = st.multiselect(
-            "HC графы",
+            "HC графы (ручной режим / fallback)",
             options=list(graphs.keys()),
             default=hc_guess,
             format_func=lambda gid: f"{graphs[gid].name} ({graphs[gid].source})",
@@ -413,12 +554,12 @@ def render_phenotype_matching_tab(
         )
 
         pm_sz_file = st.file_uploader(
-            "SZ metrics table (CSV/XLSX)",
+            "SZ metrics table (CSV/XLSX, optional if metadata is loaded)",
             type=["csv", "tsv", "xlsx", "xls"],
             key="pm_sz_file",
         )
         pm_hc_base_file = st.file_uploader(
-            "HC baseline metrics table (optional)",
+            "HC baseline metrics table (optional; иначе посчитается автоматически)",
             type=["csv", "tsv", "xlsx", "xls"],
             key="pm_hc_base_file",
         )
@@ -453,6 +594,26 @@ def render_phenotype_matching_tab(
         )
 
         with st.expander("Phenotype matching advanced"):
+            pm_meta_id_col = st.text_input(
+                "Metadata ID column (optional)",
+                value="",
+                key="pm_meta_id_col",
+            )
+            pm_meta_group_col = st.text_input(
+                "Metadata group column (optional)",
+                value="",
+                key="pm_meta_group_col",
+            )
+            pm_meta_hc_values = st.text_input(
+                "Healthy/control values",
+                value="0,healthy,control,hc,false",
+                key="pm_meta_hc_values",
+            )
+            pm_meta_sz_values = st.text_input(
+                "SZ values",
+                value="1,sz,schizophrenia,patient,case,true",
+                key="pm_meta_sz_values",
+            )
             pm_compute_curv = st.checkbox(
                 "Считать curvature в baseline",
                 value=_needs_curvature_for_metrics(pm_metrics),
@@ -474,17 +635,59 @@ def render_phenotype_matching_tab(
                 key="pm_removal_mode",
             )
 
+        pm_meta = None
+        pm_meta_info = {}
+        pm_match = None
+        if pm_meta_file is not None:
+            try:
+                pm_meta, pm_meta_info = _prepare_uploaded_metadata(
+                    pm_meta_file,
+                    id_col=str(st.session_state.get("pm_meta_id_col", "") or ""),
+                    group_col=str(st.session_state.get("pm_meta_group_col", "") or ""),
+                )
+                pm_match = _match_workspace_graphs_to_metadata(
+                    graphs,
+                    pm_meta,
+                    group_col=str(pm_meta_info["group_col"]),
+                    healthy_values=str(st.session_state.get("pm_meta_hc_values", "0,healthy,control,hc,false")),
+                    sz_values=str(st.session_state.get("pm_meta_sz_values", "1,sz,schizophrenia,patient,case,true")),
+                )
+
+                st.success(
+                    f"Metadata detected: id_col='{pm_meta_info['id_col']}', "
+                    f"group_col='{pm_meta_info['group_col']}'. "
+                    f"Matched={len(pm_match['matched_df'])}, HC={len(pm_match['hc_gids'])}, SZ={len(pm_match['sz_gids'])}, "
+                    f"unmatched={len(pm_match['unmatched_gids'])}"
+                )
+                if pm_match["unmatched_gids"]:
+                    st.warning(
+                        "Не сматчились: "
+                        + ", ".join(str(x) for x in pm_match["unmatched_gids"][:10])
+                        + (" ..." if len(pm_match["unmatched_gids"]) > 10 else "")
+                    )
+            except Exception as exc:
+                st.error(f"Metadata parse/match error: {type(exc).__name__}: {exc}")
+
         if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
-            if not pm_hc_gids:
-                st.error("Выбери хотя бы один HC-граф.")
-            elif pm_sz_file is None:
-                st.error("Загрузи таблицу метрик SZ-группы.")
-            elif not pm_attack_kinds:
+            if not pm_attack_kinds:
                 st.error("Выбери хотя бы одну модель деградации.")
             elif not pm_metrics:
                 st.error("Выбери хотя бы одну метрику.")
             else:
                 with st.spinner("HC → SZ phenotype matching..."):
+                    use_metadata_mode = pm_match is not None and len(pm_match.get("hc_gids", [])) > 0 and len(pm_match.get("sz_gids", [])) > 0
+
+                    if use_metadata_mode:
+                        hc_gids_effective = list(pm_match["hc_gids"])
+                        sz_gids_effective = list(pm_match["sz_gids"])
+                    else:
+                        hc_gids_effective = list(pm_hc_gids)
+                        sz_gids_effective = []
+
+                    if not hc_gids_effective:
+                        st.error("Не найдено HC-графов: ни по metadata, ни вручную.")
+                        st.stop()
+
                     hc_graphs = [
                         _build_current_graph_for_entry(
                             graphs[gid],
@@ -492,15 +695,12 @@ def render_phenotype_matching_tab(
                             min_weight=float(min_weight),
                             analysis_mode=str(analysis_mode),
                         )
-                        for gid in pm_hc_gids
+                        for gid in hc_gids_effective
                     ]
-                    sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
 
-                    if pm_hc_base_file is not None:
-                        hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
-                    else:
-                        hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
-                            pm_hc_gids,
+                    if use_metadata_mode:
+                        sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
+                            sz_gids_effective,
                             graphs=graphs,
                             min_conf=float(min_conf),
                             min_weight=float(min_weight),
@@ -509,6 +709,52 @@ def render_phenotype_matching_tab(
                             seed=int(pm_seed),
                             compute_curvature=bool(pm_compute_curv),
                         )
+                    else:
+                        if pm_sz_file is None:
+                            st.error("Либо загрузи metadata, либо загрузи таблицу метрик SZ-группы.")
+                            st.stop()
+                        sz_group_metrics_df = _read_uploaded_metrics_table(pm_sz_file)
+
+                    if pm_hc_base_file is not None:
+                        hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
+                    else:
+                        hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
+                            hc_gids_effective,
+                            graphs=graphs,
+                            min_conf=float(min_conf),
+                            min_weight=float(min_weight),
+                            analysis_mode=str(analysis_mode),
+                            eff_k=int(pm_effk),
+                            seed=int(pm_seed),
+                            compute_curvature=bool(pm_compute_curv),
+                        )
+
+                    subject_ids = []
+                    subject_meta_rows = []
+                    if use_metadata_mode:
+                        hc_meta_df = pm_match.get("hc_meta_df", pd.DataFrame()).copy()
+                        for gid in hc_gids_effective:
+                            sub = hc_meta_df.loc[hc_meta_df["graph_id"] == gid]
+                            if sub.empty:
+                                subject_id = str(gid)
+                                group_value = ""
+                            else:
+                                row = sub.iloc[0]
+                                subject_id = str(row.get("subject_id", gid))
+                                group_value = row.get("group_value_raw", "")
+                            subject_ids.append(subject_id)
+                            subject_meta_rows.append(
+                                {
+                                    "subject_id": subject_id,
+                                    "graph_id": str(gid),
+                                    "graph_name": str(graphs[gid].name),
+                                    "group_value": group_value,
+                                }
+                            )
+                    else:
+                        subject_ids = [str(gid) for gid in hc_gids_effective]
+
+                    subject_metadata_df = pd.DataFrame(subject_meta_rows) if subject_meta_rows else None
 
                     pm_res = compare_degradation_models(
                         hc_graphs=hc_graphs,
@@ -528,6 +774,8 @@ def render_phenotype_matching_tab(
                         recompute_modules=bool(pm_recompute_modules),
                         module_resolution=float(pm_module_resolution),
                         removal_mode=str(pm_removal_mode),
+                        subject_ids=subject_ids,
+                        subject_metadata=subject_metadata_df,
                     )
 
                     st.session_state["last_degmatch_result"] = pm_res
