@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import traceback
 from io import BytesIO
@@ -733,6 +734,145 @@ def _research_selected_flags() -> dict[str, bool]:
     return flags
 
 
+def _research_article_preset() -> dict[str, object]:
+    """Recommended research-tab preset for paper-style all-graphs runs.
+
+    Goals:
+    - deterministic streaming outputs to disk;
+    - easy resume/skip-existing behavior for long runs;
+    - graph summaries suitable for article tables/appendix;
+    - avoid extra-heavy optional blocks (energy / attack) by default.
+    """
+    flags = {f"__research_flag_{key}": False for key, _label, _help in _research_metric_catalog()}
+    for key in ["basic", "efficiency", "spectral", "clustering", "entropy", "curvature", "resistance"]:
+        flags[f"__research_flag_{key}"] = True
+    return {
+        "__research_stream_save": True,
+        "__research_resume_existing": True,
+        "__research_skip_existing": True,
+        "__research_ignore_run_lock": False,
+        "__research_graph_timeout": 0,
+        "__research_run_label": "paper_all_graphs",
+        "__research_eff_k": 32,
+        "__research_ricci_max_support": 0,
+        "__research_ricci_sample_edges": 500,
+        "__research_scope": "Все графы workspace",
+        "__research_attack_fast_mode": True,
+        "__research_attack_frac": 0.5,
+        "__research_attack_steps": 12,
+        "__research_attack_heavy_every": 4,
+        "__research_energy_steps": 50,
+        "__research_energy_flow_mode": "rw",
+        **flags,
+    }
+
+
+def _research_safe_stem(name: str) -> str:
+    """Return filesystem-safe stable stem for graph identifiers."""
+    s = str(name or "").strip()
+    s = re.sub(r"[^\w\-.]+", "_", s, flags=re.UNICODE)
+    s = re.sub(r"_+", "_", s).strip("_.")
+    return s or "graph"
+
+
+def _research_pick_graph_key(graph_obj, *, fallback_idx: int | None = None, fallback_id: str = "") -> str:
+    """Pick best-effort stable key used for skip-existing and per-graph exports."""
+    if isinstance(graph_obj, dict):
+        getter = graph_obj.get
+    else:
+        getter = lambda key, default=None: getattr(graph_obj, key, default)
+
+    for key in ["graph_id", "subject_id", "subject_token", "id", "name", "label"]:
+        value = getter(key)
+        if value is not None and str(value).strip():
+            return _research_safe_stem(str(value))
+
+    if str(fallback_id).strip():
+        return _research_safe_stem(str(fallback_id))
+    if fallback_idx is not None:
+        return f"graph_{int(fallback_idx):05d}"
+    return "graph"
+
+
+def _research_collect_existing_subject_keys(out_dir: str | Path) -> set[str]:
+    """Collect processed graph keys from selected output folder.
+
+    Supports both modern run folders and legacy flat exports.
+    """
+    root = Path(out_dir).expanduser()
+    if not root.exists() or not root.is_dir():
+        return set()
+
+    scan_roots = [root]
+    per_graph = root / "per_graph"
+    if per_graph.exists() and per_graph.is_dir():
+        scan_roots.append(per_graph)
+
+    keys: set[str] = set()
+    suffixes = [
+        "__summary", "__report", "__metrics", "__manifest", "__research", "__results", "__full",
+        "_summary", "_report", "_metrics", "_manifest", "_research", "_results", "_full",
+    ]
+
+    for scan_root in scan_roots:
+        for p in scan_root.iterdir():
+            stem = _research_safe_stem(p.stem if p.is_file() else p.name)
+            if not stem:
+                continue
+            keys.add(stem)
+            for suffix in suffixes:
+                if stem.endswith(suffix):
+                    keys.add(_research_safe_stem(stem[: -len(suffix)]))
+    return keys
+
+
+def _research_filter_batch_graphs(
+    graph_items: list[tuple[str, object]],
+    *,
+    out_dir: str | Path | None,
+    skip_existing: bool,
+    start_from_index: int = 0,
+    start_from_graph_id: str = "",
+) -> dict[str, object]:
+    """Apply batch filters in deterministic order for research workspace runs.
+
+    Order is fixed by design:
+    1) skip-existing by output folder;
+    2) start-from-index (0-based in current workspace order);
+    3) start-from-graph-id.
+    """
+    indexed: list[tuple[int, str, object, str]] = []
+    for i, (gid, entry) in enumerate(list(graph_items or [])):
+        key = _research_pick_graph_key(entry, fallback_idx=i, fallback_id=gid)
+        indexed.append((i, gid, entry, key))
+
+    existing = _research_collect_existing_subject_keys(out_dir) if (skip_existing and out_dir) else set()
+    if existing:
+        indexed = [(i, gid, entry, key) for (i, gid, entry, key) in indexed if key not in existing]
+
+    start_from_index = max(0, int(start_from_index or 0))
+    if start_from_index > 0:
+        indexed = [(i, gid, entry, key) for (i, gid, entry, key) in indexed if i >= start_from_index]
+
+    wanted = _research_safe_stem(start_from_graph_id)
+    hit = None
+    if wanted:
+        for pos, (_i, _gid, _entry, key) in enumerate(indexed):
+            if key == wanted:
+                hit = pos
+                break
+        indexed = indexed[hit:] if hit is not None else []
+
+    return {
+        "graph_ids": [gid for (_i, gid, _entry, _key) in indexed],
+        "keys": [key for (_i, _gid, _entry, key) in indexed],
+        "original_indices": [i for (i, _gid, _entry, _key) in indexed],
+        "existing_keys": sorted(existing),
+        "wanted_key": wanted,
+        "found_wanted": hit is not None if wanted else True,
+    }
+
+
 def _bundle_frames_to_xlsx_bytes(frames: dict[str, pd.DataFrame]) -> bytes:
     """Serialize research summary tables into a single XLSX payload."""
     buf = BytesIO()
@@ -1268,6 +1408,22 @@ def _render_research_tab(
     st.subheader("🧠 Research calc")
     st.caption("Отдельная вкладка для полного исследовательского расчёта по активному графу или по всему workspace.")
 
+    pending_research_preset = st.session_state.pop("__research_apply_article_preset", None)
+    if isinstance(pending_research_preset, dict):
+        for _k, _v in pending_research_preset.items():
+            st.session_state[_k] = _v
+
+    preset_cols = st.columns([1.1, 1.9])
+    with preset_cols[0]:
+        if st.button("Статейный пресет", key="__research_apply_article_preset_btn", width="stretch"):
+            st.session_state["__research_apply_article_preset"] = dict(_research_article_preset())
+            st.rerun()
+    with preset_cols[1]:
+        st.caption(
+            "Пресет включает потоковое сохранение, resume/skip-existing, расчёт по всем графам workspace, "
+            "метрики для paper-таблиц и отключает attack/energy по умолчанию."
+        )
+
     stream_defaults = st.columns([1.2, 1.8])
     with stream_defaults[0]:
         research_stream_save = st.checkbox(
@@ -1409,89 +1565,67 @@ def _render_research_tab(
     graph_ids = [cur_gid] if scope == "Активный граф" else list(ctx.graphs.keys())
     graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
 
-    # Инициализация дефолтов для контролов старта research-run.
-    # Используем только session_state как источник истины, без value=...
-    # в самих widgets: это снижает риск конфликтов между параметрами и key.
-    st.session_state.setdefault("__research_start_from_index", 1)
-    st.session_state.setdefault("__research_start_from_graph", "")
+    # Backward compatibility: migrate old key once if the new field is empty.
+    if (
+        "__research_start_from_graph" in st.session_state
+        and "__research_start_from_graph_id" not in st.session_state
+    ):
+        st.session_state["__research_start_from_graph_id"] = str(st.session_state.get("__research_start_from_graph", ""))
 
-    # Применяем отложенные изменения ДО создания widgets,
-    # иначе Streamlit ругается на изменение session_state
-    # после instantiation соответствующих контролов.
-    if "__research_pending_start_from_index" in st.session_state:
-        st.session_state["__research_start_from_index"] = int(
-            st.session_state.pop("__research_pending_start_from_index")
-        )
+    st.session_state.setdefault("__research_start_from_index", 0)
+    st.session_state.setdefault("__research_start_from_graph_id", "")
+    st.session_state.setdefault("__research_output_dir", str(st.session_state.get("__research_explicit_run_dir", "") or ""))
 
-    if "__research_pending_start_from_graph" in st.session_state:
-        st.session_state["__research_start_from_graph"] = str(
-            st.session_state.pop("__research_pending_start_from_graph")
-        )
-
-    s1, s2 = st.columns(2)
-    with s1:
+    st.markdown("#### Потоковый batch / resume")
+    bf1, bf2, bf3 = st.columns([0.9, 1.1, 1.6])
+    with bf1:
         research_start_from_index = int(st.number_input(
-            "Начать с графа №",
-            min_value=1,
+            "Начать с индекса",
+            min_value=0,
             step=1,
             key="__research_start_from_index",
-            help="1-based индекс в текущем порядке графов workspace.",
+            help="0-based индекс в исходном порядке workspace-графов (до запуска).",
         ))
-    with s2:
-        research_start_from_graph = st.text_input(
-            "Или начать с graph_id / имени",
-            key="__research_start_from_graph",
-            help="Ищет подстроку в graph_id, name, source и имени workbook-стема. Если заполнено, имеет приоритет над номером.",
+    with bf2:
+        research_start_from_graph_id = st.text_input(
+            "Или начать с graph_id",
+            key="__research_start_from_graph_id",
+            help="Точный ключ графа после нормализации имени (без пробелов/спецсимволов).",
+        )
+    with bf3:
+        research_output_dir = st.text_input(
+            "Папка результата / проверки",
+            key="__research_output_dir",
+            help="Эта папка используется для pre-run skip-existing и определения уже обработанных графов.",
         )
 
-    # Быстрые кнопки для рестарта длинного research-run.
-    # Логика:
-    # - "С активного графа" -> заполняет start_from_graph текущим cur_gid
-    # - "Со следующего после активного" -> ставит start_from_index = позиция(cur_gid)+2
-    # - "Сбросить" -> очищает оба поля и стартует с начала
-    quick_cols = st.columns([1, 1.2, 0.8])
     ordered_workspace_ids = [gid for gid in list(ctx.graphs.keys()) if gid in ctx.graphs]
-    try:
-        cur_pos = ordered_workspace_ids.index(cur_gid)
-    except ValueError:
-        cur_pos = None
+    workspace_items = [(gid, ctx.graphs.get(gid)) for gid in ordered_workspace_ids if gid in ctx.graphs]
 
-    with quick_cols[0]:
-        if st.button("С активного графа", key="__research_set_start_active", width="stretch"):
-            st.session_state["__research_pending_start_from_graph"] = str(cur_gid)
-            if cur_pos is not None:
-                st.session_state["__research_pending_start_from_index"] = int(cur_pos) + 1
-            st.rerun()
-
-    with quick_cols[1]:
-        if st.button("Со следующего после активного", key="__research_set_start_after_active", width="stretch"):
-            if cur_pos is not None:
-                # 1-based номер следующего графа.
-                st.session_state["__research_pending_start_from_index"] = int(cur_pos) + 2
-            else:
-                st.session_state["__research_pending_start_from_index"] = max(
-                    1,
-                    int(st.session_state.get("__research_start_from_index", 1)),
-                )
-            # Очищаем graph-поиск, чтобы сработал именно индекс.
-            st.session_state["__research_pending_start_from_graph"] = ""
-            st.rerun()
-
-    with quick_cols[2]:
-        if st.button("Сбросить", key="__research_reset_start_from", width="stretch"):
-            st.session_state["__research_pending_start_from_index"] = 1
-            st.session_state["__research_pending_start_from_graph"] = ""
-            st.rerun()
-
-    if cur_pos is not None:
-        st.caption(
-            f"Активный граф в текущем порядке workspace: №{cur_pos + 1} "
-            f"({cur_gid})"
+    batch_probe: dict[str, object] | None = None
+    if scope == "Все графы workspace":
+        batch_probe = _research_filter_batch_graphs(
+            workspace_items,
+            out_dir=str(research_output_dir).strip(),
+            skip_existing=bool(research_skip_existing),
+            start_from_index=int(research_start_from_index),
+            start_from_graph_id=str(research_start_from_graph_id),
         )
-    else:
-        st.caption(
-            f"Активный graph_id={cur_gid} сейчас не найден в текущем порядке workspace."
+        n_all = len(workspace_items)
+        n_left = len(batch_probe["graph_ids"])
+        n_done = len(batch_probe["existing_keys"])
+        st.info(
+            f"Batch-кандидатов после фильтрации: {n_left} из {n_all}. "
+            f"Уже найдено в output-папке: {n_done}."
         )
+        keys = list(batch_probe.get("keys", []))
+        if keys:
+            preview = ", ".join(keys[:8]) + (", ..." if len(keys) > 8 else "")
+            st.caption(f"Первые графы в очереди: {preview}")
+        elif n_all > 0:
+            st.warning("После фильтрации очередь пуста: либо всё обработано, либо start-from не нашёл совпадение.")
+        if str(batch_probe.get("wanted_key", "")) and not bool(batch_probe.get("found_wanted", True)):
+            st.warning(f"graph_id '{batch_probe.get('wanted_key')}' не найден в текущей batch-очереди.")
 
     c_run1, c_run2 = st.columns(2)
     run_active = c_run1.button("Посчитать всё", type="primary", width="stretch")
@@ -1499,7 +1633,10 @@ def _render_research_tab(
     if run_active:
         graph_ids = [cur_gid]
     if run_all:
-        graph_ids = list(ctx.graphs.keys())
+        if scope == "Все графы workspace" and isinstance(batch_probe, dict):
+            graph_ids = [str(gid) for gid in batch_probe.get("graph_ids", [])]
+        else:
+            graph_ids = list(ctx.graphs.keys())
 
     if run_active or run_all:
         # Защита от рассинхрона: после rerun/trim_memory/drop_graph набор id
@@ -1541,8 +1678,10 @@ def _render_research_tab(
             skip_existing=bool(research_skip_existing),
             explicit_run_dir=str(research_explicit_run_dir),
             ignore_run_lock=bool(research_ignore_run_lock),
-            start_from_index=int(research_start_from_index),
-            start_from_graph=str(research_start_from_graph),
+            # start-from filtering is already applied by _research_filter_batch_graphs
+            # in UI pre-processing to keep order deterministic with skip-existing.
+            start_from_index=1,
+            start_from_graph="",
             graph_timeout_sec=int(research_graph_timeout),
         )
         cache_key = (

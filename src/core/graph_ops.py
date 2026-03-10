@@ -306,6 +306,17 @@ def calculate_metrics(
     tau_relax = (1.0 / l2) if (np.isfinite(l2) and l2 > EPS_W) else float("nan")
     epi_thr = (1.0 / lmax) if (np.isfinite(lmax) and lmax > EPS_W) else float("nan")
 
+    # algebraic_connectivity uses the Laplacian spectrum and can fail on edge-cases;
+    # keep this metric best-effort and never break the main metrics pipeline.
+    try:
+        algebraic_connectivity = (
+            float(nx.algebraic_connectivity(H_u, weight="weight"))
+            if (not skip_spectral and N > 1 and E > 0 and nx.is_connected(H_u) and N <= 400)
+            else float("nan")
+        )
+    except Exception:
+        algebraic_connectivity = float("nan")
+
     # These entropy-rate metrics are expensive and are skipped on light passes.
     if is_heavy:
         H_rw = float(network_entropy_rate(G, base=math.e))
@@ -365,6 +376,7 @@ def calculate_metrics(
         "lcc_frac": lcc_frac,
         "eff_w": eff_w,
         "l2_lcc": l2,
+        "algebraic_connectivity": algebraic_connectivity,
         "tau_lcc": tau,
         "tau_relax": tau_relax,
         "lmax": lmax,
