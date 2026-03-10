@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import textwrap
+import logging
 import time
 import json
 import re
@@ -54,6 +55,7 @@ from src.ui_blocks import help_icon
 from src.utils import as_simple_undirected, get_node_strength
 
 _layout_cached = GraphService.compute_layout3d
+logger = logging.getLogger(__name__)
 
 
 def _hash_graph(G: nx.Graph) -> str:
@@ -275,6 +277,30 @@ def _pm_safe_stem(name: str, fallback: str = "phenotype_match") -> str:
     s = re.sub(r"[^\w\-.]+", "_", s, flags=re.UNICODE)
     s = re.sub(r"_+", "_", s).strip("_.")
     return s or fallback
+
+
+def _pm_repo_root() -> Path:
+    """Best-effort repository root for local writes."""
+    try:
+        return Path(__file__).resolve().parents[3]
+    except Exception:
+        return Path.cwd().resolve()
+
+
+def _pm_resolve_out_dir(raw_value: str | Path | None) -> Path:
+    """Resolve output directory; relative paths are anchored to repo root."""
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return (_pm_repo_root() / "phenotype_runs").resolve()
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = _pm_repo_root() / p
+    return p.resolve()
+
+
+def _pm_write_progress_snapshot(run_dir: Path, payload: dict) -> None:
+    """Persist current run progress for debugging/resume visibility."""
+    _pm_write_json(run_dir / "progress.json", payload)
 
 
 def _pm_append_csv(path: Path, rows: pd.DataFrame | list[dict] | dict) -> None:
@@ -1019,10 +1045,16 @@ def render_phenotype_matching_tab(
         st.markdown("#### Вывод и управление")
         pm_out_dir = st.text_input(
             "Папка вывода",
-            value=str(st.session_state.get("pm_out_dir", "phenotype_runs")),
+            value=str(st.session_state.get("pm_out_dir", "./phenotype_runs")),
             key="pm_out_dir",
-            help="Для локального запуска: путь на твоём компьютере, куда писать run-папку.",
+            help="Относительный путь считается от корня репозитория. По умолчанию: ./phenotype_runs",
         )
+        pm_out_dir_resolved = _pm_resolve_out_dir(pm_out_dir)
+        try:
+            pm_out_dir_resolved.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            st.error(f"Не удалось создать папку вывода: {type(exc).__name__}: {exc}")
+        st.caption(f"Физически сохраняется в: {pm_out_dir_resolved}")
         pm_run_label = st.text_input(
             "Название run",
             value=str(st.session_state.get("pm_run_label", f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")),
@@ -1246,11 +1278,13 @@ def render_phenotype_matching_tab(
                 scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
                 normalized_families = normalize_metric_families(metric_list, None)
 
-                out_root = Path(str(pm_out_dir)).expanduser()
+                out_root = _pm_resolve_out_dir(pm_out_dir)
+                out_root.mkdir(parents=True, exist_ok=True)
                 run_name = _pm_safe_stem(str(pm_run_label), f"hc_sz_{time.strftime('%Y%m%d_%H%M%S')}")
                 run_dir = out_root / run_name
                 (run_dir / "aggregate").mkdir(parents=True, exist_ok=True)
                 (run_dir / "per_subject").mkdir(parents=True, exist_ok=True)
+                st.session_state["last_degmatch_run_dir"] = str(run_dir)
 
                 _pm_save_run_inputs(
                     run_dir,
@@ -1280,14 +1314,31 @@ def render_phenotype_matching_tab(
                     hc_baseline_upload=pm_hc_base_file,
                 )
 
-                overall_bar = st.progress(0.0)
-                subject_bar = st.progress(0.0)
+                overall_bar = st.progress(0.0, text="Общий прогресс: 0%")
+                subject_bar = st.progress(0.0, text="Текущий HC: 0%")
                 status_box = st.empty()
+                save_box = st.empty()
+                files_box = st.empty()
 
                 start_idx = int(pm_start_index or 0)
                 selected_pairs = list(zip(hc_gids_effective, subject_ids))[start_idx:]
                 total_subjects = max(1, len(selected_pairs))
                 manifest_path = run_dir / "manifest.csv"
+                save_box.info(f"Run dir: {run_dir}")
+                _pm_write_progress_snapshot(
+                    run_dir,
+                    {
+                        "status": "running",
+                        "run_dir": str(run_dir),
+                        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "total_subjects": int(len(selected_pairs)),
+                        "completed_subjects": 0,
+                        "current_subject_id": "",
+                        "current_attack_kind": "",
+                        "current_step": 0,
+                        "current_step_total": 0,
+                    },
+                )
 
                 for pos, (gid, subject_id) in enumerate(selected_pairs, start=1):
                     entry = graphs[gid]
@@ -1302,9 +1353,11 @@ def render_phenotype_matching_tab(
                         )
                     )
 
-                    overall_bar.progress(float(pos - 1) / float(total_subjects))
-                    subject_bar.progress(0.0)
+                    overall_frac = float(pos - 1) / float(total_subjects)
+                    overall_bar.progress(overall_frac, text=f"Общий прогресс: {pos - 1}/{total_subjects} ({int(round(overall_frac * 100))}%)")
+                    subject_bar.progress(0.0, text=f"Текущий HC: {subject_id} · 0%")
                     status_box.caption(f"[{pos}/{total_subjects}] {subject_id}")
+                    files_box.caption(f"Сохранение: {run_dir} · subject dir: {_pm_subject_dir(run_dir, subject_id)}")
 
                     if bool(pm_skip_done) and _pm_subject_done(run_dir, subject_id):
                         _pm_append_csv(
@@ -1335,11 +1388,33 @@ def render_phenotype_matching_tab(
                             attack_frac = 0.0 if total_attacks <= 0 else float(done_attacks) / float(total_attacks)
                             step_frac = 0.0 if step_total <= 0 else float(step_i) / float(step_total)
                             total_frac = min(1.0, attack_frac + step_frac / max(1, total_attacks))
-                            subject_bar.progress(total_frac)
+                            subject_bar.progress(
+                                total_frac,
+                                text=(
+                                    f"Текущий HC: {subject_id} · {attack_kind} · "
+                                    f"{int(round(total_frac * 100))}%"
+                                ),
+                            )
                             suffix = f" · value={current_value}" if current_value is not None else ""
                             status_box.caption(
                                 f"[{pos}/{total_subjects}] {subject_id} · {attack_kind} · step {step_i}/{step_total}{suffix}"
                             )
+                            _pm_write_progress_snapshot(
+                                run_dir,
+                                {
+                                    "status": "running",
+                                    "run_dir": str(run_dir),
+                                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "total_subjects": int(len(selected_pairs)),
+                                    "completed_subjects": int(pos - 1),
+                                    "current_subject_id": str(subject_id),
+                                    "current_attack_kind": str(attack_kind),
+                                    "current_step": int(step_i),
+                                    "current_step_total": int(step_total),
+                                    "current_value": None if current_value is None else float(current_value),
+                                },
+                            )
+                            time.sleep(0.01)
 
                         _pm_stream_subject(
                             run_dir=run_dir,
@@ -1370,6 +1445,7 @@ def render_phenotype_matching_tab(
                         )
 
                         elapsed = float(time.perf_counter() - t0)
+                        saved_subject_dir = _pm_subject_dir(run_dir, subject_id)
                         _pm_append_csv(
                             manifest_path,
                             {
@@ -1377,9 +1453,10 @@ def render_phenotype_matching_tab(
                                 "graph_id": str(gid),
                                 "status": "ok",
                                 "elapsed_sec": elapsed,
-                                "saved_dir": str(_pm_subject_dir(run_dir, subject_id)),
+                                "saved_dir": str(saved_subject_dir),
                             },
                         )
+                        files_box.caption(f"Сохранено: {saved_subject_dir}")
 
                         del G
                         gc.collect()
@@ -1410,19 +1487,55 @@ def render_phenotype_matching_tab(
                         )
                         gc.collect()
 
-                    overall_bar.progress(float(pos) / float(total_subjects))
-                    subject_bar.progress(1.0)
+                    overall_frac = float(pos) / float(total_subjects)
+                    overall_bar.progress(overall_frac, text=f"Общий прогресс: {pos}/{total_subjects} ({int(round(overall_frac * 100))}%)")
+                    subject_bar.progress(1.0, text=f"Текущий HC: {subject_id} · 100%")
+                    _pm_write_progress_snapshot(
+                        run_dir,
+                        {
+                            "status": "running",
+                            "run_dir": str(run_dir),
+                            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "total_subjects": int(len(selected_pairs)),
+                            "completed_subjects": int(pos),
+                            "current_subject_id": str(subject_id),
+                            "current_attack_kind": "",
+                            "current_step": 0,
+                            "current_step_total": 0,
+                        },
+                    )
 
                 pm_res = _pm_load_run_result(run_dir)
+                try:
+                    export_phenotype_match_excel(pm_res, run_dir / "aggregate" / "run_bundle.xlsx")
+                except Exception as exc:
+                    logger.warning("Failed to export aggregate phenotype workbook: %s", exc)
+                _pm_write_progress_snapshot(
+                    run_dir,
+                    {
+                        "status": "done",
+                        "run_dir": str(run_dir),
+                        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "total_subjects": int(len(selected_pairs)),
+                        "completed_subjects": int(len(selected_pairs)),
+                    },
+                )
                 st.session_state["last_degmatch_result"] = pm_res
                 st.session_state["last_degmatch_run_dir"] = str(run_dir)
-                st.success("Готово.")
+                st.success(f"Готово. Результаты сохранены в: {run_dir}")
 
     with pm_col2:
         pm_res = st.session_state.get("last_degmatch_result")
         last_saved_run = str(st.session_state.get("last_degmatch_run_dir", "") or "").strip()
         if last_saved_run:
             st.caption(f"Последний сохранённый run: {last_saved_run}")
+            run_path = Path(last_saved_run)
+            if run_path.exists():
+                agg_dir = run_path / "aggregate"
+                per_dir = run_path / "per_subject"
+                st.caption(
+                    f"Папка существует. aggregate={agg_dir.exists()} · per_subject={per_dir.exists()}"
+                )
         if pm_res:
             st.markdown("### Winner attacks per HC")
             winners_df = pm_res.get("winner_results", pd.DataFrame())
