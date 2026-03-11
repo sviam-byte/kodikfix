@@ -554,6 +554,14 @@ def _pm_subject_dir(run_dir: Path, subject_id: str) -> Path:
     return run_dir / "per_subject" / _pm_safe_stem(subject_id, "subject")
 
 
+def _pm_subject_file(run_dir: Path, subject_id: str, filename: str, *, ensure_dir: bool = False) -> Path:
+    """Return a per-subject file path and optionally create its parent directory."""
+    sdir = _pm_subject_dir(run_dir, subject_id)
+    if ensure_dir:
+        sdir.mkdir(parents=True, exist_ok=True)
+    return sdir / filename
+
+
 def _pm_subject_done(run_dir: Path, subject_id: str) -> bool:
     """Check resumable marker file for a processed subject."""
     sdir = _pm_subject_dir(run_dir, subject_id)
@@ -2185,7 +2193,7 @@ def render_phenotype_matching_tab(
                                 "error": str(exc),
                             },
                         )
-                        (_pm_subject_dir(run_dir, subject_id) / "traceback.txt").write_text(
+                        _pm_subject_file(run_dir, subject_id, "traceback.txt", ensure_dir=True).write_text(
                             f"TimeoutError: {exc}\n",
                             encoding="utf-8",
                         )
@@ -2223,7 +2231,10 @@ def render_phenotype_matching_tab(
                                 "error": f"{type(exc).__name__}: {exc}",
                             },
                         )
-                        (_pm_subject_dir(run_dir, subject_id) / "traceback.txt").write_text(tb, encoding="utf-8")
+                        _pm_subject_file(run_dir, subject_id, "traceback.txt", ensure_dir=True).write_text(
+                            tb,
+                            encoding="utf-8",
+                        )
                         _push_ui_event(f"ERROR subject {subject_id}: {type(exc).__name__}: {exc}")
                         _pm_emit_progress(
                             run_dir,
