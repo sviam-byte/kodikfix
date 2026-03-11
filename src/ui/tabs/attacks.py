@@ -400,6 +400,46 @@ def _pm_cost_level(
     return "heavy"
 
 
+def _pm_est_time_per_subject_sec(
+    *,
+    attacks_n: int,
+    steps: int,
+    heavy_every: int,
+    density_estimate: float,
+    n_edges_approx: int,
+    curvature_trajectory: bool,
+) -> float:
+    """Rough estimate of wall-clock seconds per HC subject.
+
+    The dominant cost is ``calculate_metrics`` on heavy steps. Coefficients are
+    empirical and intentionally conservative for dense NetworkX workloads.
+    """
+    heavy_every = max(1, int(heavy_every))
+    n_steps = int(steps) + 1
+    heavy_steps_per_attack = sum(
+        1 for i in range(n_steps) if (i % heavy_every == 0) or (i == n_steps - 1)
+    )
+    light_steps_per_attack = max(0, n_steps - heavy_steps_per_attack)
+
+    # Base cost per heavy step (Dijkstra + Louvain + clustering + spectral + entropy)
+    if density_estimate > 0.5:
+        cost_heavy = 5.0
+    elif density_estimate > 0.2:
+        cost_heavy = 3.0
+    else:
+        cost_heavy = 1.5
+
+    if n_edges_approx > 30000:
+        cost_heavy *= 1.4
+
+    if curvature_trajectory:
+        cost_heavy *= 3.0
+
+    cost_light = 0.08
+    per_attack = heavy_steps_per_attack * cost_heavy + light_steps_per_attack * cost_light
+    return float(int(attacks_n) * per_attack + 5.0)
+
+
 def _pm_build_preflight_summary(
     *,
     hc_n: int,
@@ -410,6 +450,10 @@ def _pm_build_preflight_summary(
     compute_curv: bool,
     export_subject_xlsx: bool,
     export_run_xlsx: bool,
+    density_estimate: float = 0.0,
+    n_edges_approx: int = 0,
+    n_nodes_approx: int = 0,
+    heavy_every: int = 2,
 ) -> dict:
     """Prepare a transparent summary of what exactly will be computed."""
     attacks_n = len(list(attack_kinds or []))
@@ -439,6 +483,18 @@ def _pm_build_preflight_summary(
         export_run_xlsx=bool(export_run_xlsx),
     )
 
+    # Density-aware runtime estimation for transparent preflight expectations.
+    est_sec = _pm_est_time_per_subject_sec(
+        attacks_n=int(attacks_n),
+        steps=int(steps),
+        heavy_every=int(heavy_every),
+        density_estimate=float(density_estimate),
+        n_edges_approx=int(n_edges_approx),
+        curvature_trajectory=bool(curvature_trajectory),
+    )
+    est_baseline_sec = float(int(hc_n) + int(sz_n)) * max(1.0, est_sec / max(1, attacks_n))
+    has_mix = any(str(x) in {"mix_default", "mix_degree_preserving"} for x in (attack_kinds or []))
+
     return {
         "hc_n": int(hc_n),
         "sz_n": int(sz_n),
@@ -457,6 +513,14 @@ def _pm_build_preflight_summary(
         "export_subject_xlsx": bool(export_subject_xlsx),
         "export_run_xlsx": bool(export_run_xlsx),
         "estimated_cost": str(total_cost),
+        "density_estimate": float(density_estimate),
+        "n_edges_approx": int(n_edges_approx),
+        "n_nodes_approx": int(n_nodes_approx),
+        "est_time_per_subject_sec": float(est_sec),
+        "est_baseline_sec": float(est_baseline_sec),
+        "est_total_sec": float(est_sec * int(hc_n) + est_baseline_sec),
+        "mix_attacks_selected": bool(has_mix),
+        "mix_on_dense_graph": bool(has_mix and float(density_estimate) > 0.50),
     }
 
 
@@ -1403,6 +1467,22 @@ def render_phenotype_matching_tab(
         preview_hc_n = len(pm_match.get("hc_gids", [])) if use_metadata_preview else len(pm_hc_gids)
         preview_sz_n = len(pm_match.get("sz_gids", [])) if use_metadata_preview else (0 if pm_sz_file is not None else 0)
 
+        # Estimate graph density from the active graph for runtime prediction.
+        _density_est = 0.0
+        _n_edges_est = 0
+        _n_nodes_est = 0
+        try:
+            _edges_df = active_entry.edges
+            _n_edges_est = int(len(_edges_df))
+            _n_nodes_est = int(
+                len(set(_edges_df[active_entry.src_col].tolist() + _edges_df[active_entry.dst_col].tolist()))
+            )
+            _max_e_est = _n_nodes_est * (_n_nodes_est - 1) // 2 if _n_nodes_est > 1 else 1
+            _density_est = float(_n_edges_est) / float(max(1, _max_e_est))
+        except Exception:
+            # Best-effort only: keep UI responsive even if the preview graph is malformed.
+            pass
+
         preflight = _pm_build_preflight_summary(
             hc_n=int(preview_hc_n),
             sz_n=int(preview_sz_n),
@@ -1412,6 +1492,10 @@ def render_phenotype_matching_tab(
             compute_curv=bool(pm_compute_curv),
             export_subject_xlsx=bool(pm_export_subject_xlsx),
             export_run_xlsx=bool(pm_export_run_xlsx),
+            density_estimate=float(_density_est),
+            n_edges_approx=int(_n_edges_est),
+            n_nodes_approx=int(_n_nodes_est),
+            heavy_every=int(pm_heavy),
         )
 
         with st.expander("Что будет посчитано / preflight", expanded=True):
@@ -1437,10 +1521,42 @@ def render_phenotype_matching_tab(
                 )
             )
 
+            if preflight.get("density_estimate", 0) > 0.01:
+                _est_sub = preflight.get("est_time_per_subject_sec", 0.0)
+                _est_total = preflight.get("est_total_sec", 0.0)
+                st.markdown(
+                    "\n".join(
+                        [
+                            f"- Плотность графа (оценка): **{preflight['density_estimate']:.2f}** "
+                            f"({preflight['n_nodes_approx']} узлов, {preflight['n_edges_approx']} рёбер)",
+                            f"- Оценка времени на 1 HC: **~{_est_sub / 60:.1f} мин**",
+                            f"- Оценка общего времени: **~{_est_total / 3600:.1f} ч** "
+                            f"(baseline + {preflight['hc_n']} HC)",
+                        ]
+                    )
+                )
+
             if preflight["curvature_baseline"] or preflight["curvature_trajectory"]:
                 st.warning("Curvature/Ricci включён. Такой run будет заметно тяжелее.")
             else:
                 st.info("Curvature/Ricci сейчас не должен считаться, если ты не включила его другими настройками/атаками.")
+
+            if preflight.get("mix_on_dense_graph"):
+                st.error(
+                    "⚠️ Mix-атаки (mix_default, mix_degree_preserving) выбраны при density > 0.50. "
+                    "На плотных графах edge swap и replacement нефункциональны: "
+                    "double_edge_swap не находит валидных свопов, "
+                    "_replace_edges_from_source попадает в collision loop. "
+                    "Эти атаки будут автоматически пропущены при density > 0.80. "
+                    "Рекомендация: убрать mix_default и mix_degree_preserving из списка."
+                )
+
+            if preflight.get("density_estimate", 0) > 0.5 and int(pm_heavy) < 3:
+                st.warning(
+                    f"При density={preflight['density_estimate']:.2f} рекомендуется heavy_every ≥ 3 "
+                    f"(сейчас {pm_heavy}). Это уменьшит количество тяжёлых шагов с метриками "
+                    f"и ускорит run примерно на ~30%."
+                )
 
         if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
             if not pm_attack_kinds:
