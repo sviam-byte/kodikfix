@@ -23,7 +23,6 @@ import pandas as pd
 from src.metrics import calculate_metrics
 from src.services.graph_service import GraphService
 
-
 # ---------------------------------------------------------------------------
 # Pure computation functions (called inside the child process)
 # ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ import pandas as pd
 from .degradation import prepare_module_info, run_degradation_trajectory
 from .metric_registry import (
     get_default_metrics_for_regime,
-    is_metric_valid_for_regime,
     split_metrics_by_regime,
 )
 from .phenotype_scalar import (
