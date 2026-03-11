@@ -256,7 +256,9 @@ def compute_profile_distance(
         d = float(np.mean(family_values)) if family_values else float("nan")
         return {"distance": d, "used_metrics": used, "n_used_metrics": int(len(used)), "distance_mode": "family_balanced", "family_distances": family_distances}
 
-    d = float(np.sqrt(np.sum(np.square(np.asarray([diffs[m] for m in used], dtype=float)))))
+    # Use RMSE (instead of unnormalized L2 sum) to keep distances comparable
+    # when the number of finite metrics differs between trajectory steps.
+    d = float(np.sqrt(np.mean(np.square(np.asarray([diffs[m] for m in used], dtype=float)))))
     return {"distance": d, "used_metrics": used, "n_used_metrics": int(len(used)), "distance_mode": "raw", "family_distances": {}}
 
 
