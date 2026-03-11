@@ -384,9 +384,14 @@ def compare_degradation_models(
     metric_audit_df = resolved.get("audit_df", pd.DataFrame())
 
     if not metric_list:
+        # Compatibility: keep full result schema so downstream CLI/export code
+        # can safely consume empty runs without special-case KeyError checks.
         return {
+            "target_vector": {},
+            "scales": {},
             "trajectory_results": pd.DataFrame(),
             "subject_results": pd.DataFrame(),
+            "winner_results": pd.DataFrame(),
             "family_summary": pd.DataFrame(),
             "scalar_subject_results": pd.DataFrame(),
             "scalar_winners": pd.DataFrame(),
@@ -405,6 +410,11 @@ def compare_degradation_models(
     normalized_families = normalize_metric_families(metric_list, metric_families)
     target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
     scales = dict(resolved.get("scales") or {})
+    # Backward compatibility: degradation module supports only these removal modes.
+    # Accept broader external labels (e.g. fraction_initial) and degrade gracefully.
+    effective_removal_mode = str(removal_mode)
+    if effective_removal_mode not in {"random", "weak_weight", "strong_weight"}:
+        effective_removal_mode = "random"
     if subject_ids is None:
         subject_ids = [f"hc_{i:04d}" for i in range(len(hc_graphs))]
     subject_ids = [str(x) for x in subject_ids]
@@ -453,7 +463,7 @@ def compare_degradation_models(
                 module_info=module_info,
                 recompute_modules=bool(recompute_modules),
                 module_resolution=float(module_resolution),
-                removal_mode=str(removal_mode),
+                removal_mode=str(effective_removal_mode),
                 fast_mode=bool(fast_mode),
                 graph_regime=str(graph_regime),
             )
