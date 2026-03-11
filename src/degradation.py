@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import logging
 from dataclasses import dataclass
 
 import networkx as nx
@@ -12,6 +13,8 @@ from .attacks import run_edge_attack
 from .attacks_mix import run_mix_attack
 from .metrics import calculate_metrics
 from .utils import as_simple_undirected
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -571,6 +574,39 @@ def run_degradation_trajectory(
         return _normalize_legacy_trajectory(df, source_kind=kind), aux
 
     if kind in {"mix_default", "mix_degree_preserving"}:
+        # Guard: mix attacks are ineffective on near-complete graphs.
+        # double_edge_swap cannot find valid swaps when density > 0.80;
+        # replacement from donor edges hits a collision wall.
+        _N_guard = H.number_of_nodes()
+        _E_guard = H.number_of_edges()
+        _max_e_guard = _N_guard * (_N_guard - 1) // 2 if _N_guard > 1 else 1
+        _dens_guard = float(_E_guard) / float(max(1, _max_e_guard))
+        if _dens_guard > 0.80:
+            _logger.warning(
+                "Skipping mix attack '%s': graph density %.3f > 0.80; "
+                "edge swap/replacement is ineffective on near-complete graphs.",
+                kind,
+                _dens_guard,
+            )
+            row = _metrics_row(
+                H,
+                step=0,
+                damage_frac=0.0,
+                eff_sources_k=int(eff_sources_k),
+                seed=int(seed),
+                heavy=True,
+                compute_curvature=bool(compute_curvature),
+                curvature_sample_edges=int(curvature_sample_edges),
+                metric_names=metric_names,
+            )
+            row["attack_kind"] = str(kind)
+            row["skipped_reason"] = "density_too_high"
+            df = pd.DataFrame([row])
+            df["damage_frac"] = 0.0
+            if row_cb is not None:
+                row_cb(dict(row), 0, 0)
+            return df, {"kind": kind, "skipped": True, "density": float(_dens_guard)}
+
         mix_kind = "mix_default" if kind == "mix_default" else "mix_degree_preserving"
         actual_kind = "mix_weightconf_preserving" if kind == "mix_default" else kind
         df, aux = run_mix_attack(

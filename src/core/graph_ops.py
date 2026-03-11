@@ -95,6 +95,18 @@ def approx_weighted_efficiency(
     elif N > 500:
         req_k = min(req_k, 25)
 
+    # Density-adaptive cap: on dense graphs shortest paths are typically
+    # 1-2 hops, so fewer Dijkstra passes retain enough approximation quality
+    # while materially reducing runtime in heavy trajectory steps.
+    _E_eff = G.number_of_edges()
+    _max_e_eff = N * (N - 1) // 2
+    if _max_e_eff > 0:
+        _dens_eff = float(_E_eff) / float(_max_e_eff)
+        if _dens_eff > 0.5:
+            req_k = min(req_k, 12)
+        elif _dens_eff > 0.3:
+            req_k = min(req_k, 20)
+
     k = min(req_k, len(nodes))
     if k <= 0:
         return 0.0
