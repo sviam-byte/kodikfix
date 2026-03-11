@@ -26,6 +26,7 @@ from src.core_math import classify_phase_transition
 from src.config_loader import load_metrics_info
 from src.metrics import calculate_metrics
 from src.mix_frac_estimator import estimate_mix_frac_star
+from src.metric_registry import get_default_metrics_for_regime, describe_metrics_for_regime
 from src.degradation import run_degradation_trajectory, prepare_module_info
 from src.phenotype_matching import (
     compare_degradation_models,
@@ -1376,14 +1377,18 @@ def render_phenotype_matching_tab(
         pm_metrics = st.multiselect(
             "Метрики distance",
             options=DEGRADATION_METRIC_OPTIONS,
-            default=[
-                "l2_lcc",
-                "H_rw",
-                "fragility_H",
-                "mod",
-            ],
+            default=get_default_metrics_for_regime("full_weighted_unsigned"),
             key="pm_metrics",
         )
+
+        regime_metric_info = describe_metrics_for_regime("full_weighted_unsigned")
+        with st.expander("Какие метрики валидны для full weighted regime"):
+            st.markdown(
+                "**Core:** " + ", ".join(regime_metric_info["core"]) + "\n\n"
+                + "**Secondary:** " + ", ".join(regime_metric_info["secondary"]) + "\n\n"
+                + "**Discouraged:** " + ", ".join(regime_metric_info["discouraged"]) + "\n\n"
+                + "**Guardrail only:** " + ", ".join(regime_metric_info["guardrail"])
+            )
 
         with st.expander("Phenotype matching advanced"):
             pm_meta_id_col = st.text_input(

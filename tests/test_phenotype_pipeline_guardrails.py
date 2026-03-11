@@ -67,7 +67,7 @@ def test_compare_degradation_models_propagates_subject_id():
     )
     assert result["subject_results"]["subject_id"].iloc[0] == "subj_001"
     assert result["winner_results"]["subject_id"].iloc[0] == "subj_001"
-    assert "family_dist__density" in result["trajectory_results"].columns
+    assert "family_dist__modularity" in result["trajectory_results"].columns
 
 
 def test_compare_degradation_models_exposes_best_severity_columns():
@@ -112,10 +112,10 @@ def test_compare_degradation_models_excludes_low_variance_metrics_from_distance(
         subject_ids=["subj_001"],
         compute_heavy_every=1,
     )
-    assert "density" in result["metrics_excluded"]
-    assert result["metrics_used"] == ["l2_lcc", "H_rw", "fragility_H", "mod"]
+    assert "density" in result["metrics_discouraged_for_regime"]
+    assert "density" not in result["metrics_used"]
     assert "density" not in str(result["trajectory_results"]["used_metrics"].iloc[0]).split(",")
     assert "metric_scale_audit" in result
     audit = result["metric_scale_audit"]
     assert not audit.empty
-    assert bool(audit.loc[audit["metric"] == "density", "keep"].iloc[0]) is False
+    assert "density" not in set(audit["metric"].astype(str).tolist())

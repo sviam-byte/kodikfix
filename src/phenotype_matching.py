@@ -7,6 +7,11 @@ import numpy as np
 import pandas as pd
 
 from .degradation import prepare_module_info, run_degradation_trajectory
+from .metric_registry import (
+    get_default_metrics_for_regime,
+    is_metric_valid_for_regime,
+    split_metrics_by_regime,
+)
 from .phenotype_scalar import (
     build_scalar_subject_results,
     build_scalar_summary,
@@ -32,7 +37,7 @@ SPARSE_PROFILE_METRICS = [
     "lcc_frac",
 ]
 
-DEFAULT_PROFILE_METRICS = list(FULL_WEIGHTED_PROFILE_METRICS)
+DEFAULT_PROFILE_METRICS = get_default_metrics_for_regime("full_weighted_unsigned")
 
 DEFAULT_METRIC_FAMILIES = {
     "integration": ["algebraic_connectivity", "l2_lcc", "eff_w", "tau_relax", "lcc_frac"],
@@ -347,35 +352,56 @@ def find_best_match_to_target(
 
 
 def compare_degradation_models(
-    hc_graphs: Sequence[nx.Graph],
+    hc_graphs: Sequence,
     *,
     sz_group_metrics_df: pd.DataFrame,
     hc_baseline_metrics_df: pd.DataFrame,
     attack_kinds: Sequence[str],
     metrics: Sequence[str] | None = None,
-    steps: int = 12,
-    frac: float = 0.5,
+    steps: int = 10,
+    frac: float = 0.1,
     seed: int = 42,
-    eff_sources_k: int = 16,
-    compute_heavy_every: int = 2,
-    compute_curvature: bool = False,
-    curvature_sample_edges: int = 80,
-    noise_sigma_max: float = 0.5,
-    keep_density_from_baseline: bool = True,
-    recompute_modules: bool = False,
-    module_resolution: float = 1.0,
-    removal_mode: str = "random",
-    fast_mode: bool = False,
     subject_ids: Sequence[str] | None = None,
-    subject_metadata: pd.DataFrame | None = None,
+    module_resolution: float = 1.0,
+    removal_mode: str = "fraction_initial",
+    compute_heavy_every: int = 1,
     distance_mode: str = "raw",
     metric_families: Mapping[str, Sequence[str]] | None = None,
     graph_regime: str = "full_weighted_unsigned",
+    **kwargs,
 ) -> dict:
     requested_metric_list = _as_metric_list(metrics)
-    resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=requested_metric_list)
+    if not requested_metric_list:
+        requested_metric_list = get_default_metrics_for_regime(graph_regime)
+
+    regime_split = split_metrics_by_regime(requested_metric_list, graph_regime)
+    invalid_regime_metrics = list(regime_split["invalid"])
+    discouraged_regime_metrics = list(regime_split["discouraged"])
+    requested_valid_metrics = list(regime_split["core"] + regime_split["secondary"])
+
+    resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=requested_valid_metrics)
     metric_list = list(resolved.get("kept_metrics") or [])
     metric_audit_df = resolved.get("audit_df", pd.DataFrame())
+
+    if not metric_list:
+        return {
+            "trajectory_results": pd.DataFrame(),
+            "subject_results": pd.DataFrame(),
+            "family_summary": pd.DataFrame(),
+            "scalar_subject_results": pd.DataFrame(),
+            "scalar_winners": pd.DataFrame(),
+            "scalar_summary": pd.DataFrame(),
+            "metrics_requested": requested_metric_list,
+            "metrics_used": [],
+            "metrics_excluded": list(resolved.get("excluded_metrics") or []),
+            "metrics_invalid_for_regime": invalid_regime_metrics,
+            "metrics_discouraged_for_regime": discouraged_regime_metrics,
+            "metric_scale_audit": metric_audit_df,
+            "metric_families": {},
+            "distance_mode": str(distance_mode),
+            "graph_regime": str(graph_regime),
+        }
+
     normalized_families = normalize_metric_families(metric_list, metric_families)
     target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
     scales = dict(resolved.get("scales") or {})
@@ -386,6 +412,15 @@ def compare_degradation_models(
         raise ValueError("Length of subject_ids must match length of hc_graphs")
 
     meta_df = pd.DataFrame()
+    eff_sources_k = int(kwargs.get("eff_sources_k", 16))
+    compute_curvature = bool(kwargs.get("compute_curvature", False))
+    curvature_sample_edges = int(kwargs.get("curvature_sample_edges", 80))
+    noise_sigma_max = float(kwargs.get("noise_sigma_max", 0.5))
+    keep_density_from_baseline = bool(kwargs.get("keep_density_from_baseline", True))
+    recompute_modules = bool(kwargs.get("recompute_modules", False))
+    fast_mode = bool(kwargs.get("fast_mode", False))
+    subject_metadata = kwargs.get("subject_metadata", None)
+
     if isinstance(subject_metadata, pd.DataFrame) and not subject_metadata.empty:
         meta_df = subject_metadata.copy()
         if "subject_id" not in meta_df.columns:
@@ -498,6 +533,8 @@ def compare_degradation_models(
         "metrics_requested": requested_metric_list,
         "metrics_used": metric_list,
         "metrics_excluded": list(resolved.get("excluded_metrics") or []),
+        "metrics_invalid_for_regime": invalid_regime_metrics,
+        "metrics_discouraged_for_regime": discouraged_regime_metrics,
         "metric_scale_audit": metric_audit_df,
         "metric_families": normalized_families,
         "distance_mode": str(distance_mode),

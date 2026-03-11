@@ -8,27 +8,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .metric_registry import (
+    describe_metrics_for_regime,
+    get_default_metrics_for_regime,
+    is_metric_discouraged_for_regime,
+    is_metric_valid_for_regime,
+    split_metrics_by_regime,
+)
 from .phenotype_matching import normalize_metric_families
-
-GRAPH_REGIME_ALLOWED_METRICS: dict[str, set[str]] = {
-    "full_weighted_unsigned": {
-        "l2_lcc", "H_rw", "fragility_H", "mod", "eff_w",
-        "kappa_mean", "kappa_frac_negative", "kappa_median", "kappa_var", "kappa_skew", "kappa_entropy",
-        "H_w", "total_weight", "E", "N",
-    },
-    "full_weighted_signed": {
-        "l2_lcc", "H_rw", "fragility_H", "mod", "eff_w",
-        "kappa_mean", "kappa_frac_negative", "kappa_median", "kappa_var", "kappa_skew", "kappa_entropy",
-        "H_w", "total_weight", "E", "N",
-    },
-    "sparse_thresholded": set(),
-}
-
-GRAPH_REGIME_WARN_METRICS: dict[str, set[str]] = {
-    "full_weighted_unsigned": {"density", "clustering", "lcc_frac", "avg_degree", "beta", "beta_red"},
-    "full_weighted_signed": {"density", "clustering", "lcc_frac", "avg_degree", "beta", "beta_red"},
-    "sparse_thresholded": set(),
-}
 
 ATTACK_FAMILY_MAP: dict[str, str] = {
     "weight_noise": "weight",
@@ -155,11 +142,24 @@ def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_me
         warnings.append("Metric families are imbalanced; consider family_balanced distance mode.")
 
     regime = str(graph_regime or "")
-    allowed_for_regime = GRAPH_REGIME_ALLOWED_METRICS.get(regime, set())
-    invalid_for_regime = sorted([m for m in metric_list if allowed_for_regime and m not in allowed_for_regime])
-    discouraged_metrics = sorted([m for m in metric_list if m in GRAPH_REGIME_WARN_METRICS.get(regime, set())])
+    regime_metric_info = describe_metrics_for_regime(regime)
+    metric_split = split_metrics_by_regime(metric_list, regime)
+
+    invalid_for_regime = list(metric_split["invalid"])
+    discouraged_metrics = list(metric_split["discouraged"])
+    guardrail_metrics = list(metric_split["guardrail"])
+
+    if invalid_for_regime:
+        warnings.append(
+            "Метрики невалидны для выбранного graph_regime и будут исключены из phenotype-distance: "
+            + ", ".join(invalid_for_regime)
+        )
+
     if discouraged_metrics:
-        warnings.append(f"Metrics discouraged for regime '{regime}': {', '.join(discouraged_metrics)}")
+        warnings.append(
+            "Метрики нежелательны для выбранного graph_regime и, как правило, вырождаются или слабоинформативны: "
+            + ", ".join(discouraged_metrics)
+        )
 
     attack_list = [str(x) for x in (attack_kinds or []) if str(x)]
     attack_families = {k: ATTACK_FAMILY_MAP.get(k, "unknown") for k in attack_list}
@@ -189,7 +189,11 @@ def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_me
         "n_hc_baseline_rows": int(len(hc_baseline_metrics_df)),
         "graph_regime": regime,
         "attack_families": attack_families,
+        "regime_metric_info": regime_metric_info,
+        "metric_split": metric_split,
         "invalid_for_graph_regime": invalid_for_regime,
+        "discouraged_for_graph_regime": discouraged_metrics,
+        "guardrail_metrics": guardrail_metrics,
         "discouraged_metrics": discouraged_metrics,
         "density_estimate": float("nan"),
     }
