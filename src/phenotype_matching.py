@@ -14,7 +14,14 @@ from .phenotype_scalar import (
     find_best_scalar_match,
 )
 
-DEFAULT_PROFILE_METRICS = [
+FULL_WEIGHTED_PROFILE_METRICS = [
+    "l2_lcc",
+    "H_rw",
+    "fragility_H",
+    "mod",
+]
+
+SPARSE_PROFILE_METRICS = [
     "density",
     "clustering",
     "mod",
@@ -25,11 +32,14 @@ DEFAULT_PROFILE_METRICS = [
     "lcc_frac",
 ]
 
+DEFAULT_PROFILE_METRICS = list(FULL_WEIGHTED_PROFILE_METRICS)
+
 DEFAULT_METRIC_FAMILIES = {
-    "density": ["density", "avg_degree", "beta", "beta_red", "clustering"],
     "integration": ["algebraic_connectivity", "l2_lcc", "eff_w", "tau_relax", "lcc_frac"],
     "modularity": ["mod"],
     "entropy_fragility": ["H_rw", "fragility_H", "H_evo", "fragility_evo"],
+    "density_topology": ["density", "avg_degree", "beta", "beta_red", "clustering"],
+    "signed_weight": ["kappa_mean", "kappa_frac_negative", "kappa_median", "kappa_var", "kappa_skew", "kappa_entropy"],
 }
 
 
@@ -52,15 +62,21 @@ def normalize_metric_families(
     metric_families: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, list[str]]:
     metric_list = _as_metric_list(metrics)
-    families_src = dict(DEFAULT_METRIC_FAMILIES)
+    # User-supplied families take precedence and are matched first.
+    families_src: dict[str, list[str]] = {}
     if metric_families:
         for fam, fam_metrics in metric_families.items():
+            families_src[str(fam)] = [str(m) for m in fam_metrics if str(m)]
+    for fam, fam_metrics in DEFAULT_METRIC_FAMILIES.items():
+        if str(fam) not in families_src:
             families_src[str(fam)] = [str(m) for m in fam_metrics if str(m)]
 
     out: dict[str, list[str]] = {}
     assigned: set[str] = set()
     for fam, fam_metrics in families_src.items():
-        kept = [m for m in fam_metrics if m in metric_list]
+        # Keep first-match assignment stable so overlapping family definitions
+        # (e.g., user overrides plus default aliases) do not duplicate metrics.
+        kept = [m for m in fam_metrics if m in metric_list and m not in assigned]
         if kept:
             out[str(fam)] = kept
             assigned.update(kept)
@@ -84,29 +100,105 @@ def build_group_target_vector(group_df: pd.DataFrame, *, metrics: Sequence[str] 
     return out
 
 
+def audit_metric_variability(
+    baseline_df: pd.DataFrame,
+    *,
+    metrics: Sequence[str] | None = None,
+    eps: float = 1e-8,
+) -> pd.DataFrame:
+    """Build a per-metric variability audit used by phenotype distance scaling."""
+    metric_list = _as_metric_list(metrics)
+    rows: list[dict[str, float | str | int | bool]] = []
+    for m in metric_list:
+        if m not in baseline_df.columns:
+            rows.append({
+                "metric": str(m),
+                "status": "missing_in_baseline",
+                "n": 0,
+                "n_unique": 0,
+                "std": float("nan"),
+                "mad": float("nan"),
+                "scale": float("nan"),
+                "keep": False,
+            })
+            continue
+        arr = pd.to_numeric(baseline_df[m], errors="coerce").to_numpy(dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            rows.append({
+                "metric": str(m),
+                "status": "empty_in_baseline",
+                "n": 0,
+                "n_unique": 0,
+                "std": float("nan"),
+                "mad": float("nan"),
+                "scale": float("nan"),
+                "keep": False,
+            })
+            continue
+        std = float(np.nanstd(arr, ddof=1)) if arr.size >= 2 else 0.0
+        med = float(np.nanmedian(arr))
+        mad = float(np.nanmedian(np.abs(arr - med)))
+        robust_scale = 1.4826 * mad if np.isfinite(mad) else float("nan")
+        n_unique = int(pd.Series(arr).nunique(dropna=True))
+        has_dispersion = bool((np.isfinite(std) and std >= eps) or (np.isfinite(robust_scale) and robust_scale >= eps))
+        # Backward compatibility: with <2 baseline points we cannot estimate
+        # variability reliably, so keep metric with a neutral unit scale.
+        keep = bool(has_dispersion or arr.size < 2)
+        if has_dispersion:
+            scale = std if np.isfinite(std) and std >= eps else robust_scale
+            status = "ok"
+        elif arr.size < 2:
+            scale = 1.0
+            status = "insufficient_baseline"
+        else:
+            scale = float("nan")
+            status = "low_variance" if n_unique <= 1 or arr.size >= 1 else "empty_in_baseline"
+        rows.append({
+            "metric": str(m),
+            "status": status,
+            "n": int(arr.size),
+            "n_unique": n_unique,
+            "std": std,
+            "mad": mad,
+            "scale": float(scale) if np.isfinite(scale) else float("nan"),
+            "keep": keep,
+        })
+    return pd.DataFrame(rows)
+
+
+def resolve_metric_scales(
+    baseline_df: pd.DataFrame,
+    *,
+    metrics: Sequence[str] | None = None,
+    eps: float = 1e-8,
+) -> dict[str, object]:
+    """Resolve robust scales and exclude low-variance metrics from distance."""
+    audit_df = audit_metric_variability(baseline_df, metrics=metrics, eps=eps)
+    kept_metrics = [str(x) for x in audit_df.loc[audit_df["keep"].fillna(False), "metric"].tolist()]
+    excluded_metrics = [str(x) for x in audit_df.loc[~audit_df["keep"].fillna(False), "metric"].tolist()]
+    scales = {
+        str(row["metric"]): float(row["scale"])
+        for _, row in audit_df.iterrows()
+        if bool(row.get("keep", False)) and np.isfinite(float(row.get("scale", np.nan)))
+    }
+    return {
+        "audit_df": audit_df,
+        "kept_metrics": kept_metrics,
+        "excluded_metrics": excluded_metrics,
+        "scales": scales,
+    }
+
+
 def build_scale_vector(
     baseline_df: pd.DataFrame,
     *,
     metrics: Sequence[str] | None = None,
     eps: float = 1e-8,
 ) -> dict[str, float]:
-    metric_list = _as_metric_list(metrics)
-    scales: dict[str, float] = {}
-    for m in metric_list:
-        if m not in baseline_df.columns:
-            scales[m] = 1.0
-            continue
-        arr = pd.to_numeric(baseline_df[m], errors="coerce").to_numpy(dtype=float)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            scales[m] = 1.0
-            continue
-        s = float(np.nanstd(arr, ddof=1)) if arr.size >= 2 else 0.0
-        if (not np.isfinite(s)) or s < eps:
-            mad = float(np.nanmedian(np.abs(arr - np.nanmedian(arr))))
-            s = 1.4826 * mad if np.isfinite(mad) and mad >= eps else 1.0
-        scales[m] = float(max(s, eps))
-    return scales
+    """Backward-compatible helper that returns only resolved scale values."""
+    resolved = resolve_metric_scales(baseline_df, metrics=metrics, eps=eps)
+    return {str(k): float(v) for k, v in (resolved.get("scales") or {}).items()}
 
 
 def _compute_row_diffs(
@@ -126,7 +218,7 @@ def _compute_row_diffs(
         if not np.isfinite(xv) or not np.isfinite(tv):
             continue
         if (not np.isfinite(sv)) or sv <= 1e-12:
-            sv = 1.0
+            continue
         used.append(m)
         diffs[m] = float((xv - tv) / sv)
     return used, diffs
@@ -277,10 +369,13 @@ def compare_degradation_models(
     distance_mode: str = "raw",
     metric_families: Mapping[str, Sequence[str]] | None = None,
 ) -> dict:
-    metric_list = _as_metric_list(metrics)
+    requested_metric_list = _as_metric_list(metrics)
+    resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=requested_metric_list)
+    metric_list = list(resolved.get("kept_metrics") or [])
+    metric_audit_df = resolved.get("audit_df", pd.DataFrame())
     normalized_families = normalize_metric_families(metric_list, metric_families)
     target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
-    scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
+    scales = dict(resolved.get("scales") or {})
     if subject_ids is None:
         subject_ids = [f"hc_{i:04d}" for i in range(len(hc_graphs))]
     subject_ids = [str(x) for x in subject_ids]
@@ -393,7 +488,10 @@ def compare_degradation_models(
         "scalar_subject_results": scalar_subject_df,
         "scalar_winners": scalar_winners_df,
         "scalar_summary": scalar_summary_df,
+        "metrics_requested": requested_metric_list,
         "metrics_used": metric_list,
+        "metrics_excluded": list(resolved.get("excluded_metrics") or []),
+        "metric_scale_audit": metric_audit_df,
         "metric_families": normalized_families,
         "distance_mode": str(distance_mode),
     }

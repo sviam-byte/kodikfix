@@ -138,12 +138,12 @@ MIX_FRAC_METRIC_OPTIONS = [
 
 
 DEGRADATION_METRIC_OPTIONS = [
-    "density",
-    "clustering",
-    "mod",
     "l2_lcc",
     "H_rw",
     "fragility_H",
+    "mod",
+    "density",
+    "clustering",
     "eff_w",
     "lcc_frac",
     "kappa_mean",
@@ -1377,14 +1377,10 @@ def render_phenotype_matching_tab(
             "Метрики distance",
             options=DEGRADATION_METRIC_OPTIONS,
             default=[
-                "density",
-                "clustering",
-                "mod",
                 "l2_lcc",
                 "H_rw",
                 "fragility_H",
-                "eff_w",
-                "lcc_frac",
+                "mod",
             ],
             key="pm_metrics",
         )
@@ -1581,6 +1577,16 @@ def render_phenotype_matching_tab(
                     f"(сейчас {pm_heavy}). Это уменьшит количество тяжёлых шагов с метриками "
                     f"и ускорит run примерно на ~30%."
                 )
+
+            if preflight.get("density_estimate", 0) > 0.80:
+                dead_defaults = [m for m in ["density", "clustering", "lcc_frac"] if m in pm_metrics]
+                if dead_defaults:
+                    st.warning(
+                        "Для почти полного графа выбраны метрики, которые обычно близки к константе: "
+                        + ", ".join(dead_defaults)
+                        + ". Они будут автоматически исключены из phenotype-distance по baseline variability audit, "
+                        "но лучше убрать их сразу из UI-набора."
+                    )
 
         if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
             if not pm_attack_kinds:
