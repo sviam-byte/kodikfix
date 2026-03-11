@@ -1033,10 +1033,27 @@ def _compute_metrics_df_for_graph_ids(
     eff_k: int,
     seed: int,
     compute_curvature: bool,
+    metric_names: list[str] | None = None,
+    progress_cb=None,
 ) -> pd.DataFrame:
-    """Compute baseline metrics table for selected loaded graphs."""
+    """Compute baseline metrics table for selected loaded graphs.
+
+    If *metric_names* is provided, unnecessary expensive computations are
+    skipped (e.g. diameter/assortativity/spectral block). Optionally reports
+    per-graph progress via *progress_cb(done, total, graph_id)*.
+    """
+    # Compute only heavy blocks needed by selected optimization metrics.
+    _mset = set(str(m) for m in (metric_names or []))
+    _needs_spectral = not _mset or bool(
+        _mset & {"mod", "l2_lcc", "lmax", "thresh", "tau_lcc", "tau_relax", "algebraic_connectivity"}
+    )
+    _needs_diameter = not _mset or bool(_mset & {"diameter_approx"})
+    _needs_assortativity = not _mset or bool(_mset & {"assortativity"})
+    _needs_clustering = not _mset or bool(_mset & {"clustering"})
+
     rows = []
-    for gid in graph_ids:
+    total = len(graph_ids)
+    for idx, gid in enumerate(graph_ids):
         entry = graphs[gid]
         G = _build_current_graph_for_entry(
             entry,
@@ -1051,12 +1068,19 @@ def _compute_metrics_df_for_graph_ids(
             bool(compute_curvature),
             curvature_sample_edges=80,
             compute_heavy=True,
-            skip_spectral=False,
-            diameter_samples=16,
+            skip_spectral=not _needs_spectral,
+            skip_clustering=not _needs_clustering,
+            skip_assortativity=not _needs_assortativity,
+            diameter_samples=8 if _needs_diameter else 0,
         )
         row = {"graph_id": gid, "graph_name": entry.name}
         row.update(met)
         rows.append(row)
+        if callable(progress_cb):
+            try:
+                progress_cb(idx + 1, total, str(gid))
+            except Exception:
+                pass
     return pd.DataFrame(rows)
 
 
@@ -1686,6 +1710,15 @@ def render_phenotype_matching_tab(
                         write_event=True,
                     )
 
+                    def _sz_progress(done, total, gid):
+                        # Отдаем пользователю живой прогресс по графам, чтобы UI
+                        # не выглядел зависшим на длинной prepare-фазе.
+                        frac = 0.07 + 0.05 * (float(done) / float(max(1, total)))
+                        overall_bar.progress(frac, text=f"Общий прогресс: SZ baseline {done}/{total} ({int(frac*100)}%)")
+                        status_box.caption(f"SZ baseline: граф {done}/{total} · {gid}")
+                        if done == total or done % max(1, total // 5) == 0:
+                            _push_ui_event(f"SZ baseline: {done}/{total}")
+
                     sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
                         sz_gids_effective,
                         graphs=graphs,
@@ -1695,6 +1728,8 @@ def render_phenotype_matching_tab(
                         eff_k=int(pm_effk),
                         seed=int(pm_seed),
                         compute_curvature=bool(pm_compute_curv),
+                        metric_names=metric_list,
+                        progress_cb=_sz_progress,
                     )
                 else:
                     if pm_sz_file is None:
@@ -1734,6 +1769,14 @@ def render_phenotype_matching_tab(
                 if pm_hc_base_file is not None:
                     hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
                 else:
+                    def _hc_progress(done, total, gid):
+                        # Аналогичный per-graph прогресс для HC baseline-фазы.
+                        frac = 0.14 + 0.04 * (float(done) / float(max(1, total)))
+                        overall_bar.progress(frac, text=f"Общий прогресс: HC baseline {done}/{total} ({int(frac*100)}%)")
+                        status_box.caption(f"HC baseline: граф {done}/{total} · {gid}")
+                        if done == total or done % max(1, total // 5) == 0:
+                            _push_ui_event(f"HC baseline: {done}/{total}")
+
                     hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
                         hc_gids_effective,
                         graphs=graphs,
@@ -1743,6 +1786,8 @@ def render_phenotype_matching_tab(
                         eff_k=int(pm_effk),
                         seed=int(pm_seed),
                         compute_curvature=bool(pm_compute_curv),
+                        metric_names=metric_list,
+                        progress_cb=_hc_progress,
                     )
 
                 phase_box.info("Prepare phase: target/scales")

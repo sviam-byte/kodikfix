@@ -270,12 +270,22 @@ def calculate_metrics(
         if (N > 2 and E > 0 and not skip_assortativity)
         else float("nan")
     )
-    clust = (
-        nx.average_clustering(H_u)
-        if (N > 2 and E > 0 and not skip_clustering)
-        else float("nan")
-    )
-    diam = approx_diameter_lcc(G, seed=seed, samples=diameter_samples)
+    if N > 2 and E > 0 and not skip_clustering:
+        # На почти полных графах full average_clustering имеет высокую стоимость
+        # O(N*d^2), но отличается слабо между узлами. Ограничиваемся репрезентативной
+        # подвыборкой для заметного ускорения baseline/prepare фазы.
+        _max_e_clust = N * (N - 1) // 2
+        _dens_clust = float(E) / float(max(1, _max_e_clust))
+        if _dens_clust > 0.85 and N > 100:
+            _rng_clust = random.Random(int(seed))
+            _sample_n = min(50, N)
+            _sample_nodes = _rng_clust.sample(list(H_u.nodes()), _sample_n)
+            clust = float(nx.average_clustering(H_u, nodes=_sample_nodes))
+        else:
+            clust = float(nx.average_clustering(H_u))
+    else:
+        clust = float("nan")
+    diam = approx_diameter_lcc(G, seed=seed, samples=diameter_samples) if diameter_samples > 0 else None
 
     beta = int(E - N + C) if N > 0 else 0
 
