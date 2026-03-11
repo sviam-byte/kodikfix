@@ -32,7 +32,7 @@ from src.degradation import run_degradation_trajectory, prepare_module_info
 from src.phenotype_matching import (
     compare_degradation_models,
     build_group_target_vector,
-    build_scale_vector,
+    resolve_metric_scales,
     normalize_metric_families,
     compute_profile_distance,
 )
@@ -528,7 +528,12 @@ def _pm_build_preflight_summary(
 
 
 def _pm_append_csv(path: Path, rows: pd.DataFrame | list[dict] | dict) -> None:
-    """Append rows to CSV, accepting dict/list/DataFrame inputs."""
+    """Append rows to CSV, accepting dict/list/DataFrame inputs.
+
+    The implementation is intentionally tolerant to concurrent writers.
+    We avoid a separate ``path.exists()`` check because it opens a race
+    between header detection and append mode in Streamlit reruns.
+    """
     if isinstance(rows, dict):
         df = pd.DataFrame([rows])
     elif isinstance(rows, list):
@@ -538,8 +543,13 @@ def _pm_append_csv(path: Path, rows: pd.DataFrame | list[dict] | dict) -> None:
     if df.empty:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    df.to_csv(path, mode="a", header=not exists, index=False)
+    try:
+        if path.stat().st_size > 0:
+            df.to_csv(path, mode="a", header=False, index=False)
+            return
+    except (FileNotFoundError, OSError):
+        pass
+    df.to_csv(path, mode="w", header=True, index=False)
 
 
 def _pm_read_csv_if_exists(path: Path) -> pd.DataFrame:
@@ -721,6 +731,27 @@ def _pm_stream_subject(
         if path.exists():
             path.unlink()
 
+    # При resume subject может быть пересчитан заново (done.json ещё не создан),
+    # поэтому заранее удаляем старые строки этого subject из aggregate CSV,
+    # чтобы не накапливать дубли в результирующих таблицах.
+    for agg_file in [
+        "trajectory_results.csv",
+        "subject_results.csv",
+        "scalar_subject_results.csv",
+        "winner_results.csv",
+    ]:
+        agg_path = run_dir / "aggregate" / agg_file
+        if not agg_path.exists():
+            continue
+        try:
+            agg_df = pd.read_csv(agg_path)
+            if "subject_id" in agg_df.columns:
+                agg_df = agg_df[agg_df["subject_id"].astype(str) != str(subject_id)]
+                agg_df.to_csv(agg_path, index=False)
+        except Exception:
+            # Не блокируем run из-за повреждённого/частично записанного CSV.
+            pass
+
     subject_meta = dict(subject_meta or {})
     subject_meta.setdefault("subject_id", str(subject_id))
     t0 = time.perf_counter()
@@ -744,6 +775,15 @@ def _pm_stream_subject(
         metric_best: dict[str, dict] = {}
         last_step = max(1, int(steps))
         baseline_holder = {}
+        min_required_metrics = max(1, int(np.ceil(0.75 * len(metric_list))))
+
+        def _to_float(value, *, default=np.nan) -> float:
+            """Fast scalar coercion for hot loops (avoids tiny pandas Series)."""
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return float(default)
+            return out if np.isfinite(out) else float(default)
 
         def _check_timeout() -> None:
             if timeout_seconds and (time.perf_counter() - t0) > float(timeout_seconds):
@@ -775,6 +815,11 @@ def _pm_stream_subject(
             row2["n_used_metrics"] = int(info.get("n_used_metrics", 0))
             row2["distance_mode"] = str(info.get("distance_mode", "raw"))
             row2["used_metrics"] = ",".join(info.get("used_metrics", []) or [])
+            if row2["n_used_metrics"] < min_required_metrics:
+                # Защита от winner bias: шаги с большим числом NaN-метрик не
+                # должны выигрывать только потому, что в L2 сумме меньше слагаемых.
+                row2["distance_to_target"] = float("inf")
+                row2["distance_excluded_reason"] = "too_few_metrics"
 
             fam_d = info.get("family_distances", {}) or {}
             for fam in normalized_families:
@@ -785,16 +830,16 @@ def _pm_stream_subject(
             baseline = baseline_holder
 
             for col in ["density", "eff_w", "lcc_frac", "E", "total_weight"]:
-                base_val = pd.to_numeric(pd.Series([baseline.get(col, np.nan)]), errors="coerce").iloc[0]
-                cur_val = pd.to_numeric(pd.Series([row2.get(col, np.nan)]), errors="coerce").iloc[0]
+                base_val = _to_float(baseline.get(col, np.nan))
+                cur_val = _to_float(row2.get(col, np.nan))
                 row2[f"delta_{col}"] = (
                     float(cur_val - base_val)
                     if pd.notna(base_val) and pd.notna(cur_val)
                     else np.nan
                 )
 
-            base_e = pd.to_numeric(pd.Series([baseline.get("E", np.nan)]), errors="coerce").iloc[0]
-            cur_e = pd.to_numeric(pd.Series([row2.get("E", np.nan)]), errors="coerce").iloc[0]
+            base_e = _to_float(baseline.get("E", np.nan))
+            cur_e = _to_float(row2.get("E", np.nan))
             row2["removed_edge_fraction_from_baseline"] = (
                 float(1.0 - (cur_e / base_e))
                 if pd.notna(base_e) and base_e > 0 and pd.notna(cur_e)
@@ -810,9 +855,9 @@ def _pm_stream_subject(
                 best_row = dict(row2)
 
             for m in metric_list:
-                val = pd.to_numeric(pd.Series([row2.get(m, np.nan)]), errors="coerce").iloc[0]
-                tgt = pd.to_numeric(pd.Series([target_vector.get(m, np.nan)]), errors="coerce").iloc[0]
-                sc = pd.to_numeric(pd.Series([scales.get(m, 1.0)]), errors="coerce").iloc[0]
+                val = _to_float(row2.get(m, np.nan))
+                tgt = _to_float(target_vector.get(m, np.nan))
+                sc = _to_float(scales.get(m, 1.0), default=1.0)
 
                 if pd.isna(val) or pd.isna(tgt):
                     err = np.nan
@@ -1912,9 +1957,40 @@ def render_phenotype_matching_tab(
                 _push_ui_event("Build target vector and scales")
                 overall_bar.progress(0.18, text="Общий прогресс: prepare 18%")
 
+                sz_status = sz_group_metrics_df.get("status")
+                if sz_status is not None:
+                    sz_ok_mask = sz_status.astype(str).eq("ok")
+                    sz_failed = int((~sz_ok_mask).sum())
+                    if sz_failed > 0:
+                        st.warning(
+                            f"⚠️ SZ baseline: {sz_failed} из {len(sz_group_metrics_df)} графов завершились с ошибкой/timeout. "
+                            f"Target vector будет рассчитан по {int(sz_ok_mask.sum())} валидным графам."
+                        )
+                    sz_group_metrics_df = sz_group_metrics_df[sz_ok_mask].copy()
+
+                hc_status = hc_baseline_metrics_df.get("status")
+                if hc_status is not None:
+                    hc_ok_mask = hc_status.astype(str).eq("ok")
+                    hc_failed = int((~hc_ok_mask).sum())
+                    if hc_failed > 0:
+                        st.warning(
+                            f"⚠️ HC baseline: {hc_failed} из {len(hc_baseline_metrics_df)} графов завершились с ошибкой/timeout. "
+                            f"Scale-вектор будет рассчитан по {int(hc_ok_mask.sum())} валидным графам."
+                        )
+                    hc_baseline_metrics_df = hc_baseline_metrics_df[hc_ok_mask].copy()
+
                 target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
-                scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
+                scale_resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=metric_list)
+                scales = {str(k): float(v) for k, v in (scale_resolved.get("scales") or {}).items()}
                 normalized_families = normalize_metric_families(metric_list, None)
+
+                excluded_from_distance = list(scale_resolved.get("excluded_metrics", []) or [])
+                if excluded_from_distance:
+                    st.warning(
+                        "⚠️ Метрики исключены из distance (low HC baseline variance): "
+                        f"{', '.join(excluded_from_distance)}. "
+                        f"Distance будет рассчитан по {len(scales)} из {len(metric_list)} метрик."
+                    )
 
                 _pm_save_run_inputs(
                     run_dir,
