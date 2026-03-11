@@ -8,7 +8,6 @@ import re
 import gc
 import traceback
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import networkx as nx
 import numpy as np
@@ -56,6 +55,8 @@ from src.ui.plots.charts import (
 from src.ui.plots.scene3d import make_3d_traces
 from src.ui_blocks import help_icon
 from src.utils import as_simple_undirected, get_node_strength
+from src.timeout_worker import run_with_timeout as _run_with_timeout_safe
+from src.timeout_worker import build_graph_safe, compute_metrics_safe
 
 _layout_cached = GraphService.compute_layout3d
 logger = logging.getLogger(__name__)
@@ -1126,8 +1127,10 @@ def _compute_metrics_df_for_graph_ids(
                     pass
 
             row = _run_with_timeout(
-                _compute_one_graph_metrics_payload,
-                entry,
+                compute_metrics_safe,
+                entry.edges,
+                entry.src_col,
+                entry.dst_col,
                 min_conf=float(min_conf),
                 min_weight=float(min_weight),
                 analysis_mode=str(analysis_mode),
@@ -1138,6 +1141,7 @@ def _compute_metrics_df_for_graph_ids(
                 needs_clustering=bool(_needs_clustering),
                 needs_assortativity=bool(_needs_assortativity),
                 needs_diameter=bool(_needs_diameter),
+                graph_name=str(entry.name),
                 timeout_seconds=float(timeout_seconds_per_graph or 0.0),
             )
             row["graph_id"] = str(gid)
@@ -1227,19 +1231,8 @@ def _compute_one_graph_metrics_payload(
 
 
 def _run_with_timeout(fn, *args, timeout_seconds: float = 0.0, **kwargs):
-    """Run a top-level callable in a separate process and hard-stop it on timeout."""
-    timeout_seconds = float(timeout_seconds or 0.0)
-    if timeout_seconds <= 0:
-        return fn(*args, **kwargs)
-
-    with ProcessPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn, *args, **kwargs)
-        try:
-            return fut.result(timeout=timeout_seconds)
-        except FuturesTimeoutError as exc:
-            fut.cancel()
-            ex.shutdown(wait=False, cancel_futures=True)
-            raise TimeoutError(f"stage timeout > {timeout_seconds:.1f}s") from exc
+    """Thin wrapper over the streamlit-safe multiprocessing timeout runner."""
+    return _run_with_timeout_safe(fn, *args, timeout_seconds=timeout_seconds, **kwargs)
 
 
 def _needs_curvature_for_metrics(metrics: list[str]) -> bool:
@@ -2150,11 +2143,13 @@ def render_phenotype_matching_tab(
 
                     try:
                         G = _run_with_timeout(
-                            _build_current_graph_for_entry,
-                            entry,
-                            min_conf=float(min_conf),
-                            min_weight=float(min_weight),
-                            analysis_mode=str(analysis_mode),
+                            build_graph_safe,
+                            entry.edges,
+                            entry.src_col,
+                            entry.dst_col,
+                            float(min_conf),
+                            float(min_weight),
+                            str(analysis_mode),
                             timeout_seconds=float(pm_timeout_per_stage or 0),
                         )
 

@@ -10,9 +10,6 @@ import pandas as pd
 
 from .metric_registry import (
     describe_metrics_for_regime,
-    get_default_metrics_for_regime,
-    is_metric_discouraged_for_regime,
-    is_metric_valid_for_regime,
     split_metrics_by_regime,
 )
 from .phenotype_matching import normalize_metric_families
