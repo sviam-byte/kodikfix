@@ -82,3 +82,23 @@ def test_find_best_match_to_target_selects_expected_step():
         scales=scales,
     )
     assert out["best_step"] == 1
+
+
+def test_run_degradation_trajectory_reports_attack_family_and_graph_audit():
+    """Trajectory aux should expose regime-aware audit metadata for downstream logs."""
+    G = _toy_two_module_graph()
+    df, aux = run_degradation_trajectory(
+        G,
+        kind="weight_noise",
+        steps=2,
+        frac=0.2,
+        seed=7,
+        eff_sources_k=4,
+        compute_heavy_every=1,
+        graph_regime="full_weighted_unsigned",
+    )
+    assert not df.empty
+    assert aux.get("attack_family") == "weight"
+    graph_audit = aux.get("graph_audit", {})
+    assert graph_audit.get("graph_regime") == "full_weighted_unsigned"
+    assert int(graph_audit.get("n_nodes", -1)) == G.number_of_nodes()

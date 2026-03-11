@@ -328,6 +328,8 @@ def find_best_match_to_target(
     )
     if scored.empty or "distance_to_target" not in scored.columns:
         return {"best_step": None, "best_damage_frac": float("nan"), "best_distance": float("nan"), "n_used_metrics": 0, "scored_trajectory": scored, "distance_mode": str(distance_mode)}
+    if "is_invalid_state" in scored.columns:
+        scored = scored.loc[~scored["is_invalid_state"].fillna(False)].copy()
     valid = scored[np.isfinite(pd.to_numeric(scored["distance_to_target"], errors="coerce"))].copy()
     if valid.empty:
         return {"best_step": None, "best_damage_frac": float("nan"), "best_distance": float("nan"), "n_used_metrics": 0, "scored_trajectory": scored, "distance_mode": str(distance_mode)}
@@ -368,6 +370,7 @@ def compare_degradation_models(
     subject_metadata: pd.DataFrame | None = None,
     distance_mode: str = "raw",
     metric_families: Mapping[str, Sequence[str]] | None = None,
+    graph_regime: str = "full_weighted_unsigned",
 ) -> dict:
     requested_metric_list = _as_metric_list(metrics)
     resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=requested_metric_list)
@@ -417,6 +420,7 @@ def compare_degradation_models(
                 module_resolution=float(module_resolution),
                 removal_mode=str(removal_mode),
                 fast_mode=bool(fast_mode),
+                graph_regime=str(graph_regime),
             )
             best = find_best_match_to_target(
                 traj_df,
@@ -430,6 +434,7 @@ def compare_degradation_models(
             scored["subject_idx"] = int(subj_idx)
             scored["subject_id"] = str(subject_id)
             scored["attack_kind"] = str(kind)
+            scored["attack_family"] = str((_aux or {}).get("attack_family", "unknown"))
             all_traj.append(scored)
 
             best_row = best.get("best_row", {}) or {}
@@ -442,6 +447,8 @@ def compare_degradation_models(
                 "best_delta_total_weight": float(best_row.get("delta_total_weight", best_row.get("delta_E", np.nan))),
                 "best_delta_E": float(best_row.get("delta_E", np.nan)),
                 "best_removed_edge_fraction_from_baseline": float(best_row.get("removed_edge_fraction_from_baseline", np.nan)),
+                "best_invalid_reason": str(best_row.get("invalid_reason", "") or ""),
+                "graph_regime": str(graph_regime),
             })
 
             scalar_best = find_best_scalar_match(traj_df, target_vector=target_vector, metrics=metric_list, scales=scales, absolute=True)
@@ -494,6 +501,7 @@ def compare_degradation_models(
         "metric_scale_audit": metric_audit_df,
         "metric_families": normalized_families,
         "distance_mode": str(distance_mode),
+        "graph_regime": str(graph_regime),
     }
 
 

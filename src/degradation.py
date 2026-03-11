@@ -16,6 +16,55 @@ from .utils import as_simple_undirected
 
 _logger = logging.getLogger(__name__)
 
+WEIGHT_ATTACK_KINDS = {"weight_noise", "weight_noise_pure"}
+TOPOLOGY_ATTACK_KINDS = {
+    "weak_edges_by_weight", "strong_edges_by_weight", "random_edges",
+    "inter_module_removal", "intra_module_removal", "mix_default", "mix_degree_preserving",
+}
+
+
+def classify_attack_family(kind: str) -> str:
+    """Classify an attack kind into weight/topology buckets for reporting."""
+    k = str(kind)
+    if k in WEIGHT_ATTACK_KINDS:
+        return "weight"
+    if k in TOPOLOGY_ATTACK_KINDS:
+        return "topology"
+    return "unknown"
+
+
+def validate_graph_for_regime(G: nx.Graph, *, graph_regime: str) -> dict:
+    """Audit graph compatibility with the selected processing regime."""
+    H = as_simple_undirected(G)
+    weights = [float(d.get("weight", 1.0)) for _u, _v, d in H.edges(data=True)]
+    has_negative = any(w < 0 for w in weights)
+    has_zero = any(abs(w) <= 1e-12 for w in weights)
+    return {
+        "graph_regime": str(graph_regime),
+        "n_nodes": int(H.number_of_nodes()),
+        "n_edges": int(H.number_of_edges()),
+        "has_negative_weights": bool(has_negative),
+        "has_zero_weights": bool(has_zero),
+    }
+
+
+def _trajectory_guardrails(df: pd.DataFrame) -> pd.DataFrame:
+    """Annotate invalid trajectory rows to protect downstream winner selection."""
+    out = df.copy()
+    out["is_invalid_state"] = False
+    out["invalid_reason"] = ""
+    if "E" in out.columns:
+        e = pd.to_numeric(out["E"], errors="coerce")
+        bad_e = ~np.isfinite(e) | (e < 0)
+        out.loc[bad_e, "is_invalid_state"] = True
+        out.loc[bad_e, "invalid_reason"] = "invalid_E"
+    if "distance_to_target" in out.columns:
+        d = pd.to_numeric(out["distance_to_target"], errors="coerce")
+        bad_d = ~np.isfinite(d)
+        out.loc[bad_d, "is_invalid_state"] = True
+        out.loc[bad_d, "invalid_reason"] = out.loc[bad_d, "invalid_reason"].replace("", "invalid_distance")
+    return out
+
 
 @dataclass
 class ModuleInfo:
@@ -552,9 +601,11 @@ def run_degradation_trajectory(
     fast_mode: bool = False,
     progress_cb=None,
     row_cb=None,
+    graph_regime: str = "full_weighted_unsigned",
 ) -> tuple[pd.DataFrame, dict]:
     kind = str(kind)
     H = as_simple_undirected(G)
+    graph_audit = validate_graph_for_regime(H, graph_regime=str(graph_regime))
 
     if kind in {"weak_edges_by_weight", "strong_edges_by_weight"}:
         df, aux = run_edge_attack(
@@ -571,7 +622,8 @@ def run_degradation_trajectory(
             progress_cb=progress_cb,
             row_cb=row_cb,
         )
-        return _normalize_legacy_trajectory(df, source_kind=kind), aux
+        out = _trajectory_guardrails(_normalize_legacy_trajectory(df, source_kind=kind))
+        return out, {**dict(aux or {}), "attack_family": classify_attack_family(kind), "graph_audit": graph_audit}
 
     if kind in {"mix_default", "mix_degree_preserving"}:
         # Guard: mix attacks are ineffective on near-complete graphs.
@@ -605,7 +657,8 @@ def run_degradation_trajectory(
             df["damage_frac"] = 0.0
             if row_cb is not None:
                 row_cb(dict(row), 0, 0)
-            return df, {"kind": kind, "skipped": True, "density": float(_dens_guard)}
+            out = _trajectory_guardrails(df)
+            return out, {"kind": kind, "skipped": True, "density": float(_dens_guard), "attack_family": classify_attack_family(kind), "graph_audit": graph_audit}
 
         mix_kind = "mix_default" if kind == "mix_default" else "mix_degree_preserving"
         actual_kind = "mix_weightconf_preserving" if kind == "mix_default" else kind
@@ -620,10 +673,11 @@ def run_degradation_trajectory(
             progress_cb=progress_cb,
             row_cb=row_cb,
         )
-        return _normalize_legacy_trajectory(df, source_kind=mix_kind), aux
+        out = _trajectory_guardrails(_normalize_legacy_trajectory(df, source_kind=mix_kind))
+        return out, {**dict(aux or {}), "attack_family": classify_attack_family(kind), "graph_audit": graph_audit}
 
     if kind == "random_edges":
-        return _run_random_edge_removal(
+        df, aux = _run_random_edge_removal(
             H,
             steps=int(steps),
             frac=float(frac),
@@ -636,9 +690,10 @@ def run_degradation_trajectory(
             row_cb=row_cb,
             progress_cb=progress_cb,
         )
+        return _trajectory_guardrails(df), {**dict(aux or {}), "attack_family": classify_attack_family(kind), "graph_audit": graph_audit}
 
     if kind in {"weight_noise", "weight_noise_pure"}:
-        return _run_noise_trajectory(
+        df, aux = _run_noise_trajectory(
             H,
             steps=int(steps),
             frac=float(frac),
@@ -654,6 +709,7 @@ def run_degradation_trajectory(
             row_cb=row_cb,
             progress_cb=progress_cb,
         )
+        return _trajectory_guardrails(df), {**dict(aux or {}), "attack_family": classify_attack_family(kind), "graph_audit": graph_audit}
 
     if kind in {"inter_module_removal", "intra_module_removal"}:
         mi = module_info
@@ -663,7 +719,7 @@ def run_degradation_trajectory(
                 seed=int(seed),
                 resolution=float(module_resolution),
             )
-        return _run_module_selective_edge_removal(
+        df, aux = _run_module_selective_edge_removal(
             H,
             kind=kind,
             steps=int(steps),
@@ -681,5 +737,6 @@ def run_degradation_trajectory(
             row_cb=row_cb,
             progress_cb=progress_cb,
         )
+        return _trajectory_guardrails(df), {**dict(aux or {}), "attack_family": classify_attack_family(kind), "graph_audit": graph_audit}
 
     raise ValueError(f"Unsupported degradation kind: {kind}")

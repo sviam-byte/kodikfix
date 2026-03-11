@@ -34,6 +34,21 @@ def test_preflight_catches_duplicate_subject_ids_and_missing_metrics():
     assert rep["duplicate_subject_ids"] == ["x"]
 
 
+def test_preflight_warns_for_weighted_regime_with_topology_only_attacks():
+    """Weighted regime should nudge users toward at least one weight attack."""
+    sz = pd.DataFrame({"l2_lcc": [0.1], "mod": [0.2]})
+    hc = pd.DataFrame({"l2_lcc": [0.3, 0.4], "mod": [0.5, 0.6]})
+    rep = run_phenotype_preflight(
+        sz_group_metrics_df=sz,
+        hc_baseline_metrics_df=hc,
+        metrics=["l2_lcc", "mod"],
+        graph_regime="full_weighted_unsigned",
+        attack_kinds=["weak_edges_by_weight", "random_edges"],
+    )
+    assert rep["ok"] is True
+    assert any("only topology attacks" in str(msg) for msg in rep["warnings"])
+
+
 def test_compare_degradation_models_propagates_subject_id():
     sz = pd.DataFrame({"density": [1.0], "mod": [0.0]})
     hc_baseline = pd.DataFrame({"density": [1.0], "mod": [0.0]})
