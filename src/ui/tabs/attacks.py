@@ -8,6 +8,7 @@ import re
 import gc
 import traceback
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import networkx as nx
 import numpy as np
@@ -694,6 +695,7 @@ def _pm_stream_subject(
     fast_mode: bool,
     subject_meta: dict | None = None,
     timeout_seconds: float = 0.0,
+    attack_timeout_seconds: float = 0.0,
     progress_cb=None,
     export_subject_excel: bool = False,
     include_subject_trajectory_in_return: bool = False,
@@ -728,6 +730,7 @@ def _pm_stream_subject(
         )
 
     for attack_pos, kind in enumerate(attack_kinds, start=1):
+        attack_t0 = time.perf_counter()
         best_distance = float("inf")
         best_row = None
         metric_best: dict[str, dict] = {}
@@ -737,6 +740,8 @@ def _pm_stream_subject(
         def _check_timeout() -> None:
             if timeout_seconds and (time.perf_counter() - t0) > float(timeout_seconds):
                 raise TimeoutError(f"subject timeout > {float(timeout_seconds):.1f}s")
+            if attack_timeout_seconds and (time.perf_counter() - attack_t0) > float(attack_timeout_seconds):
+                raise TimeoutError(f"attack timeout [{kind}] > {float(attack_timeout_seconds):.1f}s")
 
         def _row_cb(row: dict, i: int, total_steps: int) -> None:
             nonlocal best_distance, best_row, last_step
@@ -1036,12 +1041,16 @@ def _compute_metrics_df_for_graph_ids(
     compute_curvature: bool,
     metric_names: list[str] | None = None,
     progress_cb=None,
+    timeout_seconds_per_graph: float = 0.0,
 ) -> pd.DataFrame:
     """Compute baseline metrics table for selected loaded graphs.
 
     If *metric_names* is provided, unnecessary expensive computations are
     skipped (e.g. diameter/assortativity/spectral block). Optionally reports
-    per-graph progress via *progress_cb(done, total, graph_id)*.
+    per-graph progress via *progress_cb(done, total, graph_id, stage)*.
+
+    With *timeout_seconds_per_graph* > 0, each graph is computed in a separate
+    process and tagged as timeout/error without stopping the whole run.
     """
     # Compute only heavy blocks needed by selected optimization metrics.
     _mset = set(str(m) for m in (metric_names or []))
@@ -1056,30 +1065,49 @@ def _compute_metrics_df_for_graph_ids(
     total = len(graph_ids)
     for idx, gid in enumerate(graph_ids):
         entry = graphs[gid]
-        G = _build_current_graph_for_entry(
-            entry,
-            min_conf=float(min_conf),
-            min_weight=float(min_weight),
-            analysis_mode=str(analysis_mode),
-        )
-        met = calculate_metrics(
-            G,
-            int(eff_k),
-            int(seed),
-            bool(compute_curvature),
-            curvature_sample_edges=80,
-            compute_heavy=True,
-            skip_spectral=not _needs_spectral,
-            skip_clustering=not _needs_clustering,
-            skip_assortativity=not _needs_assortativity,
-            diameter_samples=8 if _needs_diameter else 0,
-        )
-        row = {"graph_id": gid, "graph_name": entry.name}
-        row.update(met)
+        try:
+            if callable(progress_cb):
+                try:
+                    progress_cb(idx, total, str(gid), "build+metrics")
+                except Exception:
+                    pass
+
+            row = _run_with_timeout(
+                _compute_one_graph_metrics_payload,
+                entry,
+                min_conf=float(min_conf),
+                min_weight=float(min_weight),
+                analysis_mode=str(analysis_mode),
+                eff_k=int(eff_k),
+                seed=int(seed),
+                compute_curvature=bool(compute_curvature),
+                needs_spectral=bool(_needs_spectral),
+                needs_clustering=bool(_needs_clustering),
+                needs_assortativity=bool(_needs_assortativity),
+                needs_diameter=bool(_needs_diameter),
+                timeout_seconds=float(timeout_seconds_per_graph or 0.0),
+            )
+            row["graph_id"] = str(gid)
+            row["graph_name"] = entry.name
+            row.setdefault("status", "ok")
+        except TimeoutError as exc:
+            row = {
+                "graph_id": str(gid),
+                "graph_name": entry.name,
+                "status": "timeout",
+                "error": str(exc),
+            }
+        except Exception as exc:
+            row = {
+                "graph_id": str(gid),
+                "graph_name": entry.name,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         rows.append(row)
         if callable(progress_cb):
             try:
-                progress_cb(idx + 1, total, str(gid))
+                progress_cb(idx + 1, total, str(gid), str(row.get("status", "ok")))
             except Exception:
                 pass
     return pd.DataFrame(rows)
@@ -1101,6 +1129,64 @@ def _build_current_graph_for_entry(
         float(min_weight),
         str(analysis_mode),
     )
+
+
+def _compute_one_graph_metrics_payload(
+    entry: GraphEntry,
+    *,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+    eff_k: int,
+    seed: int,
+    compute_curvature: bool,
+    needs_spectral: bool,
+    needs_clustering: bool,
+    needs_assortativity: bool,
+    needs_diameter: bool,
+) -> dict:
+    """Build one graph and compute one baseline metrics row in an isolated worker."""
+    G = _build_current_graph_for_entry(
+        entry,
+        min_conf=float(min_conf),
+        min_weight=float(min_weight),
+        analysis_mode=str(analysis_mode),
+    )
+    met = calculate_metrics(
+        G,
+        int(eff_k),
+        int(seed),
+        bool(compute_curvature),
+        curvature_sample_edges=80,
+        compute_heavy=True,
+        skip_spectral=not bool(needs_spectral),
+        skip_clustering=not bool(needs_clustering),
+        skip_assortativity=not bool(needs_assortativity),
+        diameter_samples=8 if bool(needs_diameter) else 0,
+    )
+    row = {
+        "graph_id": str(getattr(entry, "gid", getattr(entry, "name", ""))),
+        "graph_name": str(getattr(entry, "name", "")),
+        "status": "ok",
+    }
+    row.update(met)
+    return row
+
+
+def _run_with_timeout(fn, *args, timeout_seconds: float = 0.0, **kwargs):
+    """Run a top-level callable in a separate process and hard-stop it on timeout."""
+    timeout_seconds = float(timeout_seconds or 0.0)
+    if timeout_seconds <= 0:
+        return fn(*args, **kwargs)
+
+    with ProcessPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout_seconds)
+        except FuturesTimeoutError as exc:
+            fut.cancel()
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(f"stage timeout > {timeout_seconds:.1f}s") from exc
 
 
 def _needs_curvature_for_metrics(metrics: list[str]) -> bool:
@@ -1359,6 +1445,14 @@ def render_phenotype_matching_tab(
             value=int(st.session_state.get("pm_timeout_per_subject", 0)),
             step=10,
             key="pm_timeout_per_subject",
+        )
+        pm_timeout_per_stage = st.number_input(
+            "Скип по времени на любой prepare/build-этап (сек)",
+            min_value=0,
+            value=int(st.session_state.get("pm_timeout_per_stage", 600)),
+            step=10,
+            key="pm_timeout_per_stage",
+            help="Если один baseline/build этап длится слишком долго, он помечается как timeout и run идёт дальше.",
         )
 
         pm_attack_kinds = st.multiselect(
@@ -1688,6 +1782,8 @@ def render_phenotype_matching_tab(
                         "module_resolution": float(pm_module_resolution),
                         "removal_mode": str(pm_removal_mode),
                         "compute_curvature": bool(pm_compute_curv),
+                        "timeout_per_subject": float(pm_timeout_per_subject or 0),
+                        "timeout_per_stage": float(pm_timeout_per_stage or 0),
                         "distance_mode": "raw",
                     },
                     metadata_upload=pm_meta_file,
@@ -1721,12 +1817,12 @@ def render_phenotype_matching_tab(
                         write_event=True,
                     )
 
-                    def _sz_progress(done, total, gid):
+                    def _sz_progress(done, total, gid, stage="metrics"):
                         # Отдаем пользователю живой прогресс по графам, чтобы UI
                         # не выглядел зависшим на длинной prepare-фазе.
                         frac = 0.07 + 0.05 * (float(done) / float(max(1, total)))
                         overall_bar.progress(frac, text=f"Общий прогресс: SZ baseline {done}/{total} ({int(frac*100)}%)")
-                        status_box.caption(f"SZ baseline: граф {done}/{total} · {gid}")
+                        status_box.caption(f"SZ baseline: граф {done}/{total} · {gid} · {stage}")
                         if done == total or done % max(1, total // 5) == 0:
                             _push_ui_event(f"SZ baseline: {done}/{total}")
 
@@ -1741,6 +1837,7 @@ def render_phenotype_matching_tab(
                         compute_curvature=bool(pm_compute_curv),
                         metric_names=metric_list,
                         progress_cb=_sz_progress,
+                        timeout_seconds_per_graph=float(pm_timeout_per_stage or 0),
                     )
                 else:
                     if pm_sz_file is None:
@@ -1780,11 +1877,11 @@ def render_phenotype_matching_tab(
                 if pm_hc_base_file is not None:
                     hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
                 else:
-                    def _hc_progress(done, total, gid):
+                    def _hc_progress(done, total, gid, stage="metrics"):
                         # Аналогичный per-graph прогресс для HC baseline-фазы.
                         frac = 0.14 + 0.04 * (float(done) / float(max(1, total)))
                         overall_bar.progress(frac, text=f"Общий прогресс: HC baseline {done}/{total} ({int(frac*100)}%)")
-                        status_box.caption(f"HC baseline: граф {done}/{total} · {gid}")
+                        status_box.caption(f"HC baseline: граф {done}/{total} · {gid} · {stage}")
                         if done == total or done % max(1, total // 5) == 0:
                             _push_ui_event(f"HC baseline: {done}/{total}")
 
@@ -1799,6 +1896,7 @@ def render_phenotype_matching_tab(
                         compute_curvature=bool(pm_compute_curv),
                         metric_names=metric_list,
                         progress_cb=_hc_progress,
+                        timeout_seconds_per_graph=float(pm_timeout_per_stage or 0),
                     )
 
                 phase_box.info("Prepare phase: target/scales")
@@ -1829,6 +1927,8 @@ def render_phenotype_matching_tab(
                         "module_resolution": float(pm_module_resolution),
                         "removal_mode": str(pm_removal_mode),
                         "compute_curvature": bool(pm_compute_curv),
+                        "timeout_per_subject": float(pm_timeout_per_subject or 0),
+                        "timeout_per_stage": float(pm_timeout_per_stage or 0),
                         "distance_mode": "raw",
                         "target_vector": target_vector,
                         "scales": scales,
@@ -1965,11 +2065,13 @@ def render_phenotype_matching_tab(
                     t0 = time.perf_counter()
 
                     try:
-                        G = _build_current_graph_for_entry(
+                        G = _run_with_timeout(
+                            _build_current_graph_for_entry,
                             entry,
                             min_conf=float(min_conf),
                             min_weight=float(min_weight),
                             analysis_mode=str(analysis_mode),
+                            timeout_seconds=float(pm_timeout_per_stage or 0),
                         )
 
                         status_box.caption(f"[{pos}/{total_subjects}] {subject_id} · trajectory")
@@ -2045,6 +2147,7 @@ def render_phenotype_matching_tab(
                             fast_mode=False,
                             subject_meta=subject_meta,
                             timeout_seconds=float(pm_timeout_per_subject or 0),
+                            attack_timeout_seconds=float(pm_timeout_per_stage or 0),
                             progress_cb=_ui_progress,
                             export_subject_excel=bool(pm_export_subject_xlsx),
                             include_subject_trajectory_in_return=False,
