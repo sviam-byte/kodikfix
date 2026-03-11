@@ -13,6 +13,7 @@ This module contains:
 from __future__ import annotations
 
 import multiprocessing as mp
+import sys as _sys
 import traceback as _tb_mod
 from typing import Any
 
@@ -22,6 +23,8 @@ import pandas as pd
 # Streamlit-free imports only (safe for multiprocessing "spawn")
 from src.metrics import calculate_metrics
 from src.services.graph_service import GraphService
+
+_SENTINEL = object()
 
 # ---------------------------------------------------------------------------
 # Pure computation functions (called inside the child process)
@@ -114,6 +117,16 @@ def run_with_timeout(fn, *args, timeout_seconds: float = 0.0, **kwargs):
     Notes:
     - ``fn`` must be a top-level function from a streamlit-free module.
     - With timeout <= 0, execution falls back to direct in-process call.
+
+    On Windows (spawn context), the child process may attempt to re-import
+    ``__main__``. If ``__main__`` points to a Streamlit entry module (for
+    example, ``app.py`` with ``st.set_page_config`` calls), this re-import can
+    crash the child process before any computation starts.
+
+    To avoid this, we temporarily mask ``__main__.__file__`` and
+    ``__main__.__spec__`` while starting the process. That makes spawn skip
+    re-importing the main module while still allowing normal imports for this
+    streamlit-free worker module.
     """
     timeout_seconds = float(timeout_seconds or 0.0)
     if timeout_seconds <= 0:
@@ -128,7 +141,28 @@ def run_with_timeout(fn, *args, timeout_seconds: float = 0.0, **kwargs):
         args=(result_q, error_q, fn, args, kwargs),
         daemon=True,
     )
-    proc.start()
+
+    # Guard against problematic ``__main__`` re-import in spawn-based children.
+    main_mod = _sys.modules.get("__main__")
+    saved_file = getattr(main_mod, "__file__", _SENTINEL)
+    saved_spec = getattr(main_mod, "__spec__", _SENTINEL)
+    try:
+        if main_mod is not None:
+            if saved_file is not _SENTINEL:
+                try:
+                    delattr(main_mod, "__file__")
+                except AttributeError:
+                    # Attribute can be immutable/proxied in some launchers.
+                    pass
+            main_mod.__spec__ = None
+        proc.start()
+    finally:
+        # Restore immediately so the parent process state remains unchanged.
+        if main_mod is not None:
+            if saved_file is not _SENTINEL:
+                main_mod.__file__ = saved_file
+            if saved_spec is not _SENTINEL:
+                main_mod.__spec__ = saved_spec
     proc.join(timeout=timeout_seconds)
 
     if proc.is_alive():
