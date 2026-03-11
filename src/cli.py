@@ -608,6 +608,9 @@ def _cmd_phenotype_match(args) -> int:
         module_resolution=float(args.module_resolution),
         recompute_modules=bool(args.recompute_modules),
         removal_mode=str(args.removal_mode),
+        graph_regime=str(settings.GRAPH_REGIME),
+        weight_policy=str(settings.WEIGHT_POLICY),
+        sign_policy="unsigned_abs" if str(settings.WEIGHT_POLICY) == "abs" else str(settings.WEIGHT_POLICY),
         notes=str(getattr(args, "notes", "")),
     )
     preflight = run_phenotype_preflight(
@@ -616,6 +619,8 @@ def _cmd_phenotype_match(args) -> int:
         metrics=effective_metrics_requested,
         subject_ids=subject_ids,
         metric_families=metric_families,
+        graph_regime=str(settings.GRAPH_REGIME),
+        attack_kinds=attack_kinds,
     )
     if not preflight.get("ok", False):
         raise ValueError("Phenotype preflight failed: " + "; ".join(preflight.get("fatal_errors", [])))
@@ -629,6 +634,7 @@ def _cmd_phenotype_match(args) -> int:
         keep_density_from_baseline=bool(args.keep_density_from_baseline), recompute_modules=bool(args.recompute_modules),
         module_resolution=float(args.module_resolution), removal_mode=str(args.removal_mode),
         subject_ids=subject_ids, distance_mode=distance_mode,
+        graph_regime=str(settings.GRAPH_REGIME),
     )
 
     if bool(getattr(args, "control_suite", False)):

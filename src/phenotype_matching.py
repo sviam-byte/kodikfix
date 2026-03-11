@@ -7,6 +7,11 @@ import numpy as np
 import pandas as pd
 
 from .degradation import prepare_module_info, run_degradation_trajectory
+from .metric_registry import (
+    get_default_metrics_for_regime,
+    is_metric_valid_for_regime,
+    split_metrics_by_regime,
+)
 from .phenotype_scalar import (
     build_scalar_subject_results,
     build_scalar_summary,
@@ -14,7 +19,14 @@ from .phenotype_scalar import (
     find_best_scalar_match,
 )
 
-DEFAULT_PROFILE_METRICS = [
+FULL_WEIGHTED_PROFILE_METRICS = [
+    "l2_lcc",
+    "H_rw",
+    "fragility_H",
+    "mod",
+]
+
+SPARSE_PROFILE_METRICS = [
     "density",
     "clustering",
     "mod",
@@ -25,11 +37,14 @@ DEFAULT_PROFILE_METRICS = [
     "lcc_frac",
 ]
 
+DEFAULT_PROFILE_METRICS = get_default_metrics_for_regime("full_weighted_unsigned")
+
 DEFAULT_METRIC_FAMILIES = {
-    "density": ["density", "avg_degree", "beta", "beta_red", "clustering"],
     "integration": ["algebraic_connectivity", "l2_lcc", "eff_w", "tau_relax", "lcc_frac"],
     "modularity": ["mod"],
     "entropy_fragility": ["H_rw", "fragility_H", "H_evo", "fragility_evo"],
+    "density_topology": ["density", "avg_degree", "beta", "beta_red", "clustering"],
+    "signed_weight": ["kappa_mean", "kappa_frac_negative", "kappa_median", "kappa_var", "kappa_skew", "kappa_entropy"],
 }
 
 
@@ -52,15 +67,21 @@ def normalize_metric_families(
     metric_families: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, list[str]]:
     metric_list = _as_metric_list(metrics)
-    families_src = dict(DEFAULT_METRIC_FAMILIES)
+    # User-supplied families take precedence and are matched first.
+    families_src: dict[str, list[str]] = {}
     if metric_families:
         for fam, fam_metrics in metric_families.items():
+            families_src[str(fam)] = [str(m) for m in fam_metrics if str(m)]
+    for fam, fam_metrics in DEFAULT_METRIC_FAMILIES.items():
+        if str(fam) not in families_src:
             families_src[str(fam)] = [str(m) for m in fam_metrics if str(m)]
 
     out: dict[str, list[str]] = {}
     assigned: set[str] = set()
     for fam, fam_metrics in families_src.items():
-        kept = [m for m in fam_metrics if m in metric_list]
+        # Keep first-match assignment stable so overlapping family definitions
+        # (e.g., user overrides plus default aliases) do not duplicate metrics.
+        kept = [m for m in fam_metrics if m in metric_list and m not in assigned]
         if kept:
             out[str(fam)] = kept
             assigned.update(kept)
@@ -84,29 +105,105 @@ def build_group_target_vector(group_df: pd.DataFrame, *, metrics: Sequence[str] 
     return out
 
 
+def audit_metric_variability(
+    baseline_df: pd.DataFrame,
+    *,
+    metrics: Sequence[str] | None = None,
+    eps: float = 1e-8,
+) -> pd.DataFrame:
+    """Build a per-metric variability audit used by phenotype distance scaling."""
+    metric_list = _as_metric_list(metrics)
+    rows: list[dict[str, float | str | int | bool]] = []
+    for m in metric_list:
+        if m not in baseline_df.columns:
+            rows.append({
+                "metric": str(m),
+                "status": "missing_in_baseline",
+                "n": 0,
+                "n_unique": 0,
+                "std": float("nan"),
+                "mad": float("nan"),
+                "scale": float("nan"),
+                "keep": False,
+            })
+            continue
+        arr = pd.to_numeric(baseline_df[m], errors="coerce").to_numpy(dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            rows.append({
+                "metric": str(m),
+                "status": "empty_in_baseline",
+                "n": 0,
+                "n_unique": 0,
+                "std": float("nan"),
+                "mad": float("nan"),
+                "scale": float("nan"),
+                "keep": False,
+            })
+            continue
+        std = float(np.nanstd(arr, ddof=1)) if arr.size >= 2 else 0.0
+        med = float(np.nanmedian(arr))
+        mad = float(np.nanmedian(np.abs(arr - med)))
+        robust_scale = 1.4826 * mad if np.isfinite(mad) else float("nan")
+        n_unique = int(pd.Series(arr).nunique(dropna=True))
+        has_dispersion = bool((np.isfinite(std) and std >= eps) or (np.isfinite(robust_scale) and robust_scale >= eps))
+        # Backward compatibility: with <2 baseline points we cannot estimate
+        # variability reliably, so keep metric with a neutral unit scale.
+        keep = bool(has_dispersion or arr.size < 2)
+        if has_dispersion:
+            scale = std if np.isfinite(std) and std >= eps else robust_scale
+            status = "ok"
+        elif arr.size < 2:
+            scale = 1.0
+            status = "insufficient_baseline"
+        else:
+            scale = float("nan")
+            status = "low_variance" if n_unique <= 1 or arr.size >= 1 else "empty_in_baseline"
+        rows.append({
+            "metric": str(m),
+            "status": status,
+            "n": int(arr.size),
+            "n_unique": n_unique,
+            "std": std,
+            "mad": mad,
+            "scale": float(scale) if np.isfinite(scale) else float("nan"),
+            "keep": keep,
+        })
+    return pd.DataFrame(rows)
+
+
+def resolve_metric_scales(
+    baseline_df: pd.DataFrame,
+    *,
+    metrics: Sequence[str] | None = None,
+    eps: float = 1e-8,
+) -> dict[str, object]:
+    """Resolve robust scales and exclude low-variance metrics from distance."""
+    audit_df = audit_metric_variability(baseline_df, metrics=metrics, eps=eps)
+    kept_metrics = [str(x) for x in audit_df.loc[audit_df["keep"].fillna(False), "metric"].tolist()]
+    excluded_metrics = [str(x) for x in audit_df.loc[~audit_df["keep"].fillna(False), "metric"].tolist()]
+    scales = {
+        str(row["metric"]): float(row["scale"])
+        for _, row in audit_df.iterrows()
+        if bool(row.get("keep", False)) and np.isfinite(float(row.get("scale", np.nan)))
+    }
+    return {
+        "audit_df": audit_df,
+        "kept_metrics": kept_metrics,
+        "excluded_metrics": excluded_metrics,
+        "scales": scales,
+    }
+
+
 def build_scale_vector(
     baseline_df: pd.DataFrame,
     *,
     metrics: Sequence[str] | None = None,
     eps: float = 1e-8,
 ) -> dict[str, float]:
-    metric_list = _as_metric_list(metrics)
-    scales: dict[str, float] = {}
-    for m in metric_list:
-        if m not in baseline_df.columns:
-            scales[m] = 1.0
-            continue
-        arr = pd.to_numeric(baseline_df[m], errors="coerce").to_numpy(dtype=float)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            scales[m] = 1.0
-            continue
-        s = float(np.nanstd(arr, ddof=1)) if arr.size >= 2 else 0.0
-        if (not np.isfinite(s)) or s < eps:
-            mad = float(np.nanmedian(np.abs(arr - np.nanmedian(arr))))
-            s = 1.4826 * mad if np.isfinite(mad) and mad >= eps else 1.0
-        scales[m] = float(max(s, eps))
-    return scales
+    """Backward-compatible helper that returns only resolved scale values."""
+    resolved = resolve_metric_scales(baseline_df, metrics=metrics, eps=eps)
+    return {str(k): float(v) for k, v in (resolved.get("scales") or {}).items()}
 
 
 def _compute_row_diffs(
@@ -126,7 +223,7 @@ def _compute_row_diffs(
         if not np.isfinite(xv) or not np.isfinite(tv):
             continue
         if (not np.isfinite(sv)) or sv <= 1e-12:
-            sv = 1.0
+            continue
         used.append(m)
         diffs[m] = float((xv - tv) / sv)
     return used, diffs
@@ -236,6 +333,8 @@ def find_best_match_to_target(
     )
     if scored.empty or "distance_to_target" not in scored.columns:
         return {"best_step": None, "best_damage_frac": float("nan"), "best_distance": float("nan"), "n_used_metrics": 0, "scored_trajectory": scored, "distance_mode": str(distance_mode)}
+    if "is_invalid_state" in scored.columns:
+        scored = scored.loc[~scored["is_invalid_state"].fillna(False)].copy()
     valid = scored[np.isfinite(pd.to_numeric(scored["distance_to_target"], errors="coerce"))].copy()
     if valid.empty:
         return {"best_step": None, "best_damage_frac": float("nan"), "best_distance": float("nan"), "n_used_metrics": 0, "scored_trajectory": scored, "distance_mode": str(distance_mode)}
@@ -253,34 +352,69 @@ def find_best_match_to_target(
 
 
 def compare_degradation_models(
-    hc_graphs: Sequence[nx.Graph],
+    hc_graphs: Sequence,
     *,
     sz_group_metrics_df: pd.DataFrame,
     hc_baseline_metrics_df: pd.DataFrame,
     attack_kinds: Sequence[str],
     metrics: Sequence[str] | None = None,
-    steps: int = 12,
-    frac: float = 0.5,
+    steps: int = 10,
+    frac: float = 0.1,
     seed: int = 42,
-    eff_sources_k: int = 16,
-    compute_heavy_every: int = 2,
-    compute_curvature: bool = False,
-    curvature_sample_edges: int = 80,
-    noise_sigma_max: float = 0.5,
-    keep_density_from_baseline: bool = True,
-    recompute_modules: bool = False,
-    module_resolution: float = 1.0,
-    removal_mode: str = "random",
-    fast_mode: bool = False,
     subject_ids: Sequence[str] | None = None,
-    subject_metadata: pd.DataFrame | None = None,
+    module_resolution: float = 1.0,
+    removal_mode: str = "fraction_initial",
+    compute_heavy_every: int = 1,
     distance_mode: str = "raw",
     metric_families: Mapping[str, Sequence[str]] | None = None,
+    graph_regime: str = "full_weighted_unsigned",
+    **kwargs,
 ) -> dict:
-    metric_list = _as_metric_list(metrics)
+    requested_metric_list = _as_metric_list(metrics)
+    if not requested_metric_list:
+        requested_metric_list = get_default_metrics_for_regime(graph_regime)
+
+    regime_split = split_metrics_by_regime(requested_metric_list, graph_regime)
+    invalid_regime_metrics = list(regime_split["invalid"])
+    discouraged_regime_metrics = list(regime_split["discouraged"])
+    requested_valid_metrics = list(regime_split["core"] + regime_split["secondary"])
+
+    resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=requested_valid_metrics)
+    metric_list = list(resolved.get("kept_metrics") or [])
+    metric_audit_df = resolved.get("audit_df", pd.DataFrame())
+
+    if not metric_list:
+        # Compatibility: keep full result schema so downstream CLI/export code
+        # can safely consume empty runs without special-case KeyError checks.
+        return {
+            "target_vector": {},
+            "scales": {},
+            "trajectory_results": pd.DataFrame(),
+            "subject_results": pd.DataFrame(),
+            "winner_results": pd.DataFrame(),
+            "family_summary": pd.DataFrame(),
+            "scalar_subject_results": pd.DataFrame(),
+            "scalar_winners": pd.DataFrame(),
+            "scalar_summary": pd.DataFrame(),
+            "metrics_requested": requested_metric_list,
+            "metrics_used": [],
+            "metrics_excluded": list(resolved.get("excluded_metrics") or []),
+            "metrics_invalid_for_regime": invalid_regime_metrics,
+            "metrics_discouraged_for_regime": discouraged_regime_metrics,
+            "metric_scale_audit": metric_audit_df,
+            "metric_families": {},
+            "distance_mode": str(distance_mode),
+            "graph_regime": str(graph_regime),
+        }
+
     normalized_families = normalize_metric_families(metric_list, metric_families)
     target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
-    scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
+    scales = dict(resolved.get("scales") or {})
+    # Backward compatibility: degradation module supports only these removal modes.
+    # Accept broader external labels (e.g. fraction_initial) and degrade gracefully.
+    effective_removal_mode = str(removal_mode)
+    if effective_removal_mode not in {"random", "weak_weight", "strong_weight"}:
+        effective_removal_mode = "random"
     if subject_ids is None:
         subject_ids = [f"hc_{i:04d}" for i in range(len(hc_graphs))]
     subject_ids = [str(x) for x in subject_ids]
@@ -288,6 +422,15 @@ def compare_degradation_models(
         raise ValueError("Length of subject_ids must match length of hc_graphs")
 
     meta_df = pd.DataFrame()
+    eff_sources_k = int(kwargs.get("eff_sources_k", 16))
+    compute_curvature = bool(kwargs.get("compute_curvature", False))
+    curvature_sample_edges = int(kwargs.get("curvature_sample_edges", 80))
+    noise_sigma_max = float(kwargs.get("noise_sigma_max", 0.5))
+    keep_density_from_baseline = bool(kwargs.get("keep_density_from_baseline", True))
+    recompute_modules = bool(kwargs.get("recompute_modules", False))
+    fast_mode = bool(kwargs.get("fast_mode", False))
+    subject_metadata = kwargs.get("subject_metadata", None)
+
     if isinstance(subject_metadata, pd.DataFrame) and not subject_metadata.empty:
         meta_df = subject_metadata.copy()
         if "subject_id" not in meta_df.columns:
@@ -320,8 +463,9 @@ def compare_degradation_models(
                 module_info=module_info,
                 recompute_modules=bool(recompute_modules),
                 module_resolution=float(module_resolution),
-                removal_mode=str(removal_mode),
+                removal_mode=str(effective_removal_mode),
                 fast_mode=bool(fast_mode),
+                graph_regime=str(graph_regime),
             )
             best = find_best_match_to_target(
                 traj_df,
@@ -335,6 +479,7 @@ def compare_degradation_models(
             scored["subject_idx"] = int(subj_idx)
             scored["subject_id"] = str(subject_id)
             scored["attack_kind"] = str(kind)
+            scored["attack_family"] = str((_aux or {}).get("attack_family", "unknown"))
             all_traj.append(scored)
 
             best_row = best.get("best_row", {}) or {}
@@ -347,6 +492,8 @@ def compare_degradation_models(
                 "best_delta_total_weight": float(best_row.get("delta_total_weight", best_row.get("delta_E", np.nan))),
                 "best_delta_E": float(best_row.get("delta_E", np.nan)),
                 "best_removed_edge_fraction_from_baseline": float(best_row.get("removed_edge_fraction_from_baseline", np.nan)),
+                "best_invalid_reason": str(best_row.get("invalid_reason", "") or ""),
+                "graph_regime": str(graph_regime),
             })
 
             scalar_best = find_best_scalar_match(traj_df, target_vector=target_vector, metrics=metric_list, scales=scales, absolute=True)
@@ -393,9 +540,15 @@ def compare_degradation_models(
         "scalar_subject_results": scalar_subject_df,
         "scalar_winners": scalar_winners_df,
         "scalar_summary": scalar_summary_df,
+        "metrics_requested": requested_metric_list,
         "metrics_used": metric_list,
+        "metrics_excluded": list(resolved.get("excluded_metrics") or []),
+        "metrics_invalid_for_regime": invalid_regime_metrics,
+        "metrics_discouraged_for_regime": discouraged_regime_metrics,
+        "metric_scale_audit": metric_audit_df,
         "metric_families": normalized_families,
         "distance_mode": str(distance_mode),
+        "graph_regime": str(graph_regime),
     }
 
 

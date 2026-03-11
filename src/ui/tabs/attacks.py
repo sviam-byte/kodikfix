@@ -26,6 +26,7 @@ from src.core_math import classify_phase_transition
 from src.config_loader import load_metrics_info
 from src.metrics import calculate_metrics
 from src.mix_frac_estimator import estimate_mix_frac_star
+from src.metric_registry import get_default_metrics_for_regime, describe_metrics_for_regime
 from src.degradation import run_degradation_trajectory, prepare_module_info
 from src.phenotype_matching import (
     compare_degradation_models,
@@ -138,12 +139,12 @@ MIX_FRAC_METRIC_OPTIONS = [
 
 
 DEGRADATION_METRIC_OPTIONS = [
-    "density",
-    "clustering",
-    "mod",
     "l2_lcc",
     "H_rw",
     "fragility_H",
+    "mod",
+    "density",
+    "clustering",
     "eff_w",
     "lcc_frac",
     "kappa_mean",
@@ -1376,18 +1377,18 @@ def render_phenotype_matching_tab(
         pm_metrics = st.multiselect(
             "Метрики distance",
             options=DEGRADATION_METRIC_OPTIONS,
-            default=[
-                "density",
-                "clustering",
-                "mod",
-                "l2_lcc",
-                "H_rw",
-                "fragility_H",
-                "eff_w",
-                "lcc_frac",
-            ],
+            default=get_default_metrics_for_regime("full_weighted_unsigned"),
             key="pm_metrics",
         )
+
+        regime_metric_info = describe_metrics_for_regime("full_weighted_unsigned")
+        with st.expander("Какие метрики валидны для full weighted regime"):
+            st.markdown(
+                "**Core:** " + ", ".join(regime_metric_info["core"]) + "\n\n"
+                + "**Secondary:** " + ", ".join(regime_metric_info["secondary"]) + "\n\n"
+                + "**Discouraged:** " + ", ".join(regime_metric_info["discouraged"]) + "\n\n"
+                + "**Guardrail only:** " + ", ".join(regime_metric_info["guardrail"])
+            )
 
         with st.expander("Phenotype matching advanced"):
             pm_meta_id_col = st.text_input(
@@ -1581,6 +1582,16 @@ def render_phenotype_matching_tab(
                     f"(сейчас {pm_heavy}). Это уменьшит количество тяжёлых шагов с метриками "
                     f"и ускорит run примерно на ~30%."
                 )
+
+            if preflight.get("density_estimate", 0) > 0.80:
+                dead_defaults = [m for m in ["density", "clustering", "lcc_frac"] if m in pm_metrics]
+                if dead_defaults:
+                    st.warning(
+                        "Для почти полного графа выбраны метрики, которые обычно близки к константе: "
+                        + ", ".join(dead_defaults)
+                        + ". Они будут автоматически исключены из phenotype-distance по baseline variability audit, "
+                        "но лучше убрать их сразу из UI-набора."
+                    )
 
         if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
             if not pm_attack_kinds:

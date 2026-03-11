@@ -8,7 +8,26 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .metric_registry import (
+    describe_metrics_for_regime,
+    get_default_metrics_for_regime,
+    is_metric_discouraged_for_regime,
+    is_metric_valid_for_regime,
+    split_metrics_by_regime,
+)
 from .phenotype_matching import normalize_metric_families
+
+ATTACK_FAMILY_MAP: dict[str, str] = {
+    "weight_noise": "weight",
+    "weight_noise_pure": "weight",
+    "weak_edges_by_weight": "topology",
+    "strong_edges_by_weight": "topology",
+    "random_edges": "topology",
+    "inter_module_removal": "topology",
+    "intra_module_removal": "topology",
+    "mix_default": "topology",
+    "mix_degree_preserving": "topology",
+}
 
 
 def _as_metric_list(metrics: Sequence[str] | None) -> list[str]:
@@ -47,7 +66,8 @@ def _correlated_pairs(df: pd.DataFrame, metrics: Sequence[str], threshold: float
     return out
 
 
-def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metrics_path: str | None, hc_baseline_metrics_path: str | None, metric_list: Sequence[str], metric_families: Mapping[str, Sequence[str]] | None, attack_kinds: Sequence[str], steps: int, frac: float, seed: int, distance_mode: str, module_resolution: float, recompute_modules: bool, removal_mode: str, notes: str = "") -> dict:
+def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metrics_path: str | None, hc_baseline_metrics_path: str | None, metric_list: Sequence[str], metric_families: Mapping[str, Sequence[str]] | None, attack_kinds: Sequence[str], steps: int, frac: float, seed: int, distance_mode: str, module_resolution: float, recompute_modules: bool, removal_mode: str, graph_regime: str = "full_weighted_unsigned", weight_policy: str = "", sign_policy: str = "", notes: str = "") -> dict:
+    """Build serialized run manifest with regime and attack-family metadata."""
     return {
         "run_type": str(run_type),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -57,6 +77,7 @@ def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metr
         "metric_list": [str(x) for x in metric_list],
         "metric_families": normalize_metric_families(metric_list, metric_families),
         "attack_kinds": [str(x) for x in attack_kinds],
+        "attack_families": {str(x): ATTACK_FAMILY_MAP.get(str(x), "unknown") for x in attack_kinds},
         "steps": int(steps),
         "frac": float(frac),
         "seed": int(seed),
@@ -64,11 +85,15 @@ def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metr
         "module_resolution": float(module_resolution),
         "recompute_modules": bool(recompute_modules),
         "removal_mode": str(removal_mode),
+        "graph_regime": str(graph_regime),
+        "weight_policy": str(weight_policy),
+        "sign_policy": str(sign_policy),
         "notes": str(notes or ""),
     }
 
 
-def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_metrics_df: pd.DataFrame, metrics: Sequence[str], subject_ids: Sequence[str] | None = None, subject_id_col: str = "subject_id", metric_families: Mapping[str, Sequence[str]] | None = None) -> dict:
+def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_metrics_df: pd.DataFrame, metrics: Sequence[str], subject_ids: Sequence[str] | None = None, subject_id_col: str = "subject_id", metric_families: Mapping[str, Sequence[str]] | None = None, graph_regime: str = "full_weighted_unsigned", attack_kinds: Sequence[str] | None = None) -> dict:
+    """Run consistency checks before HC->SZ phenotype matching."""
     metric_list = _as_metric_list(metrics)
     normalized_families = normalize_metric_families(metric_list, metric_families)
     common_metrics = [m for m in metric_list if m in sz_group_metrics_df.columns and m in hc_baseline_metrics_df.columns]
@@ -116,6 +141,37 @@ def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_me
     if family_counts and max(family_counts.values()) >= max(3, 2 * max(1, min(family_counts.values()))):
         warnings.append("Metric families are imbalanced; consider family_balanced distance mode.")
 
+    regime = str(graph_regime or "")
+    regime_metric_info = describe_metrics_for_regime(regime)
+    metric_split = split_metrics_by_regime(metric_list, regime)
+
+    invalid_for_regime = list(metric_split["invalid"])
+    discouraged_metrics = list(metric_split["discouraged"])
+    guardrail_metrics = list(metric_split["guardrail"])
+
+    if invalid_for_regime:
+        warnings.append(
+            "Метрики невалидны для выбранного graph_regime и будут исключены из phenotype-distance: "
+            + ", ".join(invalid_for_regime)
+        )
+
+    if discouraged_metrics:
+        warnings.append(
+            "Метрики нежелательны для выбранного graph_regime и, как правило, вырождаются или слабоинформативны: "
+            + ", ".join(discouraged_metrics)
+        )
+
+    attack_list = [str(x) for x in (attack_kinds or []) if str(x)]
+    attack_families = {k: ATTACK_FAMILY_MAP.get(k, "unknown") for k in attack_list}
+    if regime.startswith("full_weighted"):
+        topology_first = [k for k, fam in attack_families.items() if fam == "topology"]
+        weight_first = [k for k, fam in attack_families.items() if fam == "weight"]
+        if topology_first and not weight_first:
+            warnings.append(
+                "Full weighted regime selected, but only topology attacks are present. "
+                "Add weight_noise/weight_noise_pure or another weight attack before launching phenotype matching."
+            )
+
     return {
         "ok": len(fatal_errors) == 0,
         "fatal_errors": fatal_errors,
@@ -131,6 +187,15 @@ def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_me
         "metric_families": normalized_families,
         "n_sz_rows": int(len(sz_group_metrics_df)),
         "n_hc_baseline_rows": int(len(hc_baseline_metrics_df)),
+        "graph_regime": regime,
+        "attack_families": attack_families,
+        "regime_metric_info": regime_metric_info,
+        "metric_split": metric_split,
+        "invalid_for_graph_regime": invalid_for_regime,
+        "discouraged_for_graph_regime": discouraged_metrics,
+        "guardrail_metrics": guardrail_metrics,
+        "discouraged_metrics": discouraged_metrics,
+        "density_estimate": float("nan"),
     }
 
 

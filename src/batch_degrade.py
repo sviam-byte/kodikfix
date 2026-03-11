@@ -28,9 +28,9 @@ from .phenotype_matching import (
     DEFAULT_METRIC_FAMILIES,
     DEFAULT_PROFILE_METRICS,
     build_group_target_vector,
-    build_scale_vector,
     compute_profile_distance,
     normalize_metric_families,
+    resolve_metric_scales,
 )
 from .phenotype_reporting import (
     build_attack_summary,
@@ -297,22 +297,34 @@ def run_phenotype_pass(
         print("[phenotype-pass] trajectory CSV is empty, nothing to do", flush=True)
         return {}
 
-    metric_list = (
+    requested_metrics = (
         [str(metric) for metric in phenotype_metrics if str(metric)]
         if phenotype_metrics is not None
         else list(DEFAULT_PROFILE_METRICS)
     )
-    metric_list = [metric for metric in metric_list if metric in traj_df.columns]
+    requested_metrics = [metric for metric in requested_metrics if metric in traj_df.columns]
 
-    if not metric_list:
+    if not requested_metrics:
         print("[phenotype-pass] no matching metrics in trajectory CSV", flush=True)
         return {}
 
-    target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
     if isinstance(hc_baseline_metrics_df, pd.DataFrame) and not hc_baseline_metrics_df.empty:
-        scales = build_scale_vector(hc_baseline_metrics_df, metrics=metric_list)
+        resolved = resolve_metric_scales(hc_baseline_metrics_df, metrics=requested_metrics)
+        metric_list = [metric for metric in (resolved.get("kept_metrics") or []) if metric in traj_df.columns]
+        scales = {str(k): float(v) for k, v in (resolved.get("scales") or {}).items() if str(k) in metric_list}
+        metric_audit_df = resolved.get("audit_df", pd.DataFrame())
+        excluded_metrics = [str(x) for x in resolved.get("excluded_metrics", []) if str(x) in requested_metrics]
     else:
+        metric_list = list(requested_metrics)
         scales = {metric: 1.0 for metric in metric_list}
+        metric_audit_df = pd.DataFrame()
+        excluded_metrics = []
+
+    if not metric_list:
+        print("[phenotype-pass] all candidate metrics were excluded by baseline variability audit", flush=True)
+        return {}
+
+    target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
 
     normalized_families = normalize_metric_families(
         metric_list,
@@ -434,7 +446,10 @@ def run_phenotype_pass(
         "scalar_subject_results": scalar_subject_df,
         "scalar_winners": scalar_winners_df,
         "scalar_summary": scalar_summary_df,
+        "metrics_requested": requested_metrics,
         "metrics_used": metric_list,
+        "metrics_excluded": excluded_metrics,
+        "metric_scale_audit": metric_audit_df,
         "metric_families": normalized_families,
         "distance_mode": str(distance_mode),
     }
