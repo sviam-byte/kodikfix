@@ -865,7 +865,11 @@ def _research_filter_batch_graphs(
     if start_from_index > 0:
         indexed = [(i, gid, entry, key) for (i, gid, entry, key) in indexed if i >= start_from_index]
 
-    wanted = _research_safe_stem(start_from_graph_id)
+    # Важная совместимость поведения:
+    # - пустой UI-ввод "start_from_graph_id" не должен включать фильтрацию;
+    # - нормализация через _research_safe_stem применяется только к непустому значению.
+    raw_wanted = str(start_from_graph_id or "").strip()
+    wanted = _research_safe_stem(raw_wanted) if raw_wanted else ""
     hit = None
     if wanted:
         for pos, (_i, _gid, _entry, key) in enumerate(indexed):
