@@ -38,7 +38,10 @@ class SessionManager:
                 st.session_state.get("__active_graph_ui_epoch", 0)
             ) + 1
 
-        self.trim_memory()
+        # ВАЖНО:
+        # trim_memory() не вызываем автоматически на каждом rerun.
+        # Иначе research/batch UI может потерять графы прямо перед запуском.
+        self._cleanup_graph_bound_state()
 
     def _sync_core_state(self) -> None:
         """Синхронизировать рабочие структуры менеджера со Streamlit session_state."""
@@ -110,7 +113,6 @@ class SessionManager:
         self.graphs[entry.id] = entry
         self._sync_core_state()
         self._cleanup_graph_bound_state()
-        self.trim_memory()
 
     def add_graph_entry(self, entry: GraphEntry, *, make_active: bool = True) -> None:
         """Добавить граф в состояние и при необходимости сделать его активным."""
@@ -140,12 +142,21 @@ class SessionManager:
         self._sync_core_state()
         self.trim_memory()
 
-    def trim_memory(self) -> None:
+    def trim_memory(self, drop_graphs: bool = False) -> None:
         max_g = int(settings.MAX_GRAPHS_IN_MEMORY)
         max_e = int(settings.MAX_EXPS_IN_MEMORY)
 
+        # Сначала чистим тяжёлые wrapper-объекты, оставляя только активный граф.
+        if isinstance(self.wrappers, dict):
+            active = self.active_graph_id
+            for gid in list(self.wrappers.keys()):
+                if gid != active:
+                    del self.wrappers[gid]
+            st.session_state["wrappers"] = self.wrappers
+
         # max_g <= 0 трактуем как отсутствие лимита на число графов.
-        if max_g > 0 and len(self.graphs) > max_g:
+        # Графы удаляем только при явном запросе (hard trim).
+        if drop_graphs and max_g > 0 and len(self.graphs) > max_g:
             for gid in list(self.graphs.keys()):
                 if len(self.graphs) <= max_g:
                     break
