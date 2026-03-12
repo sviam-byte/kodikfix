@@ -58,6 +58,12 @@ def filter_edges(
     min_conf: float,
     min_weight: float,
 ) -> pd.DataFrame:
+    """Apply confidence/weight filtering with awareness of weight policy semantics.
+
+    For ``signed_split`` we preserve signed values in ``weight`` at this stage,
+    therefore the minimum-weight threshold is interpreted over magnitude
+    ``abs(weight)`` to avoid accidentally dropping all negative edges.
+    """
     df = df_edges.copy()
 
     if src_col not in df.columns or dst_col not in df.columns:
@@ -82,6 +88,9 @@ def filter_edges(
     df["weight"], keep = apply_weight_policy_to_series(df["weight"], pol)
     df = df[keep]
 
-    df = df[df["weight"] >= min_weight]
+    if pol.normalize_mode() == "signed_split":
+        df = df[df["weight"].abs() >= float(min_weight)]
+    else:
+        df = df[df["weight"] >= float(min_weight)]
 
     return df

@@ -52,6 +52,10 @@ from .phenotype_stats import build_stats_tables
 ALL_ATTACK_KINDS: list[str] = [
     "weak_edges_by_weight",
     "strong_edges_by_weight",
+    "weak_positive_edges",
+    "strong_negative_edges",
+    "negative_edges_only",
+    "negative_edges_by_magnitude",
     "mix_default",
     "mix_degree_preserving",
     "weight_noise",
@@ -74,6 +78,15 @@ DEFAULT_DEGRADE_METRICS: list[str] = [
     "avg_degree",
     "assortativity",
     "tau_relax",
+    "frac_negative_weight",
+    "signed_balance_weight",
+    "signed_std_weight",
+    "signed_mean_weight",
+    "signed_entropy_weight",
+    "frustration_index",
+    "signed_lambda_min",
+    "strength_pos_mean",
+    "strength_neg_mean",
 ]
 
 

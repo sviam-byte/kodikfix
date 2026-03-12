@@ -72,6 +72,13 @@ METRIC_SPECS: Dict[str, MetricSpec] = {
     "pos_mean_weight": MetricSpec("pos_mean_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Mean positive raw weight"),
     "signed_balance_weight": MetricSpec("signed_balance_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="(positive mass - negative mass) / total absolute mass"),
     "signed_entropy_weight": MetricSpec("signed_entropy_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Histogram entropy of raw signed weights"),
+    "signed_lambda_min": MetricSpec("signed_lambda_min", family="signed_spectral", depends_on_weights=True, depends_on_sign=True, note="Smallest eigenvalue of signed normalized Laplacian"),
+    "signed_lambda2": MetricSpec("signed_lambda2", family="signed_spectral", depends_on_weights=True, depends_on_sign=True, note="Second eigenvalue of signed normalized Laplacian"),
+    "frustration_index": MetricSpec("frustration_index", family="signed_spectral", depends_on_weights=True, depends_on_sign=True, note="Alias of signed_lambda_min"),
+    "strength_pos_mean": MetricSpec("strength_pos_mean", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Mean positive strength per node"),
+    "strength_neg_mean": MetricSpec("strength_neg_mean", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Mean negative(abs) strength per node"),
+    "strength_pos_std": MetricSpec("strength_pos_std", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Std of positive strength per node"),
+    "strength_neg_std": MetricSpec("strength_neg_std", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Std of negative strength per node"),
 
     # service / guardrail
     "N": MetricSpec("N", family="service", note="Node count"),
@@ -131,6 +138,8 @@ FULL_WEIGHTED_SIGNED_HYBRID_CORE = [
     "frac_negative_weight",
     "signed_balance_weight",
     "signed_std_weight",
+    "frustration_index",
+    "signed_lambda_min",
 ]
 FULL_WEIGHTED_SIGNED_HYBRID_SECONDARY = [
     "H_w",
@@ -142,6 +151,11 @@ FULL_WEIGHTED_SIGNED_HYBRID_SECONDARY = [
     "neg_abs_mean_weight",
     "pos_mean_weight",
     "signed_entropy_weight",
+    "signed_lambda2",
+    "strength_pos_mean",
+    "strength_neg_mean",
+    "strength_pos_std",
+    "strength_neg_std",
 ]
 FULL_WEIGHTED_SIGNED_HYBRID_DISCOURAGED = list(FULL_WEIGHTED_UNSIGNED_DISCOURAGED)
 FULL_WEIGHTED_SIGNED_HYBRID_GUARDRAIL = list(FULL_WEIGHTED_UNSIGNED_GUARDRAIL)

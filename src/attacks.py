@@ -240,6 +240,16 @@ def run_attack(
     return pd.DataFrame(history), {"removed_nodes": removed_log, "states": states}
 
 
+
+
+def _edge_signed_weight(d: dict) -> float:
+    """Read signed edge weight with fallback across canonical attributes."""
+    try:
+        val = float(d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0))))
+    except (TypeError, ValueError):
+        return 0.0
+    return val if np.isfinite(val) else 0.0
+
 def run_edge_attack(
     G: nx.Graph,
     kind: str,
@@ -270,7 +280,8 @@ def run_edge_attack(
         return df, {"removed_edges_order": [], "total_edges": 0, "kind": kind}
 
     H0 = as_simple_undirected(G)
-    edges = list(H0.edges(data=True))
+    all_edges = list(H0.edges(data=True))
+    edges = list(all_edges)
     kind = str(kind)
 
     # --------------------------
@@ -288,12 +299,26 @@ def run_edge_attack(
         "weak_edges_by_confidence",
         "strong_edges_by_weight",
         "strong_edges_by_confidence",
+        "weak_positive_edges",
+        "strong_negative_edges",
+        "negative_edges_only",
+        "negative_edges_by_magnitude",
     ):
-        if "confidence" in kind:
-            key = lambda e: float(e[2].get("confidence", 1.0))
+        if kind == "weak_positive_edges":
+            edges = [e for e in all_edges if _edge_signed_weight(e[2]) > 0]
+            edges.sort(key=lambda e: _edge_signed_weight(e[2]))
+        elif kind == "strong_negative_edges":
+            edges = [e for e in all_edges if _edge_signed_weight(e[2]) < 0]
+            # Ascending signed order: most negative (strongest anti-correlation) first.
+            edges.sort(key=lambda e: _edge_signed_weight(e[2]))
+        elif kind in {"negative_edges_only", "negative_edges_by_magnitude"}:
+            edges = [e for e in all_edges if _edge_signed_weight(e[2]) < 0]
+            # Remove negative edges by descending magnitude to prioritize strongest antagonistic ties.
+            edges.sort(key=lambda e: abs(_edge_signed_weight(e[2])), reverse=True)
+        elif "confidence" in kind:
+            edges.sort(key=lambda e: float(e[2].get("confidence", 1.0)), reverse=kind.startswith("strong_"))
         else:
-            key = lambda e: _safe_float(e[2].get("weight", 1.0), 1.0)
-        edges.sort(key=key, reverse=kind.startswith("strong_"))
+            edges.sort(key=lambda e: _safe_float(e[2].get("weight", 1.0), 1.0), reverse=kind.startswith("strong_"))
 
     else:
         # --------------------------
@@ -367,6 +392,36 @@ def run_edge_attack(
         edges.sort(key=lambda e: score(e[0], e[1], e[2]), reverse=True)
 
     total_e = len(edges)
+    if total_e == 0:
+        base = calculate_metrics(
+            H0,
+            eff_sources_k=int(eff_k),
+            seed=int(seed),
+            compute_curvature=bool(compute_curvature),
+            curvature_sample_edges=int(curvature_sample_edges),
+            compute_heavy=True,
+            skip_spectral=bool(fast_mode),
+            skip_clustering=False,
+            skip_assortativity=False,
+            diameter_samples=16,
+        )
+        row = {
+            "step": 0,
+            "removed_frac": 0.0,
+            "removed_k": 0,
+            "N": int(base.get("N", H0.number_of_nodes())),
+            "E": int(base.get("E", H0.number_of_edges())),
+            "lcc_frac": float(base.get("lcc_frac", np.nan)),
+            "density": float(base.get("density", np.nan)),
+            "avg_degree": float(base.get("avg_degree", np.nan)),
+            "clustering": float(base.get("clustering", np.nan)),
+            "assortativity": float(base.get("assortativity", np.nan)),
+            "eff_w": float(base.get("eff_w", np.nan)),
+            "mod": float(base.get("mod", np.nan)),
+            "l2_lcc": float(base.get("l2_lcc", np.nan)),
+        }
+        return pd.DataFrame([row]), {"removed_edges_order": [], "total_edges": 0, "kind": kind, "empty_candidates": True}
+
     remove_total = int(round(float(frac) * total_e))
     remove_total = max(0, min(remove_total, total_e))
 
@@ -419,19 +474,17 @@ def run_edge_attack(
             "step": i,
             "removed_frac": float(removed_frac),
             "removed_k": int(k),
-            "N": int(metrics.get("N", H.number_of_nodes())),
-            "E": int(metrics.get("E", H.number_of_edges())),
-            "C": int(metrics.get("C", np.nan)) if "C" in metrics else np.nan,
-            "lcc_size": int(metrics.get("lcc_size", np.nan)) if "lcc_size" in metrics else np.nan,
-            "lcc_frac": float(metrics.get("lcc_frac", np.nan)) if "lcc_frac" in metrics else np.nan,
-            "density": float(metrics.get("density", np.nan)) if "density" in metrics else np.nan,
-            "avg_degree": float(metrics.get("avg_degree", np.nan)) if "avg_degree" in metrics else np.nan,
-            "clustering": float(metrics.get("clustering", np.nan)) if "clustering" in metrics else np.nan,
-            "assortativity": float(metrics.get("assortativity", np.nan)) if "assortativity" in metrics else np.nan,
-            "eff_w": float(metrics.get("eff_w", np.nan)) if "eff_w" in metrics else np.nan,
-            "mod": float(metrics.get("mod", np.nan)) if heavy else np.nan,
-            "l2_lcc": float(metrics.get("l2_lcc", np.nan)) if heavy else np.nan,
         }
+        # Forward all metrics to avoid drift when new metrics are added.
+        for mk, mv in metrics.items():
+            try:
+                row[mk] = float(mv) if isinstance(mv, (int, float, np.integer, np.floating)) else mv
+            except (TypeError, ValueError):
+                row[mk] = mv
+        if not heavy:
+            for col in ("mod", "l2_lcc", "frustration_index", "signed_lambda_min", "signed_lambda2"):
+                if col in row:
+                    row[col] = np.nan
         rows.append(row)
         if row_cb is not None:
             row_cb(dict(row), i, len(ks) - 1)

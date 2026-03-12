@@ -53,12 +53,21 @@ DEFAULT_METRIC_FAMILIES = {
         "pos_mean_weight",
         "signed_balance_weight",
         "signed_entropy_weight",
+        "strength_pos_mean",
+        "strength_neg_mean",
+        "strength_pos_std",
+        "strength_neg_std",
         "kappa_mean",
         "kappa_frac_negative",
         "kappa_median",
         "kappa_var",
         "kappa_skew",
         "kappa_entropy",
+    ],
+    "signed_spectral": [
+        "frustration_index",
+        "signed_lambda_min",
+        "signed_lambda2",
     ],
 }
 
