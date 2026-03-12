@@ -148,17 +148,99 @@ def add_dist_attr(G: nx.Graph) -> nx.Graph:
 
 
 def _normalize_edge_weights(G: nx.Graph) -> nx.Graph:
+    """Normalize operational edge weights used by positive-weight algorithms.
+
+    The project uses a dual representation in ``signed_split`` mode:
+    ``raw_weight`` (signed) and ``weight`` (non-negative magnitude).  This
+    helper always produces a positive operational ``weight`` and keeps signed
+    fields synchronized when present.
+    """
     H = G.copy()
     for _, _, d in H.edges(data=True):
-        w_raw = d.get("weight", 1.0)
+        raw_signed = d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0)))
         try:
-            w = float(w_raw)
+            signed = float(raw_signed)
         except (TypeError, ValueError):
+            signed = 1.0
+        if not np.isfinite(signed):
+            signed = 1.0
+        w = abs(signed)
+        if w <= 0:
             w = 1.0
-        if not np.isfinite(w) or w <= 0:
-            w = 1.0
-        d["weight"] = w
+        d["weight"] = float(w)
+        if "raw_weight" in d or "weight_signed" in d:
+            sign = 1.0 if signed > 0 else (-1.0 if signed < 0 else 1.0)
+            d["sign"] = float(sign)
+            d["raw_weight"] = float(signed if signed != 0 else sign * w)
+            d["weight_signed"] = float(d["raw_weight"])
+            d["weight_abs"] = float(w)
     return H
+
+
+# -----------------------------
+# Signed Laplacian spectrum
+# -----------------------------
+def _build_signed_adjacency(G: nx.Graph) -> np.ndarray:
+    """Build a dense signed adjacency matrix from edge attributes.
+
+    Preference order is ``raw_weight`` -> ``weight_signed`` -> ``weight`` so
+    unsigned graphs degrade gracefully while signed graphs preserve sign.
+    """
+    nodes = sorted(G.nodes())
+    n = len(nodes)
+    idx = {node: i for i, node in enumerate(nodes)}
+    A = np.zeros((n, n), dtype=float)
+    for u, v, d in G.edges(data=True):
+        raw = d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0)))
+        try:
+            w = float(raw)
+        except (TypeError, ValueError):
+            w = 0.0
+        if not np.isfinite(w):
+            w = 0.0
+        i, j = idx[u], idx[v]
+        A[i, j] = w
+        A[j, i] = w
+    return A
+
+
+def signed_laplacian_spectrum(G: nx.Graph, k: int = 3) -> dict[str, float]:
+    """Compute signed normalized Laplacian summary metrics.
+
+    Definition::
+        D = diag(sum_j |A_ij|),
+        L_s = I - D^{-1/2} A D^{-1/2}.
+
+    Returns the smallest eigenvalue (`signed_lambda_min`), second smallest
+    (`signed_lambda2`), and `frustration_index` (alias of lambda_min).
+    Parameter ``k`` is accepted for API compatibility and currently ignored.
+    """
+    n = G.number_of_nodes()
+    if n < 2 or G.number_of_edges() == 0:
+        nan = float("nan")
+        return {"signed_lambda_min": nan, "signed_lambda2": nan, "frustration_index": nan}
+
+    A = _build_signed_adjacency(G)
+    d_abs = np.abs(A).sum(axis=1)
+    mask = d_abs > 1e-15
+    if int(np.sum(mask)) < 2:
+        nan = float("nan")
+        return {"signed_lambda_min": nan, "signed_lambda2": nan, "frustration_index": nan}
+
+    inv_sqrt_d = np.zeros_like(d_abs)
+    inv_sqrt_d[mask] = 1.0 / np.sqrt(d_abs[mask])
+    D_inv_sqrt = np.diag(inv_sqrt_d)
+    L_norm = np.eye(n, dtype=float) - D_inv_sqrt @ A @ D_inv_sqrt
+    L_norm = 0.5 * (L_norm + L_norm.T)
+
+    eigvals = np.sort(np.real(np.linalg.eigvalsh(L_norm)))
+    lmin = float(max(0.0, eigvals[0]))
+    l2 = float(max(0.0, eigvals[1])) if eigvals.size >= 2 else float("nan")
+    return {
+        "signed_lambda_min": lmin,
+        "signed_lambda2": l2,
+        "frustration_index": lmin,
+    }
 
 # -----------------------------
 # 1) Entropy rate of random walk

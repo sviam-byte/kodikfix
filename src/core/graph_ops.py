@@ -17,6 +17,7 @@ from ..core_math import (
     fragility_from_entropy,
     network_entropy_rate,
     ollivier_ricci_summary,
+    signed_laplacian_spectrum,
 )
 from ..profiling import timeit
 
@@ -432,6 +433,47 @@ def calculate_metrics(
 
     signed_summary = _signed_edge_summary(ws_signed)
 
+    # Signed spectral metrics (heavy/spectral passes only).
+    if is_heavy and N >= 2 and E > 0 and not skip_spectral:
+        try:
+            sl = signed_laplacian_spectrum(G, k=3)
+        except Exception:
+            nan = float("nan")
+            sl = {"signed_lambda_min": nan, "signed_lambda2": nan, "frustration_index": nan}
+    else:
+        nan = float("nan")
+        sl = {"signed_lambda_min": nan, "signed_lambda2": nan, "frustration_index": nan}
+
+    # Signed per-node strength summary.
+    if ws_signed.size > 0 and N > 0:
+        s_pos: dict = {n: 0.0 for n in G.nodes()}
+        s_neg: dict = {n: 0.0 for n in G.nodes()}
+        for u, v, d in G.edges(data=True):
+            raw = d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0)))
+            try:
+                w = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(w):
+                continue
+            if w > 0:
+                s_pos[u] = s_pos.get(u, 0.0) + w
+                s_pos[v] = s_pos.get(v, 0.0) + w
+            elif w < 0:
+                s_neg[u] = s_neg.get(u, 0.0) + abs(w)
+                s_neg[v] = s_neg.get(v, 0.0) + abs(w)
+        pos_arr = np.array(list(s_pos.values()), dtype=float)
+        neg_arr = np.array(list(s_neg.values()), dtype=float)
+        strength_pos_mean = float(np.mean(pos_arr))
+        strength_neg_mean = float(np.mean(neg_arr))
+        strength_pos_std = float(np.std(pos_arr, ddof=1)) if pos_arr.size >= 2 else 0.0
+        strength_neg_std = float(np.std(neg_arr, ddof=1)) if neg_arr.size >= 2 else 0.0
+    else:
+        strength_pos_mean = float("nan")
+        strength_neg_mean = float("nan")
+        strength_pos_std = float("nan")
+        strength_neg_std = float("nan")
+
     frag_H = float(fragility_from_entropy(H_rw)) if np.isfinite(H_rw) else float("nan")
     frag_evo = float(fragility_from_entropy(H_evo)) if np.isfinite(H_evo) else float("nan")
     frag_k = float(fragility_from_curvature(kappa_mean)) if np.isfinite(kappa_mean) else float("nan")
@@ -476,6 +518,11 @@ def calculate_metrics(
         "fragility_evo": frag_evo,
         "fragility_kappa": frag_k,
         **signed_summary,
+        **sl,
+        "strength_pos_mean": strength_pos_mean,
+        "strength_neg_mean": strength_neg_mean,
+        "strength_pos_std": strength_pos_std,
+        "strength_neg_std": strength_neg_std,
     }
 
 

@@ -18,8 +18,25 @@ _logger = logging.getLogger(__name__)
 
 WEIGHT_ATTACK_KINDS = {"weight_noise", "weight_noise_pure"}
 TOPOLOGY_ATTACK_KINDS = {
-    "weak_edges_by_weight", "strong_edges_by_weight", "random_edges",
-    "inter_module_removal", "intra_module_removal", "mix_default", "mix_degree_preserving",
+    "weak_edges_by_weight",
+    "strong_edges_by_weight",
+    "weak_positive_edges",
+    "strong_negative_edges",
+    "negative_edges_only",
+    "negative_edges_by_magnitude",
+    "random_edges",
+    "inter_module_removal",
+    "intra_module_removal",
+    "mix_default",
+    "mix_degree_preserving",
+}
+
+# Signed-aware edge attacks dispatched through run_edge_attack.
+SIGNED_EDGE_ATTACK_KINDS = {
+    "weak_positive_edges",
+    "strong_negative_edges",
+    "negative_edges_only",
+    "negative_edges_by_magnitude",
 }
 
 
@@ -172,25 +189,33 @@ def _rank_edges_with_noise(
     sigma: float,
     seed: int,
 ) -> list[tuple]:
+    """Rank edges by noisy perturbation of *signed* raw weights.
+
+    Returns tuples ``(u, v, data, noisy_abs, noisy_signed)`` sorted by
+    ``noisy_abs`` descending. The signed value is preserved for callers that
+    need to update sign-aware attributes in pure-noise mode.
+    """
     H = as_simple_undirected(G)
     rng = np.random.default_rng(int(seed))
 
-    weights = []
+    raw_weights = []
     for _, _, d in H.edges(data=True):
-        weights.append(_safe_float(d.get("weight", 1.0), 1.0))
-    ws = np.asarray(weights, dtype=float)
+        rw = d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0)))
+        raw_weights.append(_safe_float(rw, 0.0))
+    ws = np.asarray(raw_weights, dtype=float)
     scale = float(np.nanstd(ws, ddof=1)) if ws.size >= 2 else 1.0
     if (not np.isfinite(scale)) or scale <= 1e-12:
         scale = 1.0
 
     ranked = []
     for u, v, d in H.edges(data=True):
-        w = _safe_float(d.get("weight", 1.0), 1.0)
+        raw = _safe_float(d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0))), 0.0)
         eps = float(rng.normal(loc=0.0, scale=float(sigma) * scale))
-        # Keep strictly positive weights to avoid accidental zero-weight degeneracies
-        # in shortest-path and spectral routines during noisy trajectories.
-        noisy = max(1e-12, w + eps)
-        ranked.append((u, v, d, noisy))
+        noisy_signed = float(raw + eps)
+        if abs(noisy_signed) < 1e-12:
+            noisy_signed = 1e-12 if noisy_signed >= 0 else -1e-12
+        noisy_abs = abs(noisy_signed)
+        ranked.append((u, v, d, noisy_abs, noisy_signed))
 
     ranked.sort(key=lambda x: x[3], reverse=True)
     return ranked
@@ -347,16 +372,20 @@ def _run_noise_trajectory(
         ranked = _rank_edges_with_noise(H0, sigma=sigma, seed=int(seed) + i)
         H = _rebuild_graph_from_ranked_edges(H0, ranked, keep_k=keep_k)
         if keep_all_edges:
-            # In pure-noise mode we keep topology fixed and only perturb weights.
-            for u, v, _d, noisy in ranked:
-                if H.has_edge(u, v):
-                    H[u][v]["weight"] = float(noisy)
-                    raw_prev = _safe_float(H[u][v].get("raw_weight", H[u][v].get("weight_signed", noisy)), noisy)
-                    sign_prev = 1.0 if raw_prev > 0 else (-1.0 if raw_prev < 0 else 0.0)
-                    H[u][v]["weight_abs"] = float(noisy)
-                    H[u][v]["sign"] = sign_prev if sign_prev != 0 else 1.0
-                    H[u][v]["raw_weight"] = float((sign_prev if sign_prev != 0 else 1.0) * float(noisy))
-                    H[u][v]["weight_signed"] = float(H[u][v]["raw_weight"])
+            # In pure-noise mode we keep topology fixed and perturb signed weights.
+            # This allows weak edges to flip sign under noise while keeping
+            # operational ``weight`` strictly positive as |raw_weight|.
+            for u, v, _d, noisy_abs, noisy_signed in ranked:
+                if not H.has_edge(u, v):
+                    continue
+                if abs(noisy_signed) <= 1e-12:
+                    noisy_signed = 1e-12 if noisy_signed >= 0 else -1e-12
+                sign = 1.0 if noisy_signed > 0 else -1.0
+                H[u][v]["weight"] = float(noisy_abs)
+                H[u][v]["weight_abs"] = float(noisy_abs)
+                H[u][v]["sign"] = float(sign)
+                H[u][v]["raw_weight"] = float(noisy_signed)
+                H[u][v]["weight_signed"] = float(noisy_signed)
 
         heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == len(xs) - 1)
         row = _metrics_row(
@@ -615,7 +644,7 @@ def run_degradation_trajectory(
     H = as_simple_undirected(G)
     graph_audit = validate_graph_for_regime(H, graph_regime=str(graph_regime))
 
-    if kind in {"weak_edges_by_weight", "strong_edges_by_weight"}:
+    if kind in {"weak_edges_by_weight", "strong_edges_by_weight"} | SIGNED_EDGE_ATTACK_KINDS:
         df, aux = run_edge_attack(
             H,
             kind=kind,

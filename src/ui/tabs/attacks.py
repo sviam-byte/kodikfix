@@ -170,6 +170,10 @@ DEGRADATION_KIND_OPTIONS = [
     "intra_module_removal",
     "weak_edges_by_weight",
     "strong_edges_by_weight",
+    "weak_positive_edges",
+    "strong_negative_edges",
+    "negative_edges_only",
+    "negative_edges_by_magnitude",
     "mix_default",
     "mix_degree_preserving",
 ]

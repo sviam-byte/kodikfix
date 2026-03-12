@@ -1084,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_pm.add_argument("--sz-metrics", required=True, type=str, help="CSV/XLSX table with SZ group metrics")
     p_pm.add_argument("--hc-baseline-metrics", type=str, default="", help="Optional CSV/XLSX table with HC baseline metrics")
     _add_common_graph_args(p_pm)
-    p_pm.add_argument("--attack-kinds", type=str, default="weight_noise,inter_module_removal,intra_module_removal,weak_edges_by_weight,strong_edges_by_weight,mix_default,mix_degree_preserving")
+    p_pm.add_argument("--attack-kinds", type=str, default="weight_noise,inter_module_removal,intra_module_removal,weak_edges_by_weight,strong_edges_by_weight,weak_positive_edges,strong_negative_edges,negative_edges_only,negative_edges_by_magnitude,mix_default,mix_degree_preserving")
     p_pm.add_argument("--metrics", type=str, default="density,clustering,mod,l2_lcc,H_rw,fragility_H,eff_w,lcc_frac")
     p_pm.add_argument("--steps", type=int, default=12)
     p_pm.add_argument("--frac", type=float, default=0.5)
