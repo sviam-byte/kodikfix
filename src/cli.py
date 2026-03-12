@@ -16,6 +16,8 @@ from .attacks_mix import run_mix_attack
 from .batch_degrade import (
     ALL_ATTACK_KINDS,
     DEFAULT_DEGRADE_METRICS,
+    RESEARCH_ATTACK_KINDS,
+    RESEARCH_DEGRADE_METRICS,
     consolidate,
     run_batch_degrade,
     run_phenotype_pass,
@@ -924,12 +926,13 @@ def _cmd_batch_degrade(args) -> int:
         return 0
 
     attack_kinds = [x.strip() for x in str(args.attack_kinds).split(",") if x.strip()]
+    research_mode = bool(getattr(args, "research_mode", False))
     if not attack_kinds:
-        attack_kinds = list(ALL_ATTACK_KINDS)
+        attack_kinds = list(RESEARCH_ATTACK_KINDS if research_mode else ALL_ATTACK_KINDS)
 
     metrics = [x.strip() for x in str(args.metrics).split(",") if x.strip()]
     if not metrics:
-        metrics = list(DEFAULT_DEGRADE_METRICS)
+        metrics = list(RESEARCH_DEGRADE_METRICS if research_mode else DEFAULT_DEGRADE_METRICS)
 
     files = _iter_input_files(
         input_dir,
@@ -938,9 +941,14 @@ def _cmd_batch_degrade(args) -> int:
         limit=int(args.limit),
     )
     print(f"[batch-degrade] found {len(files)} graph files", flush=True)
+    if research_mode:
+        print("[batch-degrade] RESEARCH MODE: no ORC, no flux, no mix", flush=True)
     print(f"[batch-degrade] attacks: {', '.join(attack_kinds)}", flush=True)
     print(f"[batch-degrade] metrics: {', '.join(metrics)}", flush=True)
     print(f"[batch-degrade] steps={args.steps}, frac={args.frac}", flush=True)
+    timeout_val = float(getattr(args, "timeout_per_trajectory", 0) or 0)
+    if timeout_val > 0:
+        print(f"[batch-degrade] timeout per trajectory: {timeout_val:.0f}s", flush=True)
 
     sid_source = str(getattr(args, "subject_id_source", "basename"))
     if sid_source == "fullpath":
@@ -993,9 +1001,15 @@ def _cmd_batch_degrade(args) -> int:
         phenotype_metrics=phenotype_metrics,
         distance_mode=str(getattr(args, "distance_mode", "raw")),
         return_details=True,
+        timeout_per_trajectory=timeout_val,
     )
 
     print(f"[batch-degrade] raw trajectories -> {result['trajectories_csv']}", flush=True)
+    print(
+        f"[batch-degrade] ok={result.get('n_ok', 0)}, errors={result.get('n_errors', 0)}, "
+        f"cached_skips={result.get('n_skipped', 0)}",
+        flush=True,
+    )
     if result.get("phenotype"):
         print(f"[batch-degrade] phenotype results -> {out_dir / 'phenotype'}", flush=True)
     return 0
@@ -1253,6 +1267,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="raw",
         choices=["raw", "family_balanced"],
+    )
+    p_batch_d.add_argument(
+        "--research-mode",
+        action="store_true",
+        help=(
+            "Use lightweight research preset: no ORC, no flux attacks, no mix "
+            "(always skipped on dense), reduced metric set. Equivalent to "
+            "--attack-kinds=RESEARCH_ATTACK_KINDS --metrics=RESEARCH_DEGRADE_METRICS"
+        ),
+    )
+    p_batch_d.add_argument(
+        "--timeout-per-trajectory",
+        type=float,
+        default=0,
+        help=(
+            "Per-(subject × attack) timeout in seconds (0=no limit). "
+            "Timed-out trajectories are logged in errors.csv with reason=timeout"
+        ),
     )
 
     return parser
