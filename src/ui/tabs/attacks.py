@@ -145,9 +145,20 @@ DEGRADATION_METRIC_OPTIONS = [
     "H_rw",
     "fragility_H",
     "mod",
+    "signed_std_weight",
+    "frac_negative_weight",
+    "signed_balance_weight",
+    "signed_mean_weight",
+    "signed_median_weight",
+    "neg_abs_mean_weight",
+    "pos_mean_weight",
+    "signed_entropy_weight",
+    "H_w",
+    "eff_w",
+    "algebraic_connectivity",
+    "tau_relax",
     "density",
     "clustering",
-    "eff_w",
     "lcc_frac",
     "kappa_mean",
     "kappa_frac_negative",
@@ -1183,13 +1194,17 @@ def _compute_metrics_df_for_graph_ids(
                 extra = str(row.get("status", "ok"))
                 if row.get("status") == "ok":
                     extra += (
-                        f" · N={row.get('N', 'na')} "
+                        f" · name={row.get('graph_name', '')} "
+                        f"· N={row.get('N', 'na')} "
                         f"E={row.get('E', 'na')} "
                         f"density={row.get('density', np.nan):.4f} "
                         f"t={row.get('elapsed_sec', np.nan):.1f}s"
                     )
                 elif row.get("error"):
-                    extra += f" · {row.get('error', '')}"
+                    extra += (
+                        f" · name={row.get('graph_name', '')} "
+                        f"· error={row.get('error', '')}"
+                    )
                 progress_cb(idx + 1, total, str(gid), extra)
             except Exception:
                 pass
@@ -1549,18 +1564,24 @@ def render_phenotype_matching_tab(
         pm_metrics = st.multiselect(
             "Метрики distance",
             options=DEGRADATION_METRIC_OPTIONS,
-            default=get_default_metrics_for_regime("full_weighted_unsigned"),
+            default=get_default_metrics_for_regime("full_weighted_signed_hybrid"),
             key="pm_metrics",
         )
 
-        regime_metric_info = describe_metrics_for_regime("full_weighted_unsigned")
-        with st.expander("Какие метрики валидны для full weighted regime"):
+        regime_metric_info = describe_metrics_for_regime("full_weighted_signed_hybrid")
+        with st.expander("Какие метрики валидны для signed-hybrid full weighted regime"):
             st.markdown(
                 "**Core:** " + ", ".join(regime_metric_info["core"]) + "\n\n"
                 + "**Secondary:** " + ", ".join(regime_metric_info["secondary"]) + "\n\n"
                 + "**Discouraged:** " + ", ".join(regime_metric_info["discouraged"]) + "\n\n"
                 + "**Guardrail only:** " + ", ".join(regime_metric_info["guardrail"])
             )
+
+        st.info(
+            "Signed-hybrid режим: raw signed weight сохраняется для sign-aware метрик, "
+            "а operational weight=|raw_weight| используется для distance/random-walk/spectral частей. "
+            "Нулевые веса удаляются."
+        )
 
         with st.expander("Phenotype matching advanced"):
             pm_meta_id_col = st.text_input(
@@ -1596,6 +1617,31 @@ def render_phenotype_matching_tab(
             pm_sigma = st.slider("sigma_max (weight_noise)", 0.01, 2.0, 0.5, 0.01, key="pm_sigma")
             pm_keep_density = st.checkbox("Keep density from baseline", value=True, key="pm_keep_density")
             pm_recompute_modules = st.checkbox("Recompute modules each step", value=False, key="pm_recompute_modules")
+            # Явно управляем политикой обработки знака/веса в positive-weight pipeline.
+            pm_weight_policy_ui = st.selectbox(
+                "Политика обработки знака весов",
+                options=[
+                    "signed_split",
+                    "drop_nonpositive",
+                    "abs",
+                    "shift",
+                ],
+                index=0,
+                key="pm_weight_policy_ui",
+                help=(
+                    "signed_split: сохранять raw signed вес отдельно и считать операционный вес как |w|; "
+                    "drop_nonpositive: удалить отрицательные и нулевые веса; "
+                    "abs: взять модуль (не рекомендуется как дефолт); "
+                    "shift: сдвинуть веса на константу и обрезать снизу."
+                ),
+            )
+
+            pm_weight_shift_ui = st.number_input(
+                "Shift для весов (если выбран shift)",
+                value=float(st.session_state.get("pm_weight_shift_ui", 0.0)),
+                step=0.01,
+                key="pm_weight_shift_ui",
+            )
             pm_module_resolution = st.slider("Module resolution", 0.2, 3.0, 1.0, 0.1, key="pm_module_resolution")
             pm_removal_mode = st.selectbox(
                 "Removal mode",
@@ -1620,6 +1666,28 @@ def render_phenotype_matching_tab(
                 value=False,
                 key="pm_export_run_xlsx",
                 help="Полезно для отчёта, но это не потоковая операция и может тормозить на больших trajectory.",
+            )
+
+        # Подсказка по выбранной политике знака, чтобы избежать неявной интерпретации весов.
+        if str(pm_weight_policy_ui) == "signed_split":
+            st.info(
+                "Сейчас выбран режим signed_split: знак сохраняется в raw_weight/weight_signed, "
+                "а операционные расчёты используют |w|."
+            )
+        elif str(pm_weight_policy_ui) == "abs":
+            st.warning(
+                "Сейчас выбран режим abs: отрицательные связи превращаются в положительные по модулю. "
+                "Это уничтожает знак и может исказить интерпретацию functional connectivity."
+            )
+        elif str(pm_weight_policy_ui) == "drop_nonpositive":
+            st.info(
+                "Сейчас выбран режим drop_nonpositive: отрицательные связи не анализируются, "
+                "но и не превращаются искусственно в положительные."
+            )
+        elif str(pm_weight_policy_ui) == "shift":
+            st.warning(
+                "Сейчас выбран режим shift: знак не сохраняется как знак, а кодируется через общий сдвиг. "
+                "Используй только осознанно."
             )
 
         pm_meta = None
@@ -1766,6 +1834,12 @@ def render_phenotype_matching_tab(
                     )
 
         if st.button("🚀 RUN HC→SZ MATCHING", type="primary", width="stretch", key="pm_run"):
+            # Settings заморожен, поэтому для быстрого hotfix используем object.__setattr__.
+            object.__setattr__(settings, "WEIGHT_POLICY", str(pm_weight_policy_ui))
+            if str(pm_weight_policy_ui) == "shift":
+                object.__setattr__(settings, "WEIGHT_SHIFT", float(pm_weight_shift_ui))
+            else:
+                object.__setattr__(settings, "WEIGHT_SHIFT", 0.0)
             if not pm_attack_kinds:
                 st.error("Выбери хотя бы одну модель деградации.")
             elif not pm_metrics:
@@ -1863,6 +1937,9 @@ def render_phenotype_matching_tab(
                         "timeout_per_subject": float(pm_timeout_per_subject or 0),
                         "timeout_per_stage": float(pm_timeout_per_stage or 0),
                         "distance_mode": "raw",
+                        "graph_regime": "full_weighted_signed_hybrid",
+                        "weight_policy": str(pm_weight_policy_ui),
+                        "weight_shift": float(pm_weight_shift_ui),
                     },
                     metadata_upload=pm_meta_file,
                     sz_upload=pm_sz_file,
@@ -1996,6 +2073,40 @@ def render_phenotype_matching_tab(
                             f"⚠️ SZ baseline: {sz_failed} из {len(sz_group_metrics_df)} графов завершились с ошибкой/timeout. "
                             f"Target vector будет рассчитан по {int(sz_ok_mask.sum())} валидным графам."
                         )
+
+                        # Показываем расширенный audit по проблемным графам до фильтрации ok-only.
+                        sz_bad_df = sz_group_metrics_df.loc[
+                            ~sz_ok_mask,
+                            [c for c in [
+                                "graph_id",
+                                "graph_name",
+                                "graph_source",
+                                "status",
+                                "error",
+                                "elapsed_sec",
+                            ] if c in sz_group_metrics_df.columns]
+                        ].copy()
+
+                        if "elapsed_sec" in sz_bad_df.columns:
+                            sz_bad_df["elapsed_sec"] = pd.to_numeric(
+                                sz_bad_df["elapsed_sec"], errors="coerce"
+                            ).round(2)
+
+                        st.markdown("**Проблемные графы SZ baseline**")
+                        st.dataframe(sz_bad_df, use_container_width=True)
+
+                        try:
+                            for _, bad_row in sz_bad_df.iterrows():
+                                _push_ui_event(
+                                    "SZ baseline failed: "
+                                    f"gid={bad_row.get('graph_id', '')} · "
+                                    f"name={bad_row.get('graph_name', '')} · "
+                                    f"status={bad_row.get('status', '')} · "
+                                    f"error={bad_row.get('error', '')}"
+                                )
+                        except Exception:
+                            pass
+
                     sz_group_metrics_df = sz_group_metrics_df[sz_ok_mask].copy()
 
                 hc_status = hc_baseline_metrics_df.get("status")
@@ -2007,6 +2118,40 @@ def render_phenotype_matching_tab(
                             f"⚠️ HC baseline: {hc_failed} из {len(hc_baseline_metrics_df)} графов завершились с ошибкой/timeout. "
                             f"Scale-вектор будет рассчитан по {int(hc_ok_mask.sum())} валидным графам."
                         )
+
+                        # Показываем расширенный audit по проблемным графам до фильтрации ok-only.
+                        hc_bad_df = hc_baseline_metrics_df.loc[
+                            ~hc_ok_mask,
+                            [c for c in [
+                                "graph_id",
+                                "graph_name",
+                                "graph_source",
+                                "status",
+                                "error",
+                                "elapsed_sec",
+                            ] if c in hc_baseline_metrics_df.columns]
+                        ].copy()
+
+                        if "elapsed_sec" in hc_bad_df.columns:
+                            hc_bad_df["elapsed_sec"] = pd.to_numeric(
+                                hc_bad_df["elapsed_sec"], errors="coerce"
+                            ).round(2)
+
+                        st.markdown("**Проблемные графы HC baseline**")
+                        st.dataframe(hc_bad_df, use_container_width=True)
+
+                        try:
+                            for _, bad_row in hc_bad_df.iterrows():
+                                _push_ui_event(
+                                    "HC baseline failed: "
+                                    f"gid={bad_row.get('graph_id', '')} · "
+                                    f"name={bad_row.get('graph_name', '')} · "
+                                    f"status={bad_row.get('status', '')} · "
+                                    f"error={bad_row.get('error', '')}"
+                                )
+                        except Exception:
+                            pass
+
                     hc_baseline_metrics_df = hc_baseline_metrics_df[hc_ok_mask].copy()
 
                 target_vector = build_group_target_vector(sz_group_metrics_df, metrics=metric_list)
@@ -2044,6 +2189,9 @@ def render_phenotype_matching_tab(
                         "timeout_per_subject": float(pm_timeout_per_subject or 0),
                         "timeout_per_stage": float(pm_timeout_per_stage or 0),
                         "distance_mode": "raw",
+                        "graph_regime": "full_weighted_signed_hybrid",
+                        "weight_policy": str(pm_weight_policy_ui),
+                        "weight_shift": float(pm_weight_shift_ui),
                         "target_vector": target_vector,
                         "scales": scales,
                     },

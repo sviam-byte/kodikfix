@@ -42,6 +42,12 @@ def apply_weight_policy_to_series(w: pd.Series, policy: WeightPolicy) -> Tuple[p
         keep = finite & (w2.to_numpy() > 0)
         return w2, pd.Series(keep, index=w.index)
 
+    if mode == "signed_split":
+        # Keep finite non-zero raw signed weights; downstream graph build will
+        # store sign-aware attrs and operational positive magnitude separately.
+        keep = finite & (w_num.to_numpy() != 0)
+        return w_num, pd.Series(keep, index=w.index)
+
     if mode == "clip":
         w2 = w_num.copy()
         w2[~pd.Series(finite, index=w.index)] = np.nan
@@ -80,6 +86,8 @@ def apply_weight_policy_scalar(w: float, policy: WeightPolicy) -> float | None:
     if mode == "abs":
         x = abs(x)
         return x if x > 0 else None
+    if mode == "signed_split":
+        return x if x != 0 else None
     if mode == "clip":
         return max(x, eps)
     if mode == "shift":

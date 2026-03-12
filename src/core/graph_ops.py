@@ -192,6 +192,52 @@ def _shannon_entropy_from_counts(counts: np.ndarray) -> float:
     return abs(float(-np.sum(p * np.log(p))))
 
 
+def _edge_signed_weights(G: nx.Graph) -> np.ndarray:
+    vals: list[float] = []
+    for _, _, d in G.edges(data=True):
+        raw = d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0)))
+        try:
+            x = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(x):
+            vals.append(x)
+    return np.asarray(vals, dtype=float) if vals else np.array([], dtype=float)
+
+
+def _signed_edge_summary(ws_signed: np.ndarray) -> dict[str, float]:
+    if ws_signed.size == 0:
+        return {
+            "signed_mean_weight": float("nan"),
+            "signed_median_weight": float("nan"),
+            "signed_std_weight": float("nan"),
+            "frac_negative_weight": float("nan"),
+            "frac_positive_weight": float("nan"),
+            "neg_abs_mean_weight": float("nan"),
+            "pos_mean_weight": float("nan"),
+            "signed_balance_weight": float("nan"),
+            "signed_entropy_weight": float("nan"),
+        }
+    pos = ws_signed[ws_signed > 0]
+    neg = ws_signed[ws_signed < 0]
+    signed_entropy_weight = _shannon_entropy_from_values(ws_signed, bins=32) if ws_signed.size else float("nan")
+    pos_mass = float(np.sum(pos)) if pos.size else 0.0
+    neg_mass = float(np.sum(np.abs(neg))) if neg.size else 0.0
+    denom = pos_mass + neg_mass
+    signed_balance = ((pos_mass - neg_mass) / denom) if denom > 0 else float("nan")
+    return {
+        "signed_mean_weight": float(np.mean(ws_signed)),
+        "signed_median_weight": float(np.median(ws_signed)),
+        "signed_std_weight": float(np.std(ws_signed, ddof=1)) if ws_signed.size >= 2 else 0.0,
+        "frac_negative_weight": float(np.mean(ws_signed < 0)),
+        "frac_positive_weight": float(np.mean(ws_signed > 0)),
+        "neg_abs_mean_weight": float(np.mean(np.abs(neg))) if neg.size else float("nan"),
+        "pos_mean_weight": float(np.mean(pos)) if pos.size else float("nan"),
+        "signed_balance_weight": float(signed_balance),
+        "signed_entropy_weight": float(signed_entropy_weight),
+    }
+
+
 def _shannon_entropy_from_values(values, bins: int = 32) -> float:
     xs = np.asarray(values, dtype=float)
     xs = xs[np.isfinite(xs)]
@@ -296,6 +342,8 @@ def calculate_metrics(
     else:
         H_deg = float("nan")
 
+    ws_signed = _edge_signed_weights(G)
+
     if G.number_of_edges() > 0:
         ws_list: list[float] = []
         cs_list: list[float] = []
@@ -382,6 +430,8 @@ def calculate_metrics(
         kappa_skew = float("nan")
         kappa_entropy = float("nan")
 
+    signed_summary = _signed_edge_summary(ws_signed)
+
     frag_H = float(fragility_from_entropy(H_rw)) if np.isfinite(H_rw) else float("nan")
     frag_evo = float(fragility_from_entropy(H_evo)) if np.isfinite(H_evo) else float("nan")
     frag_k = float(fragility_from_curvature(kappa_mean)) if np.isfinite(kappa_mean) else float("nan")
@@ -425,6 +475,7 @@ def calculate_metrics(
         "fragility_H": frag_H,
         "fragility_evo": frag_evo,
         "fragility_kappa": frag_k,
+        **signed_summary,
     }
 
 

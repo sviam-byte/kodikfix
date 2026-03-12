@@ -36,7 +36,7 @@ def classify_attack_family(kind: str) -> str:
 def validate_graph_for_regime(G: nx.Graph, *, graph_regime: str) -> dict:
     """Audit graph compatibility with the selected processing regime."""
     H = as_simple_undirected(G)
-    weights = [float(d.get("weight", 1.0)) for _u, _v, d in H.edges(data=True)]
+    weights = [float(d.get("raw_weight", d.get("weight", 1.0))) for _u, _v, d in H.edges(data=True)]
     has_negative = any(w < 0 for w in weights)
     has_zero = any(abs(w) <= 1e-12 for w in weights)
     return {
@@ -239,6 +239,7 @@ def _metrics_row(
     )
 
     total_weight = float(sum(_safe_float(d.get("weight", 1.0), 1.0) for _u, _v, d in G.edges(data=True)))
+    total_signed_weight = float(sum(_safe_float(d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0))), 0.0) for _u, _v, d in G.edges(data=True)))
 
     row = {
         "step": int(step),
@@ -246,6 +247,7 @@ def _metrics_row(
         "N": int(m.get("N", G.number_of_nodes())),
         "E": int(m.get("E", G.number_of_edges())),
         "total_weight": total_weight,
+        "total_signed_weight": total_signed_weight,
     }
     # Preserve all metrics returned by calculate_metrics() so new fields propagate
     # automatically to trajectories (e.g. algebraic_connectivity).
@@ -255,7 +257,7 @@ def _metrics_row(
         row[k] = _safe_float(v, np.nan)
 
     if metric_names:
-        keep = {"step", "damage_frac", "N", "E", "total_weight"}.union(set(metric_names))
+        keep = {"step", "damage_frac", "N", "E", "total_weight", "total_signed_weight"}.union(set(metric_names))
         row = {k: v for k, v in row.items() if k in keep}
 
     return row
@@ -349,6 +351,12 @@ def _run_noise_trajectory(
             for u, v, _d, noisy in ranked:
                 if H.has_edge(u, v):
                     H[u][v]["weight"] = float(noisy)
+                    raw_prev = _safe_float(H[u][v].get("raw_weight", H[u][v].get("weight_signed", noisy)), noisy)
+                    sign_prev = 1.0 if raw_prev > 0 else (-1.0 if raw_prev < 0 else 0.0)
+                    H[u][v]["weight_abs"] = float(noisy)
+                    H[u][v]["sign"] = sign_prev if sign_prev != 0 else 1.0
+                    H[u][v]["raw_weight"] = float((sign_prev if sign_prev != 0 else 1.0) * float(noisy))
+                    H[u][v]["weight_signed"] = float(H[u][v]["raw_weight"])
 
         heavy = (i % int(max(1, compute_heavy_every)) == 0) or (i == len(xs) - 1)
         row = _metrics_row(

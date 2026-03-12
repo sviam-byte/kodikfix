@@ -63,7 +63,7 @@ def _correlated_pairs(df: pd.DataFrame, metrics: Sequence[str], threshold: float
     return out
 
 
-def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metrics_path: str | None, hc_baseline_metrics_path: str | None, metric_list: Sequence[str], metric_families: Mapping[str, Sequence[str]] | None, attack_kinds: Sequence[str], steps: int, frac: float, seed: int, distance_mode: str, module_resolution: float, recompute_modules: bool, removal_mode: str, graph_regime: str = "full_weighted_unsigned", weight_policy: str = "", sign_policy: str = "", notes: str = "") -> dict:
+def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metrics_path: str | None, hc_baseline_metrics_path: str | None, metric_list: Sequence[str], metric_families: Mapping[str, Sequence[str]] | None, attack_kinds: Sequence[str], steps: int, frac: float, seed: int, distance_mode: str, module_resolution: float, recompute_modules: bool, removal_mode: str, graph_regime: str = "full_weighted_signed_hybrid", weight_policy: str = "", sign_policy: str = "", notes: str = "") -> dict:
     """Build serialized run manifest with regime and attack-family metadata."""
     return {
         "run_type": str(run_type),
@@ -89,7 +89,7 @@ def build_run_manifest(*, run_type: str, hc_paths: Sequence[str] | None, sz_metr
     }
 
 
-def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_metrics_df: pd.DataFrame, metrics: Sequence[str], subject_ids: Sequence[str] | None = None, subject_id_col: str = "subject_id", metric_families: Mapping[str, Sequence[str]] | None = None, graph_regime: str = "full_weighted_unsigned", attack_kinds: Sequence[str] | None = None) -> dict:
+def run_phenotype_preflight(*, sz_group_metrics_df: pd.DataFrame, hc_baseline_metrics_df: pd.DataFrame, metrics: Sequence[str], subject_ids: Sequence[str] | None = None, subject_id_col: str = "subject_id", metric_families: Mapping[str, Sequence[str]] | None = None, graph_regime: str = "full_weighted_signed_hybrid", attack_kinds: Sequence[str] | None = None) -> dict:
     """Run consistency checks before HC->SZ phenotype matching."""
     metric_list = _as_metric_list(metrics)
     normalized_families = normalize_metric_families(metric_list, metric_families)

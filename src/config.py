@@ -49,10 +49,11 @@ class Settings:
     # - "abs": заменить w <- |w| (подходит для корреляций, но теряется знак)
     # - "clip": заменить w <- max(w, eps)
     # - "shift": сдвинуть веса на фиксированную константу (w <- w + shift, затем max(w, eps))
-    # Full weighted phenotype-matching should not silently destroy negative edges.
-    # Keep unsigned compatibility by default via |w|, but make the regime explicit.
-    GRAPH_REGIME: str = "full_weighted_unsigned"
-    WEIGHT_POLICY: str = "abs"
+    # - "signed_split": хранить raw signed weight отдельно, а operational weight = |raw_weight|; нули удалить
+    # Для phenotype matching на signed FC используем гибридный signed режим:
+    # magnitude-метрики считаются по |w|, sign-aware метрики — по raw_weight.
+    GRAPH_REGIME: str = "full_weighted_signed_hybrid"
+    WEIGHT_POLICY: str = "signed_split"
     WEIGHT_EPS: float = 1e-9
     WEIGHT_SHIFT: float = 0.0
     RICCI_CUTOFF: float = RICCI_CUTOFF
