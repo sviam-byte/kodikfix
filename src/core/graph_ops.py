@@ -24,6 +24,34 @@ from ..profiling import timeit
 GraphMetrics = dict[str, int | float | str | Any]
 
 
+# ---------------------------------------------------------------------------
+# Metric-group sets for selective computation gating.
+# ---------------------------------------------------------------------------
+_SPECTRAL_METRICS = frozenset({
+    "l2_lcc", "algebraic_connectivity", "tau_relax",
+    "lmax", "thresh", "epi_thr", "tau_lcc", "mod",
+})
+_EFFICIENCY_METRICS = frozenset({"eff_w"})
+_ENTROPY_RW_METRICS = frozenset({"H_rw", "fragility_H"})
+_ENTROPY_EVO_METRICS = frozenset({"H_evo", "fragility_evo"})
+_CURVATURE_METRICS = frozenset({
+    "kappa_mean", "kappa_median", "kappa_frac_negative",
+    "kappa_var", "kappa_skew", "kappa_entropy", "fragility_kappa",
+    "kappa_computed_edges", "kappa_skipped_edges",
+})
+_SIGNED_SPECTRAL_METRICS = frozenset({
+    "signed_lambda_min", "signed_lambda2", "frustration_index",
+})
+_SIGNED_WEIGHT_METRICS = frozenset({
+    "signed_mean_weight", "signed_median_weight", "signed_std_weight",
+    "frac_negative_weight", "frac_positive_weight",
+    "neg_abs_mean_weight", "pos_mean_weight",
+    "signed_balance_weight", "signed_entropy_weight",
+    "strength_pos_mean", "strength_neg_mean",
+    "strength_pos_std", "strength_neg_std",
+})
+
+
 def spectral_radius_weighted_adjacency(G: nx.Graph) -> float:
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         return 0.0
@@ -103,8 +131,10 @@ def approx_weighted_efficiency(
     _max_e_eff = N * (N - 1) // 2
     if _max_e_eff > 0:
         _dens_eff = float(_E_eff) / float(_max_e_eff)
-        if _dens_eff > 0.5:
-            req_k = min(req_k, 12)
+        if _dens_eff > 0.8:
+            req_k = min(req_k, 6)
+        elif _dens_eff > 0.5:
+            req_k = min(req_k, 10)
         elif _dens_eff > 0.3:
             req_k = min(req_k, 20)
 
@@ -259,6 +289,7 @@ def calculate_metrics(
     curvature_cutoff: float = settings.RICCI_CUTOFF,
     progress_cb: Callable[[float], None] | None = None,
     skip_spectral: bool = False,
+    needed_metrics: frozenset[str] | set[str] | None = None,
     **kwargs,
 ) -> GraphMetrics:
     N = G.number_of_nodes()
@@ -267,6 +298,26 @@ def calculate_metrics(
     is_heavy = kwargs.get("compute_heavy", True)
     if not is_heavy:
         compute_curvature = False
+
+    # ---- selective gating ----
+    _need_all = needed_metrics is None
+    _need = frozenset(needed_metrics) if needed_metrics is not None else frozenset()
+
+    def _want(group: frozenset) -> bool:
+        return _need_all or bool(_need & group)
+
+    want_spectral = _want(_SPECTRAL_METRICS) and not skip_spectral
+    want_efficiency = _want(_EFFICIENCY_METRICS)
+    want_H_rw = _want(_ENTROPY_RW_METRICS) and is_heavy
+    want_H_evo = _want(_ENTROPY_EVO_METRICS) and is_heavy
+    want_curvature = compute_curvature and _want(_CURVATURE_METRICS)
+    want_signed_spectral = _want(_SIGNED_SPECTRAL_METRICS) and is_heavy and not skip_spectral
+    want_signed_weight = _want(_SIGNED_WEIGHT_METRICS)
+
+    if not is_heavy:
+        want_spectral = False
+        want_efficiency = want_efficiency and (N < 300)
+        want_signed_spectral = False
 
     # Тонкая настройка «лёгких» шагов для атак/батча без поломки API.
     skip_clustering = bool(kwargs.get("skip_clustering", not is_heavy))
@@ -289,7 +340,7 @@ def calculate_metrics(
     lcc_size = len(max(nx.connected_components(H_u), key=len)) if N > 0 else 0
     lcc_frac = lcc_size / N if N > 0 else 0.0
 
-    if not skip_spectral:
+    if want_spectral:
         lmax = spectral_radius_weighted_adjacency(G)
         thresh = (1.0 / lmax) if lmax > 0 else 0.0
 
@@ -306,7 +357,7 @@ def calculate_metrics(
 
     # Efficiency — самая дорогая операция (Dijkstra).
     # Если шаг "легкий", мы вообще её не считаем (либо считаем на микро-выборке для UI)
-    if is_heavy or N < 300:
+    if want_efficiency:
         eff_w = approx_weighted_efficiency(G, sources_k=eff_sources_k, seed=seed)
     else:
         eff_w = float("nan")
@@ -382,21 +433,24 @@ def calculate_metrics(
     try:
         algebraic_connectivity = (
             float(nx.algebraic_connectivity(H_u, weight="weight"))
-            if (not skip_spectral and N > 1 and E > 0 and nx.is_connected(H_u) and N <= 400)
+            if (want_spectral and N > 1 and E > 0 and nx.is_connected(H_u) and N <= 400)
             else float("nan")
         )
     except Exception:
         algebraic_connectivity = float("nan")
 
-    # These entropy-rate metrics are expensive and are skipped on light passes.
-    if is_heavy:
+    # These entropy-rate metrics are expensive and are skipped when not needed.
+    if want_H_rw:
         H_rw = float(network_entropy_rate(G, base=math.e))
-        H_evo = float(evolutionary_entropy_demetrius(G, base=math.e))
     else:
         H_rw = float("nan")
+
+    if want_H_evo:
+        H_evo = float(evolutionary_entropy_demetrius(G, base=math.e))
+    else:
         H_evo = float("nan")
 
-    if compute_curvature and G.number_of_edges() > 0:
+    if want_curvature and G.number_of_edges() > 0:
         def _progress_cb(i: int, total: int, *_args) -> None:
             if progress_cb is None:
                 return
@@ -433,8 +487,8 @@ def calculate_metrics(
 
     signed_summary = _signed_edge_summary(ws_signed)
 
-    # Signed spectral metrics (heavy/spectral passes only).
-    if is_heavy and N >= 2 and E > 0 and not skip_spectral:
+    # Signed spectral metrics (gated by want_signed_spectral).
+    if want_signed_spectral and N >= 2 and E > 0:
         try:
             sl = signed_laplacian_spectrum(G, k=3)
         except Exception:
@@ -445,7 +499,7 @@ def calculate_metrics(
         sl = {"signed_lambda_min": nan, "signed_lambda2": nan, "frustration_index": nan}
 
     # Signed per-node strength summary.
-    if ws_signed.size > 0 and N > 0:
+    if want_signed_weight and ws_signed.size > 0 and N > 0:
         s_pos: dict = {n: 0.0 for n in G.nodes()}
         s_neg: dict = {n: 0.0 for n in G.nodes()}
         for u, v, d in G.edges(data=True):

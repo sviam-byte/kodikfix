@@ -250,6 +250,7 @@ def _metrics_row(
     metric_names: Sequence[str] | None = None,
 ) -> dict:
     skip_light = not bool(heavy)
+    _needed = frozenset(metric_names) if metric_names else None
     m = calculate_metrics(
         G,
         eff_sources_k=int(eff_sources_k),
@@ -261,6 +262,7 @@ def _metrics_row(
         skip_clustering=skip_light,
         skip_assortativity=skip_light,
         diameter_samples=16 if heavy else 6,
+        needed_metrics=_needed,
     )
 
     total_weight = float(sum(_safe_float(d.get("weight", 1.0), 1.0) for _u, _v, d in G.edges(data=True)))
@@ -672,6 +674,7 @@ def run_degradation_trajectory(
             compute_curvature=bool(compute_curvature),
             curvature_sample_edges=int(curvature_sample_edges),
             fast_mode=bool(fast_mode),
+            metric_names=metric_names,
             progress_cb=progress_cb,
             row_cb=row_cb,
         )
