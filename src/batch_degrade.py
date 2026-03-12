@@ -13,7 +13,6 @@ The implementation is incremental and resumable by design.
 from __future__ import annotations
 
 import json
-import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +63,18 @@ ALL_ATTACK_KINDS: list[str] = [
     "random_edges",
 ]
 
+# Lightweight preset for research baseline builds: no flux/ORC-dependent attacks,
+# no mix (always skipped on dense connectomes anyway).
+RESEARCH_ATTACK_KINDS: list[str] = [
+    "weak_edges_by_weight",
+    "strong_edges_by_weight",
+    "weak_positive_edges",
+    "strong_negative_edges",
+    "negative_edges_by_magnitude",
+    "weight_noise",
+    "random_edges",
+]
+
 # Compact default metric set for degradation trajectories (without curvature).
 DEFAULT_DEGRADE_METRICS: list[str] = [
     "density",
@@ -83,6 +94,27 @@ DEFAULT_DEGRADE_METRICS: list[str] = [
     "signed_std_weight",
     "signed_mean_weight",
     "signed_entropy_weight",
+    "frustration_index",
+    "signed_lambda_min",
+    "strength_pos_mean",
+    "strength_neg_mean",
+]
+
+# Research preset: skip H_evo/fragility_evo/kappa/ORC (expensive) for fast baseline.
+RESEARCH_DEGRADE_METRICS: list[str] = [
+    "density",
+    "mod",
+    "l2_lcc",
+    "H_rw",
+    "fragility_H",
+    "eff_w",
+    "lcc_frac",
+    "algebraic_connectivity",
+    "tau_relax",
+    "frac_negative_weight",
+    "signed_balance_weight",
+    "signed_std_weight",
+    "signed_mean_weight",
     "frustration_index",
     "signed_lambda_min",
     "strength_pos_mean",
@@ -138,12 +170,19 @@ def run_batch_degrade(
     metric_families: Mapping[str, Sequence[str]] | None = None,
     progress_cb: Callable[[int, int, str], None] | None = None,
     return_details: bool = False,
+    timeout_per_trajectory: float = 0.0,
 ) -> Path | dict[str, object]:
     """Run degradation batch and optionally execute phenotype pass.
 
     By default returns ``Path`` to ``trajectories_all.csv`` for backward
     compatibility. Set ``return_details=True`` to get a rich result dictionary.
+
+    ``timeout_per_trajectory`` (seconds): if >0, each (subject × attack) job
+    is interrupted after this timeout and logged to ``errors.csv``.
     """
+    import signal
+    import time as _time
+
     out_path = Path(out_dir)
     per_item_dir = out_path / "per_item"
     per_item_dir.mkdir(parents=True, exist_ok=True)
@@ -161,8 +200,11 @@ def run_batch_degrade(
     total_jobs = max(0, n_graphs - int(start_from)) * n_attacks
     done_jobs = 0
     skipped_jobs = 0
+    ok_jobs = 0
     errors: list[dict[str, str]] = []
-    started_at = time.monotonic()
+    skips: list[dict[str, str]] = []
+    started_at = _time.monotonic()
+    timeout_sec = float(timeout_per_trajectory or 0.0)
 
     needs_modules = any(kind in {"inter_module_removal", "intra_module_removal"} for kind in attacks)
 
@@ -176,6 +218,7 @@ def run_batch_degrade(
         "frac": float(frac),
         "seed": int(seed),
         "skip_existing": bool(skip_existing),
+        "timeout_per_trajectory": float(timeout_sec),
         "has_phenotype_pass": isinstance(sz_group_metrics_df, pd.DataFrame)
         and not sz_group_metrics_df.empty,
     }
@@ -183,6 +226,9 @@ def run_batch_degrade(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    def _log(msg: str) -> None:
+        print(msg, flush=True)
 
     for subj_idx in range(int(start_from), n_graphs):
         subject_id = str(subject_ids[subj_idx])
@@ -202,18 +248,39 @@ def run_batch_degrade(
             if skip_existing and _already_done(per_item_dir, subject_id, attack_kind):
                 skipped_jobs += 1
                 done_jobs += 1
+                reason = "already_computed"
+                skips.append(
+                    {
+                        "subject_id": subject_id,
+                        "attack_kind": attack_kind,
+                        "reason": reason,
+                        "detail": str(per_item_dir / _item_csv_name(subject_id, attack_kind)),
+                    }
+                )
                 if progress_cb is not None:
-                    progress_cb(done_jobs, total_jobs, f"SKIP {label}")
+                    progress_cb(done_jobs, total_jobs, f"SKIP {label} ({reason})")
                 else:
-                    print(f"  SKIP {label}", flush=True)
+                    _log(f"  SKIP {label}  reason={reason}")
                 continue
 
             if progress_cb is not None:
                 progress_cb(done_jobs, total_jobs, label)
             else:
-                print(f"  RUN  {label}", flush=True)
+                _log(f"  RUN  {label}")
 
+            t0 = _time.monotonic()
+            old_handler = None
             try:
+                # Optional per-trajectory timeout via SIGALRM (Unix only).
+                if timeout_sec > 0 and hasattr(signal, "SIGALRM"):
+
+                    def _alarm_handler(signum, frame):
+                        del signum, frame
+                        raise TimeoutError(f"trajectory timeout > {timeout_sec:.0f}s")
+
+                    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+                    signal.alarm(int(timeout_sec))
+
                 traj_df, _aux = run_degradation_trajectory(
                     graph,
                     kind=attack_kind,
@@ -234,6 +301,23 @@ def run_batch_degrade(
                     fast_mode=bool(fast_mode),
                 )
 
+                if timeout_sec > 0 and hasattr(signal, "SIGALRM"):
+                    signal.alarm(0)
+                    if old_handler is not None:
+                        signal.signal(signal.SIGALRM, old_handler)
+
+                elapsed = _time.monotonic() - t0
+
+                # Detect density_too_high / engine-side skips propagated via aux.
+                was_skipped = bool(_aux.get("skipped", False)) if isinstance(_aux, dict) else False
+                skip_reason = str(_aux.get("skipped_reason", "")) if isinstance(_aux, dict) else ""
+                if not skip_reason and was_skipped:
+                    skip_reason = "skipped_by_engine"
+                if "skipped_reason" in traj_df.columns and not skip_reason:
+                    sr_vals = traj_df["skipped_reason"].dropna().unique()
+                    if len(sr_vals) > 0:
+                        skip_reason = str(sr_vals[0])
+
                 traj_df["attack_kind"] = attack_kind
                 traj_df["subject_idx"] = int(subj_idx)
                 traj_df["subject_id"] = subject_id
@@ -244,36 +328,105 @@ def run_batch_degrade(
 
                 csv_path = per_item_dir / _item_csv_name(subject_id, attack_kind)
                 traj_df.to_csv(csv_path, index=False)
+                ok_jobs += 1
+
+                if was_skipped:
+                    skips.append(
+                        {
+                            "subject_id": subject_id,
+                            "attack_kind": attack_kind,
+                            "reason": skip_reason,
+                            "detail": (
+                                f"density={_aux.get('density', '?')}"
+                                if isinstance(_aux, dict) and "density" in str(skip_reason)
+                                else ""
+                            ),
+                        }
+                    )
+                    _log(f"  DONE {label}  {elapsed:.1f}s  ⚠ SKIPPED: {skip_reason}")
+                else:
+                    _log(f"  DONE {label}  {elapsed:.1f}s  steps={len(traj_df)}")
+
+            except TimeoutError as exc:
+                if timeout_sec > 0 and hasattr(signal, "SIGALRM"):
+                    signal.alarm(0)
+                    if old_handler is not None:
+                        signal.signal(signal.SIGALRM, old_handler)
+                elapsed = _time.monotonic() - t0
+                message = f"TimeoutError: {exc}"
+                errors.append(
+                    {
+                        "subject_id": subject_id,
+                        "attack_kind": attack_kind,
+                        "error": message,
+                        "reason": "timeout",
+                        "elapsed_sec": f"{elapsed:.1f}",
+                    }
+                )
+                _log(f"  TIMEOUT {label}  {elapsed:.1f}s :: {message}")
 
             except Exception as exc:  # noqa: BLE001
+                if timeout_sec > 0 and hasattr(signal, "SIGALRM"):
+                    try:
+                        signal.alarm(0)
+                        if old_handler is not None:
+                            signal.signal(signal.SIGALRM, old_handler)
+                    except Exception:
+                        pass
+                elapsed = _time.monotonic() - t0
                 message = f"{type(exc).__name__}: {exc}"
                 errors.append(
                     {
                         "subject_id": subject_id,
                         "attack_kind": attack_kind,
                         "error": message,
+                        "reason": "exception",
+                        "elapsed_sec": f"{elapsed:.1f}",
                     }
                 )
-                print(f"  ERROR {label} :: {message}", flush=True)
+                _log(f"  ERROR {label}  {elapsed:.1f}s :: {message}")
 
             done_jobs += 1
 
-    elapsed = time.monotonic() - started_at
-    print(
-        f"\n[batch-degrade] done: {done_jobs} jobs, "
-        f"{skipped_jobs} skipped, {len(errors)} errors, "
-        f"{elapsed:.1f}s elapsed",
-        flush=True,
-    )
+    total_elapsed = _time.monotonic() - started_at
+
+    # ---- summary log ----
+    _log(f"\n{'=' * 60}")
+    _log("[batch-degrade] SUMMARY")
+    _log(f"  total jobs:    {done_jobs}")
+    _log(f"  ok:            {ok_jobs}")
+    _log(f"  skip (cached): {skipped_jobs}")
+    _log(f"  errors:        {len(errors)}")
+    _log(f"  elapsed:       {total_elapsed:.1f}s")
+
+    if skips:
+        _log(f"\n  --- skipped trajectories ({len(skips)}) ---")
+        for item in skips:
+            _log(
+                f"    {item['subject_id']} × {item['attack_kind']}  reason={item['reason']}"
+                + (f"  {item['detail']}" if item.get("detail") else "")
+            )
+
+    if errors:
+        _log(f"\n  --- errors ({len(errors)}) ---")
+        for item in errors:
+            _log(
+                f"    {item['subject_id']} × {item['attack_kind']}  "
+                f"reason={item.get('reason', '?')}  t={item.get('elapsed_sec', '?')}s  {item['error']}"
+            )
+
+    _log(f"{'=' * 60}\n")
 
     if errors:
         pd.DataFrame(errors).to_csv(out_path / "errors.csv", index=False)
+    if skips:
+        pd.DataFrame(skips).to_csv(out_path / "skips.csv", index=False)
 
     trajectories_csv = _consolidate_per_item_dir(per_item_dir, out_path)
 
     phenotype_result: dict[str, object] | None = None
     if isinstance(sz_group_metrics_df, pd.DataFrame) and not sz_group_metrics_df.empty:
-        print("[batch-degrade] running phenotype pass ...", flush=True)
+        _log("[batch-degrade] running phenotype pass ...")
         phenotype_result = run_phenotype_pass(
             trajectories_csv=trajectories_csv,
             sz_group_metrics_df=sz_group_metrics_df,
@@ -288,8 +441,12 @@ def run_batch_degrade(
         "trajectories_csv": trajectories_csv,
         "phenotype": phenotype_result,
         "errors": errors,
+        "skips": skips,
         "n_done": done_jobs,
+        "n_ok": ok_jobs,
         "n_skipped": skipped_jobs,
+        "n_errors": len(errors),
+        "elapsed_sec": total_elapsed,
     }
     return result if return_details else trajectories_csv
 

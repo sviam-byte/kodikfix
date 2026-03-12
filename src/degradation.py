@@ -289,6 +289,12 @@ def _metrics_row(
 
 
 def _forward_fill_heavy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Forward-fill sparse heavy metrics so light steps stay numerically stable.
+
+    Some metrics are computed only on heavy passes (``compute_heavy_every``),
+    therefore light passes produce ``NaN`` for these columns. Forward-filling
+    prevents stepwise spikes in downstream phenotype distance calculations.
+    """
     out = df.copy()
     # Heavy-only metrics are absent on light steps by design, so we forward-fill
     # from the most recent heavy step to keep trajectory rows comparable.
@@ -306,6 +312,7 @@ def _forward_fill_heavy_columns(df: pd.DataFrame) -> pd.DataFrame:
         "kappa_frac_negative",
         "algebraic_connectivity",
         "tau_relax",
+        # signed spectral metrics are also available only on heavy passes
         "frustration_index",
         "signed_lambda_min",
         "signed_lambda2",
