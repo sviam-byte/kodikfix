@@ -1813,12 +1813,21 @@ def _render_research_tab(
     if run_active or run_all:
         # Защита от рассинхрона: после rerun/trim_memory/drop_graph набор id
         # может устареть, поэтому валидируем его прямо перед запуском.
+        before_ids = list(ctx.graphs.keys()) if isinstance(ctx.graphs, dict) else []
         graph_ids = [gid for gid in graph_ids if gid in ctx.graphs]
+
         if not graph_ids:
             st.error(
                 "В workspace нет доступных графов для расчёта. "
-                "Возможно, список устарел после удаления графов или trim_memory()."
+                "Скорее всего, графы были удалены из session_state "
+                "после trim_memory(), reset, rerun или переимпорта."
             )
+            st.caption(
+                f"Сейчас в ctx.graphs: {len(before_ids)} графов. "
+                f"active_graph_id={ctx.active_graph_id!r}"
+            )
+            if before_ids:
+                st.caption("Первые graph_id: " + ", ".join(before_ids[:8]))
             return
         frames, extras, run_dir = _run_research_workspace_plan(
             graph_ids,
@@ -2326,7 +2335,8 @@ with st.sidebar:
     with c2:
         if st.button("🧨 Trim memory", help="Обрезает лишние графы/экспы (чтобы вкладка не съедала 4ГБ)"):
             try:
-                ctx.trim_memory()
+                # Мягкая очистка: не удаляет графы без явного hard-trim запроса.
+                ctx.trim_memory(drop_graphs=False)
             except Exception:
                 pass
             st.rerun()
