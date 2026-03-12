@@ -65,6 +65,12 @@ from src.energy_export import (
 )
 from src.robustness import attack_trajectory_summary, graph_resistance_summary
 from src.cli import _attack_payload_from_graph, _metrics_payload_from_graph
+from src.timeout_worker import (
+    run_with_timeout as _run_with_timeout_safe,
+    build_graph_safe,
+    compute_metrics_from_graph_safe,
+    graph_resistance_from_graph_safe,
+)
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.mat_packed import bundle_to_edge_frames
@@ -1193,14 +1199,55 @@ def _run_research_workspace_plan(
                         f"{elapsed:.0f}s > {graph_timeout_sec}s limit"
                     )
 
-            graph = cached_build_graph(
-                entry.edges,
-                entry.src_col,
-                entry.dst_col,
-                min_conf,
-                min_weight,
-                analysis_mode,
-            )
+            def _remaining_timeout(label: str = "") -> float:
+                """Return remaining per-graph timeout budget for hard-timeout stages."""
+                if graph_timeout_sec <= 0:
+                    return 0.0
+                elapsed = time.monotonic() - _t_graph_start
+                remaining = float(graph_timeout_sec) - float(elapsed)
+                if remaining <= 0:
+                    raise _GraphTimeoutError(
+                        f"[{idx}/{total}] {entry.name}: {label} — "
+                        f"{elapsed:.0f}s > {graph_timeout_sec}s limit"
+                    )
+                return max(0.1, float(remaining))
+
+            def _run_hard_timeout_stage(stage_label: str, fn, *args, **kwargs):
+                """Run one research stage with hard timeout and normalize timeout errors."""
+                try:
+                    return _run_with_timeout_safe(
+                        fn,
+                        *args,
+                        timeout_seconds=_remaining_timeout(stage_label),
+                        **kwargs,
+                    )
+                except TimeoutError as exc:
+                    elapsed = time.monotonic() - _t_graph_start
+                    raise _GraphTimeoutError(
+                        f"[{idx}/{total}] {entry.name}: {stage_label} — "
+                        f"hard timeout after {elapsed:.0f}s (limit {graph_timeout_sec}s)"
+                    ) from exc
+
+            if graph_timeout_sec > 0:
+                graph = _run_hard_timeout_stage(
+                    "build_graph",
+                    build_graph_safe,
+                    entry.edges,
+                    entry.src_col,
+                    entry.dst_col,
+                    float(min_conf),
+                    float(min_weight),
+                    str(analysis_mode),
+                )
+            else:
+                graph = cached_build_graph(
+                    entry.edges,
+                    entry.src_col,
+                    entry.dst_col,
+                    min_conf,
+                    min_weight,
+                    analysis_mode,
+                )
 
             if any(flags.get(k, False) for k in ["basic", "efficiency", "spectral", "clustering", "assortativity", "entropy", "curvature"]):
                 args_metrics = build_ui_args(
@@ -1214,8 +1261,32 @@ def _run_research_workspace_plan(
                     diameter_samples=16,
                     n_jobs=1,
                 )
-                payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
-                row = payload_to_flat_row(payload)
+                if graph_timeout_sec > 0:
+                    row = _run_hard_timeout_stage(
+                        "metrics+curvature",
+                        compute_metrics_from_graph_safe,
+                        graph,
+                        eff_k=int(eff_k),
+                        seed=int(seed_val),
+                        compute_curvature=bool(flags.get("curvature", False)),
+                        curvature_sample_edges=int(curv_n),
+                        curvature_max_support=int(curv_max_support),
+                        compute_heavy=bool(
+                            flags.get("efficiency", False)
+                            or flags.get("entropy", False)
+                            or flags.get("clustering", False)
+                            or flags.get("assortativity", False)
+                            or flags.get("spectral", False)
+                        ),
+                        skip_spectral=not bool(flags.get("spectral", False)),
+                        skip_clustering=not bool(flags.get("clustering", False)),
+                        skip_assortativity=not bool(flags.get("assortativity", False)),
+                        diameter_samples=16,
+                        graph_name=str(entry.name),
+                    )
+                else:
+                    payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
+                    row = payload_to_flat_row(payload)
                 row.update({
                     "graph_id": entry.id,
                     "graph_name": entry.name,
@@ -1243,7 +1314,14 @@ def _run_research_workspace_plan(
                 _check_timeout("after metrics+curvature")
 
             if flags.get("resistance", False):
-                row = graph_resistance_summary(graph)
+                if graph_timeout_sec > 0:
+                    row = _run_hard_timeout_stage(
+                        "resistance",
+                        graph_resistance_from_graph_safe,
+                        graph,
+                    )
+                else:
+                    row = graph_resistance_summary(graph)
                 row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
                 if keep_compact_results_in_memory:
                     results["research_resistance"].append(row)

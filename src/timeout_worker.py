@@ -5,7 +5,8 @@ On Windows, multiprocessing uses ``spawn`` so the child process re-imports this 
 Any direct or transitive ``streamlit`` import here can crash child processes.
 
 This module contains:
-1. Pure computation functions (``build_graph_safe``, ``compute_metrics_safe``)
+1. Pure computation functions (``build_graph_safe``, ``compute_metrics_safe``,
+   ``compute_metrics_from_graph_safe``, ``graph_resistance_from_graph_safe``)
 2. The subprocess worker (``_mp_worker``) that the child process actually runs
 3. The timeout runner (``run_with_timeout``) that the parent process calls
 """
@@ -22,6 +23,7 @@ import pandas as pd
 
 # Streamlit-free imports only (safe for multiprocessing "spawn")
 from src.metrics import calculate_metrics
+from src.robustness import graph_resistance_summary
 from src.services.graph_service import GraphService
 
 _SENTINEL = object()
@@ -89,6 +91,48 @@ def compute_metrics_safe(
     )
     row: dict[str, Any] = {"graph_name": str(graph_name), "status": "ok"}
     row.update(metrics)
+    return row
+
+
+def compute_metrics_from_graph_safe(
+    graph: nx.Graph,
+    *,
+    eff_k: int,
+    seed: int,
+    compute_curvature: bool,
+    curvature_sample_edges: int,
+    curvature_max_support: int,
+    compute_heavy: bool,
+    skip_spectral: bool,
+    skip_clustering: bool,
+    skip_assortativity: bool,
+    diameter_samples: int,
+    graph_name: str = "",
+) -> dict:
+    """Compute metrics for an already-built graph in a subprocess-safe way."""
+    metrics = calculate_metrics(
+        graph,
+        int(eff_k),
+        int(seed),
+        bool(compute_curvature),
+        curvature_sample_edges=int(curvature_sample_edges),
+        curvature_max_support=int(curvature_max_support),
+        compute_heavy=bool(compute_heavy),
+        skip_spectral=bool(skip_spectral),
+        skip_clustering=bool(skip_clustering),
+        skip_assortativity=bool(skip_assortativity),
+        diameter_samples=int(diameter_samples),
+        ricci_n_jobs=1,
+    )
+    row: dict[str, Any] = {"graph_name": str(graph_name), "status": "ok"}
+    row.update(metrics)
+    return row
+
+
+def graph_resistance_from_graph_safe(graph: nx.Graph) -> dict:
+    """Compute resistance/robustness summary in a subprocess-safe way."""
+    row = graph_resistance_summary(graph)
+    row["status"] = "ok"
     return row
 
 
