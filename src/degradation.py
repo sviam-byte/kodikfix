@@ -290,6 +290,8 @@ def _metrics_row(
 
 def _forward_fill_heavy_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    # Heavy-only metrics are absent on light steps by design, so we forward-fill
+    # from the most recent heavy step to keep trajectory rows comparable.
     heavy_cols = [
         "clustering",
         "assortativity",
@@ -298,8 +300,15 @@ def _forward_fill_heavy_columns(df: pd.DataFrame) -> pd.DataFrame:
         "l2_lcc",
         "H_rw",
         "fragility_H",
+        "H_evo",
+        "fragility_evo",
         "kappa_mean",
         "kappa_frac_negative",
+        "algebraic_connectivity",
+        "tau_relax",
+        "frustration_index",
+        "signed_lambda_min",
+        "signed_lambda2",
     ]
     for col in heavy_cols:
         if col in out.columns:
