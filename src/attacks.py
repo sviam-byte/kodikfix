@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 from typing import Optional
 
 import networkx as nx
@@ -261,6 +262,7 @@ def run_edge_attack(
     compute_curvature: bool = False,
     curvature_sample_edges: int = 80,
     fast_mode: bool = False,
+    metric_names: Sequence[str] | None = None,
     progress_cb=None,
     row_cb=None,
 ):
@@ -392,6 +394,7 @@ def run_edge_attack(
         edges.sort(key=lambda e: score(e[0], e[1], e[2]), reverse=True)
 
     total_e = len(edges)
+    _needed = frozenset(metric_names) if metric_names else None
     if total_e == 0:
         base = calculate_metrics(
             H0,
@@ -404,6 +407,7 @@ def run_edge_attack(
             skip_clustering=False,
             skip_assortativity=False,
             diameter_samples=16,
+            needed_metrics=_needed,
         )
         row = {
             "step": 0,
@@ -468,6 +472,7 @@ def run_edge_attack(
             skip_clustering=is_light_step,
             skip_assortativity=is_light_step,
             diameter_samples=16 if heavy else 6,
+            needed_metrics=_needed,
         )
 
         row = {

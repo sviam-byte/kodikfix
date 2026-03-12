@@ -39,6 +39,12 @@ def as_simple_undirected(G: nx.Graph) -> nx.Graph:
             simple.add_edge(u, v, **attrs)
         return simple
 
+    # Если граф уже простой неориентированный nx.Graph,
+    # возвращаем его без копирования.
+    # Это существенно снижает накладные расходы на плотных графах.
+    if type(H) is nx.Graph:
+        return H
+
     return nx.Graph(H)
 
 

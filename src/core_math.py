@@ -137,6 +137,11 @@ def classify_phase_transition(
 # Robust geometry / curvature
 # -----------------------------
 def add_dist_attr(G: nx.Graph) -> nx.Graph:
+    """Add ``dist = 1/weight`` to edges. Reuse G if dist already present."""
+    if G.number_of_edges() > 0:
+        first_d = next(iter(G.edges(data=True)))[2]
+        if "dist" in first_d:
+            return G
 
     H = G.copy()
     for _, _, d in H.edges(data=True):
@@ -183,24 +188,34 @@ def _normalize_edge_weights(G: nx.Graph) -> nx.Graph:
 def _build_signed_adjacency(G: nx.Graph) -> np.ndarray:
     """Build a dense signed adjacency matrix from edge attributes.
 
-    Preference order is ``raw_weight`` -> ``weight_signed`` -> ``weight`` so
-    unsigned graphs degrade gracefully while signed graphs preserve sign.
+    Uses ``nx.adjacency_matrix`` (C-level sparse builder) when possible,
+    falling back to a Python loop for mixed-attribute graphs.
     """
     nodes = sorted(G.nodes())
     n = len(nodes)
-    idx = {node: i for i, node in enumerate(nodes)}
-    A = np.zeros((n, n), dtype=float)
-    for u, v, d in G.edges(data=True):
-        raw = d.get("raw_weight", d.get("weight_signed", d.get("weight", 1.0)))
-        try:
-            w = float(raw)
-        except (TypeError, ValueError):
-            w = 0.0
-        if not np.isfinite(w):
-            w = 0.0
-        i, j = idx[u], idx[v]
-        A[i, j] = w
-        A[j, i] = w
+    if n == 0:
+        return np.zeros((0, 0), dtype=float)
+
+    sample_d = next(iter(G.edges(data=True)))[2] if G.number_of_edges() > 0 else {}
+    attr = "raw_weight" if "raw_weight" in sample_d else ("weight_signed" if "weight_signed" in sample_d else "weight")
+
+    try:
+        A = nx.adjacency_matrix(G, weight=attr, nodelist=nodes).toarray().astype(float)
+        A = np.where(np.isfinite(A), A, 0.0)
+    except Exception:
+        idx = {node: i for i, node in enumerate(nodes)}
+        A = np.zeros((n, n), dtype=float)
+        for u, v, d in G.edges(data=True):
+            raw = d.get(attr, d.get("weight", 1.0))
+            try:
+                w = float(raw)
+            except (TypeError, ValueError):
+                w = 0.0
+            if not np.isfinite(w):
+                w = 0.0
+            i, j = idx[u], idx[v]
+            A[i, j] = w
+            A[j, i] = w
     return A
 
 
@@ -584,12 +599,13 @@ def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
     Implementation notes:
     - Works with non-negative edge weights. Non-finite / non-positive weights are sanitized to 1.0.
     - Entropy is computed in O(nnz) time without materializing a dense P matrix.
+    - For undirected (symmetric) A = A^T, left PF eigenvector equals right PF eigenvector.
     """
     H = _normalize_edge_weights(as_simple_undirected(G))
     if H.number_of_nodes() < 2 or H.number_of_edges() == 0:
         return float("nan")
 
-    A = nx.adjacency_matrix(H.to_directed(), weight="weight").astype(float).tocsr()
+    A = nx.adjacency_matrix(H, weight="weight").astype(float).tocsr()
     if A.nnz == 0:
         return float("nan")
     if A.data.size:
@@ -597,18 +613,18 @@ def evolutionary_entropy_demetrius(G: nx.Graph, base: float = math.e) -> float:
 
     n = int(A.shape[0])
 
-    # Right PF eigenpair (A u = lam u) and left PF eigenvector (A^T v = lam v).
+    # For undirected graphs A is symmetric, so left/right PF eigenvectors are equal.
+    # Use eigh for dense case to avoid two separate eigendecompositions.
     if n <= 600:
         Ad = A.toarray()
-        vals_r, vecs_r = np.linalg.eig(Ad)
-        idx_r = int(np.argmax(np.real(vals_r)))
-        lam = float(np.real(vals_r[idx_r]))
-        u = np.real(vecs_r[:, idx_r])
-        vals_l, vecs_l = np.linalg.eig(Ad.T)
-        idx_l = int(np.argmax(np.real(vals_l)))
-        v = np.real(vecs_l[:, idx_l])
+        vals_r, vecs_r = np.linalg.eigh(Ad)
+        idx_r = int(np.argmax(vals_r))
+        lam = float(vals_r[idx_r])
+        u = vecs_r[:, idx_r]
+        v = u
     else:
         lam, u, v = _pf_eigs_sparse(A)
+        v = u
 
     if not np.isfinite(lam) or lam <= 0:
         return float("nan")
