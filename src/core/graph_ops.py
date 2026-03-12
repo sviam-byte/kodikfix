@@ -292,6 +292,16 @@ def calculate_metrics(
     needed_metrics: frozenset[str] | set[str] | None = None,
     **kwargs,
 ) -> GraphMetrics:
+    """Compute graph metrics with optional selective gating.
+
+    Parameters
+    ----------
+    needed_metrics:
+        Optional set of metric names requested by the caller. When provided,
+        expensive metric blocks are computed only if they contribute to at
+        least one requested metric, while preserving output keys for backward
+        compatibility (unused values remain NaN where appropriate).
+    """
     N = G.number_of_nodes()
     E = G.number_of_edges()
     # Получаем флаг тяжелых вычислений (по умолчанию True, если не передан)
