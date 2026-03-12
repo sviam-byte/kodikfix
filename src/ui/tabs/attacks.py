@@ -145,18 +145,32 @@ DEGRADATION_METRIC_OPTIONS = [
     "H_rw",
     "fragility_H",
     "mod",
-    "signed_std_weight",
+    # signed-hybrid core
     "frac_negative_weight",
     "signed_balance_weight",
+    "signed_std_weight",
+    "frustration_index",
+    "signed_lambda_min",
+
+    # signed-hybrid secondary
     "signed_mean_weight",
     "signed_median_weight",
     "neg_abs_mean_weight",
     "pos_mean_weight",
     "signed_entropy_weight",
+    "signed_lambda2",
+    "strength_pos_mean",
+    "strength_neg_mean",
+    "strength_pos_std",
+    "strength_neg_std",
+
+    # extra weighted/spectral
     "H_w",
     "eff_w",
     "algebraic_connectivity",
     "tau_relax",
+
+    # older / optional / discouraged
     "density",
     "clustering",
     "lcc_frac",
@@ -1565,10 +1579,30 @@ def render_phenotype_matching_tab(
             key="pm_attack_kinds",
         )
 
+        # Фильтруем default по фактическим options, чтобы избежать падения UI,
+        # если registry и UI-список временно рассинхронизировались.
+        pm_metric_options = list(DEGRADATION_METRIC_OPTIONS)
+        pm_metric_default = [
+            m for m in get_default_metrics_for_regime("full_weighted_signed_hybrid")
+            if m in pm_metric_options
+        ]
+
+        # Страховка от пустого default: всегда оставляем минимальный рабочий набор.
+        if not pm_metric_default:
+            pm_metric_default = ["l2_lcc", "H_rw", "fragility_H", "mod"]
+
+        # Если в session_state остались старые/битые метрики, очищаем их заранее,
+        # чтобы st.multiselect не падал при инициализации значения key.
+        existing_pm_metrics = st.session_state.get("pm_metrics")
+        if isinstance(existing_pm_metrics, (list, tuple)):
+            st.session_state["pm_metrics"] = [
+                m for m in existing_pm_metrics if m in pm_metric_options
+            ]
+
         pm_metrics = st.multiselect(
             "Метрики distance",
-            options=DEGRADATION_METRIC_OPTIONS,
-            default=get_default_metrics_for_regime("full_weighted_signed_hybrid"),
+            options=pm_metric_options,
+            default=pm_metric_default,
             key="pm_metrics",
         )
 
