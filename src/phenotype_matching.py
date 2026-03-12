@@ -36,14 +36,30 @@ SPARSE_PROFILE_METRICS = [
     "lcc_frac",
 ]
 
-DEFAULT_PROFILE_METRICS = get_default_metrics_for_regime("full_weighted_unsigned")
+DEFAULT_PROFILE_METRICS = get_default_metrics_for_regime("full_weighted_signed_hybrid")
 
 DEFAULT_METRIC_FAMILIES = {
     "integration": ["algebraic_connectivity", "l2_lcc", "eff_w", "tau_relax", "lcc_frac"],
     "modularity": ["mod"],
-    "entropy_fragility": ["H_rw", "fragility_H", "H_evo", "fragility_evo"],
+    "entropy_fragility": ["H_rw", "fragility_H", "H_evo", "fragility_evo", "H_w"],
     "density_topology": ["density", "avg_degree", "beta", "beta_red", "clustering"],
-    "signed_weight": ["kappa_mean", "kappa_frac_negative", "kappa_median", "kappa_var", "kappa_skew", "kappa_entropy"],
+    "signed_weight": [
+        "signed_mean_weight",
+        "signed_median_weight",
+        "signed_std_weight",
+        "frac_negative_weight",
+        "frac_positive_weight",
+        "neg_abs_mean_weight",
+        "pos_mean_weight",
+        "signed_balance_weight",
+        "signed_entropy_weight",
+        "kappa_mean",
+        "kappa_frac_negative",
+        "kappa_median",
+        "kappa_var",
+        "kappa_skew",
+        "kappa_entropy",
+    ],
 }
 
 
@@ -368,7 +384,7 @@ def compare_degradation_models(
     compute_heavy_every: int = 1,
     distance_mode: str = "raw",
     metric_families: Mapping[str, Sequence[str]] | None = None,
-    graph_regime: str = "full_weighted_unsigned",
+    graph_regime: str = "full_weighted_signed_hybrid",
     **kwargs,
 ) -> dict:
     requested_metric_list = _as_metric_list(metrics)

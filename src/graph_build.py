@@ -42,13 +42,31 @@ def build_graph_from_edges(
         except (TypeError, ValueError):
             c = 0.0
 
-        w2 = apply_weight_policy_scalar(w, pol)
-        if w2 is None:
-            if strict:
-                raise ValueError(f"edge weight must be finite and >0 under policy={pol.mode!r}, got {w!r}")
-            to_drop.append((u, v))
-            continue
-        w = float(w2)
+        if pol.normalize_mode() == "signed_split":
+            if (not np.isfinite(w)) or abs(float(w)) <= float(pol.eps):
+                if strict:
+                    raise ValueError(f"edge weight must be finite and non-zero under policy={pol.mode!r}, got {w!r}")
+                to_drop.append((u, v))
+                continue
+            raw_w = float(w)
+            w = abs(raw_w)
+            sign_w = 1.0 if raw_w > 0 else -1.0
+            d["raw_weight"] = raw_w
+            d["weight_signed"] = raw_w
+            d["weight_abs"] = float(w)
+            d["sign"] = sign_w
+        else:
+            w2 = apply_weight_policy_scalar(w, pol)
+            if w2 is None:
+                if strict:
+                    raise ValueError(f"edge weight must be finite and >0 under policy={pol.mode!r}, got {w!r}")
+                to_drop.append((u, v))
+                continue
+            w = float(w2)
+            d["raw_weight"] = float(w)
+            d["weight_signed"] = float(w)
+            d["weight_abs"] = abs(float(w))
+            d["sign"] = 1.0 if float(w) > 0 else (-1.0 if float(w) < 0 else 0.0)
         if not np.isfinite(c):
             raise ValueError(f"edge confidence must be finite, got {c!r}")
 

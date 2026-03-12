@@ -36,3 +36,12 @@ def test_weight_policy_shift_adds_offset():
     w2, keep = apply_weight_policy_to_series(w, pol)
     assert keep.all()
     assert w2.tolist() == [0.5, 1.1]
+
+
+
+def test_weight_policy_signed_split_keeps_nonzero_raw_signed_values():
+    """signed_split should preserve non-zero signed values and drop zeros/nan."""
+    w = pd.Series([-2, 0, 5, None])
+    pol = WeightPolicy(mode="signed_split", eps=1e-9)
+    w2, keep = apply_weight_policy_to_series(w, pol)
+    assert w2[keep].tolist() == [-2.0, 5.0]

@@ -6,6 +6,7 @@ from typing import Dict, List, Literal, Sequence
 GraphRegime = Literal[
     "full_weighted_unsigned",
     "full_weighted_signed",
+    "full_weighted_signed_hybrid",
     "sparse_thresholded",
 ]
 
@@ -62,6 +63,15 @@ METRIC_SPECS: Dict[str, MetricSpec] = {
     "kappa_var": MetricSpec("kappa_var", family="signed_weight", depends_on_weights=True, depends_on_sign=True),
     "kappa_skew": MetricSpec("kappa_skew", family="signed_weight", depends_on_weights=True, depends_on_sign=True),
     "kappa_entropy": MetricSpec("kappa_entropy", family="signed_weight", depends_on_weights=True, depends_on_sign=True),
+    "signed_mean_weight": MetricSpec("signed_mean_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Raw signed edge-weight mean"),
+    "signed_median_weight": MetricSpec("signed_median_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Raw signed edge-weight median"),
+    "signed_std_weight": MetricSpec("signed_std_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Raw signed edge-weight dispersion"),
+    "frac_negative_weight": MetricSpec("frac_negative_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Fraction of negative edges in raw signed weights"),
+    "frac_positive_weight": MetricSpec("frac_positive_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Fraction of positive edges in raw signed weights"),
+    "neg_abs_mean_weight": MetricSpec("neg_abs_mean_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Mean absolute magnitude of negative raw weights"),
+    "pos_mean_weight": MetricSpec("pos_mean_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Mean positive raw weight"),
+    "signed_balance_weight": MetricSpec("signed_balance_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="(positive mass - negative mass) / total absolute mass"),
+    "signed_entropy_weight": MetricSpec("signed_entropy_weight", family="signed_weight", depends_on_weights=True, depends_on_sign=True, note="Histogram entropy of raw signed weights"),
 
     # service / guardrail
     "N": MetricSpec("N", family="service", note="Node count"),
@@ -112,6 +122,29 @@ FULL_WEIGHTED_SIGNED_SECONDARY = [
     "kappa_skew",
     "kappa_entropy",
 ]
+
+FULL_WEIGHTED_SIGNED_HYBRID_CORE = [
+    "l2_lcc",
+    "H_rw",
+    "fragility_H",
+    "mod",
+    "frac_negative_weight",
+    "signed_balance_weight",
+    "signed_std_weight",
+]
+FULL_WEIGHTED_SIGNED_HYBRID_SECONDARY = [
+    "H_w",
+    "eff_w",
+    "algebraic_connectivity",
+    "tau_relax",
+    "signed_mean_weight",
+    "signed_median_weight",
+    "neg_abs_mean_weight",
+    "pos_mean_weight",
+    "signed_entropy_weight",
+]
+FULL_WEIGHTED_SIGNED_HYBRID_DISCOURAGED = list(FULL_WEIGHTED_UNSIGNED_DISCOURAGED)
+FULL_WEIGHTED_SIGNED_HYBRID_GUARDRAIL = list(FULL_WEIGHTED_UNSIGNED_GUARDRAIL)
 FULL_WEIGHTED_SIGNED_DISCOURAGED = list(FULL_WEIGHTED_UNSIGNED_DISCOURAGED)
 FULL_WEIGHTED_SIGNED_GUARDRAIL = list(FULL_WEIGHTED_UNSIGNED_GUARDRAIL)
 
@@ -157,6 +190,12 @@ REGIME_TIERS: Dict[str, Dict[str, List[str]]] = {
         "secondary": FULL_WEIGHTED_SIGNED_SECONDARY,
         "discouraged": FULL_WEIGHTED_SIGNED_DISCOURAGED,
         "guardrail": FULL_WEIGHTED_SIGNED_GUARDRAIL,
+    },
+    "full_weighted_signed_hybrid": {
+        "core": FULL_WEIGHTED_SIGNED_HYBRID_CORE,
+        "secondary": FULL_WEIGHTED_SIGNED_HYBRID_SECONDARY,
+        "discouraged": FULL_WEIGHTED_SIGNED_HYBRID_DISCOURAGED,
+        "guardrail": FULL_WEIGHTED_SIGNED_HYBRID_GUARDRAIL,
     },
     "sparse_thresholded": {
         "core": SPARSE_THRESHOLDED_CORE,
