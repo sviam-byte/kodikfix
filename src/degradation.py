@@ -296,6 +296,8 @@ def _forward_fill_heavy_columns(df: pd.DataFrame) -> pd.DataFrame:
     prevents stepwise spikes in downstream phenotype distance calculations.
     """
     out = df.copy()
+    # Heavy-only metrics are absent on light steps by design, so we forward-fill
+    # from the most recent heavy step to keep trajectory rows comparable.
     heavy_cols = [
         "clustering",
         "assortativity",
