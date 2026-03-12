@@ -65,12 +65,6 @@ from src.energy_export import (
 )
 from src.robustness import attack_trajectory_summary, graph_resistance_summary
 from src.cli import _attack_payload_from_graph, _metrics_payload_from_graph
-from src.timeout_worker import (
-    run_with_timeout as _run_with_timeout_safe,
-    build_graph_safe,
-    compute_metrics_from_graph_safe,
-    graph_resistance_from_graph_safe,
-)
 from src.state.session import ctx
 from src.state_models import build_experiment_entry, build_graph_entry
 from src.mat_packed import bundle_to_edge_frames
@@ -936,6 +930,21 @@ def _bundle_frames_to_zip_bytes(frames: dict[str, pd.DataFrame], extras: dict[st
     return buf.getvalue()
 
 
+def _research_render_live_log(placeholder, lines: list[str], *, height: int = 420) -> None:
+    """Render the research live log with graceful fallback for Streamlit widget collisions."""
+    text = "\n".join(lines) if lines else ""
+    try:
+        placeholder.text_area(
+            "Research live-log",
+            value=text,
+            height=int(height),
+            disabled=True,
+            key="__research_live_log_widget",
+        )
+    except Exception:
+        placeholder.code(text or "[empty]", language=None)
+
+
 def _run_research_workspace_plan(
     graph_ids: list[str],
     *,
@@ -1083,7 +1092,67 @@ def _run_research_workspace_plan(
     graph_bar = st.progress(0.0)
     graph_msg = st.empty()
 
+    live_log_box = st.empty()
+    live_log_lines: list[str] = []
+    live_log_path: Path | None = None
+
+    if run_dir is not None:
+        live_log_path = run_dir / "live_log.txt"
+        try:
+            live_log_path.parent.mkdir(parents=True, exist_ok=True)
+            live_log_path.write_text("", encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to initialize research live log: %s", live_log_path)
+
+    def _append_live_log(message: str, *, level: str = "INFO", update_ui: bool = True) -> None:
+        """Append one line into in-memory/UI/file live log channels."""
+        ts = time.strftime("%H:%M:%S")
+        level_norm = str(level).upper().strip() or "INFO"
+        line = f"[{ts}] {level_norm} {message}"
+        live_log_lines.append(line)
+
+        if live_log_path is not None:
+            try:
+                with live_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except Exception:
+                logger.exception("Failed to append research live log: %s", live_log_path)
+
+        try:
+            if level_norm == "WARNING":
+                logger.warning("RESEARCH %s", message)
+            elif level_norm == "ERROR":
+                logger.error("RESEARCH %s", message)
+            else:
+                logger.info("RESEARCH %s", message)
+        except Exception:
+            pass
+
+        if update_ui:
+            _research_render_live_log(live_log_box, live_log_lines, height=420)
+
+    _append_live_log(
+        f"Research run started | graphs_requested={len(requested_graph_ids)} "
+        f"graphs_valid={len(valid_graph_ids)} min_conf={float(min_conf):.6g} "
+        f"min_weight={float(min_weight):.6g} analysis_mode={analysis_mode} "
+        f"stream_save={bool(stream_save)} run_dir={str(run_dir) if run_dir is not None else '<memory>'}"
+    )
+
+    if missing_graph_ids:
+        _append_live_log(
+            f"Skipped missing graph ids: {', '.join(map(str, missing_graph_ids))}",
+            level="WARNING",
+        )
+
+    if valid_graph_ids:
+        _append_live_log(
+            "Queue: " + ", ".join(
+                str(getattr(ctx.graphs.get(gid), "name", gid)) for gid in valid_graph_ids
+            )
+        )
+
     if not valid_graph_ids:
+        _append_live_log("No valid graphs left after filtering. Research run finished immediately.", level="WARNING")
         msg.caption("Нет доступных графов для расчёта")
         bar.progress(1.0)
         frames = {name: pd.DataFrame(rows) for name, rows in results.items()}
@@ -1105,6 +1174,7 @@ def _run_research_workspace_plan(
         entry = ctx.graphs.get(gid)
         if entry is None:
             logger.warning("Research plan lost graph during run: %s", gid)
+            _append_live_log(f"[{idx}/{total}] Graph disappeared during run: {gid}", level="WARNING")
             if keep_compact_results_in_memory:
                 results["research_metrics"].append({
                     "graph_id": gid,
@@ -1122,6 +1192,10 @@ def _run_research_workspace_plan(
         msg.caption(f"[{idx}/{total}] {entry.name}")
         graph_bar.progress(0.0)
         graph_msg.caption(f"Текущий граф: {entry.name}")
+        _append_live_log(
+            f"[{idx}/{total}] START graph_id={gid} name={getattr(entry, 'name', gid)} "
+            f"source={getattr(entry, 'source', '')}"
+        )
 
         enabled_stage_names = [
             stage_name
@@ -1155,6 +1229,13 @@ def _run_research_workspace_plan(
             graph_msg.caption(
                 f"Текущий граф: {entry.name} · {stage_name} · {frac * 100:.0f}%{suffix}"
             )
+            detail_text = str(detail).strip()
+            if detail_text:
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | stage={stage_name} "
+                    f"progress={frac * 100:.1f}% | {detail_text}",
+                    update_ui=True,
+                )
 
         graph_manifest = {
             "idx": int(idx),
@@ -1185,6 +1266,7 @@ def _run_research_workspace_plan(
                 },
             )
             msg.caption(f"[{idx}/{total}] skip existing: {entry.name}")
+            _append_live_log(f"[{idx}/{total}] SKIP existing: {entry.name}")
             bar.progress(float(idx) / float(total))
             continue
         # Keep graph-local frames separate from global aggregations so that
@@ -1203,57 +1285,38 @@ def _run_research_workspace_plan(
                         f"{elapsed:.0f}s > {graph_timeout_sec}s limit"
                     )
 
-            def _remaining_timeout(label: str = "") -> float:
-                """Return remaining per-graph timeout budget for hard-timeout stages."""
-                if graph_timeout_sec <= 0:
-                    return 0.0
-                elapsed = time.monotonic() - _t_graph_start
-                remaining = float(graph_timeout_sec) - float(elapsed)
-                if remaining <= 0:
-                    raise _GraphTimeoutError(
-                        f"[{idx}/{total}] {entry.name}: {label} — "
-                        f"{elapsed:.0f}s > {graph_timeout_sec}s limit"
-                    )
-                return max(0.1, float(remaining))
-
-            def _run_hard_timeout_stage(stage_label: str, fn, *args, **kwargs):
-                """Run one research stage with hard timeout and normalize timeout errors."""
-                try:
-                    return _run_with_timeout_safe(
-                        fn,
-                        *args,
-                        timeout_seconds=_remaining_timeout(stage_label),
-                        **kwargs,
-                    )
-                except TimeoutError as exc:
-                    elapsed = time.monotonic() - _t_graph_start
-                    raise _GraphTimeoutError(
-                        f"[{idx}/{total}] {entry.name}: {stage_label} — "
-                        f"hard timeout after {elapsed:.0f}s (limit {graph_timeout_sec}s)"
-                    ) from exc
-
-            if graph_timeout_sec > 0:
-                graph = _run_hard_timeout_stage(
-                    "build_graph",
-                    build_graph_safe,
-                    entry.edges,
-                    entry.src_col,
-                    entry.dst_col,
-                    float(min_conf),
-                    float(min_weight),
-                    str(analysis_mode),
-                )
-            else:
-                graph = cached_build_graph(
-                    entry.edges,
-                    entry.src_col,
-                    entry.dst_col,
-                    min_conf,
-                    min_weight,
-                    analysis_mode,
-                )
+            _append_live_log(
+                f"[{idx}/{total}] {entry.name} | build_graph:start "
+                f"edges={len(entry.edges) if hasattr(entry, 'edges') else '?'} "
+                f"analysis_mode={analysis_mode} min_conf={float(min_conf):.6g} "
+                f"min_weight={float(min_weight):.6g}"
+            )
+            graph = cached_build_graph(
+                entry.edges,
+                entry.src_col,
+                entry.dst_col,
+                min_conf,
+                min_weight,
+                analysis_mode,
+            )
+            _check_timeout("after build_graph")
+            _append_live_log(
+                f"[{idx}/{total}] {entry.name} | build_graph:done "
+                f"N={graph.number_of_nodes()} E={graph.number_of_edges()} "
+                f"density={nx.density(graph):.6f}"
+            )
 
             if any(flags.get(k, False) for k in ["basic", "efficiency", "spectral", "clustering", "assortativity", "entropy", "curvature"]):
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | metrics:start "
+                    f"basic={bool(flags.get('basic', False))} "
+                    f"efficiency={bool(flags.get('efficiency', False))} "
+                    f"spectral={bool(flags.get('spectral', False))} "
+                    f"clustering={bool(flags.get('clustering', False))} "
+                    f"assortativity={bool(flags.get('assortativity', False))} "
+                    f"entropy={bool(flags.get('entropy', False))} "
+                    f"curvature={bool(flags.get('curvature', False))}"
+                )
                 args_metrics = build_ui_args(
                     seed=int(seed_val),
                     eff_k=int(eff_k),
@@ -1265,32 +1328,9 @@ def _run_research_workspace_plan(
                     diameter_samples=16,
                     n_jobs=1,
                 )
-                if graph_timeout_sec > 0:
-                    row = _run_hard_timeout_stage(
-                        "metrics+curvature",
-                        compute_metrics_from_graph_safe,
-                        graph,
-                        eff_k=int(eff_k),
-                        seed=int(seed_val),
-                        compute_curvature=bool(flags.get("curvature", False)),
-                        curvature_sample_edges=int(curv_n),
-                        curvature_max_support=int(curv_max_support),
-                        compute_heavy=bool(
-                            flags.get("efficiency", False)
-                            or flags.get("entropy", False)
-                            or flags.get("clustering", False)
-                            or flags.get("assortativity", False)
-                            or flags.get("spectral", False)
-                        ),
-                        skip_spectral=not bool(flags.get("spectral", False)),
-                        skip_clustering=not bool(flags.get("clustering", False)),
-                        skip_assortativity=not bool(flags.get("assortativity", False)),
-                        diameter_samples=16,
-                        graph_name=str(entry.name),
-                    )
-                else:
-                    payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
-                    row = payload_to_flat_row(payload)
+                payload = _metrics_payload_from_graph(args_metrics, graph, input_label=entry.name)
+                row = payload_to_flat_row(payload)
+                _check_timeout("after metrics+curvature")
                 row.update({
                     "graph_id": entry.id,
                     "graph_name": entry.name,
@@ -1315,25 +1355,35 @@ def _run_research_workspace_plan(
                     results["research_metrics"].append(row)
                 per_graph_frames["research_metrics"] = pd.DataFrame([row])
                 _set_graph_progress("metrics", 1.0, "готово")
-                _check_timeout("after metrics+curvature")
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | metrics:done "
+                    f"keys={len(row)} "
+                    f"kappa_mean={row.get('kappa_mean', 'NA')} "
+                    f"H_rw={row.get('H_rw', 'NA')} "
+                    f"fragility_H={row.get('fragility_H', 'NA')}"
+                )
 
             if flags.get("resistance", False):
-                if graph_timeout_sec > 0:
-                    row = _run_hard_timeout_stage(
-                        "resistance",
-                        graph_resistance_from_graph_safe,
-                        graph,
-                    )
-                else:
-                    row = graph_resistance_summary(graph)
+                _append_live_log(f"[{idx}/{total}] {entry.name} | resistance:start")
+                row = graph_resistance_summary(graph)
+                _check_timeout("after resistance")
                 row.update({"graph_id": entry.id, "graph_name": entry.name, "source": entry.source})
                 if keep_compact_results_in_memory:
                     results["research_resistance"].append(row)
                 per_graph_frames["research_resistance"] = pd.DataFrame([row])
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | resistance:done "
+                    f"keys={len(row)}"
+                )
                 _set_graph_progress("resistance", 1.0, "готово")
-                _check_timeout("after resistance")
 
             if flags.get("attack", False):
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | attack:start "
+                    f"family={attack_family} kind={attack_kind} "
+                    f"frac={float(attack_frac):.6g} steps={int(attack_steps)} "
+                    f"heavy_every={int(attack_heavy_every)} fast_mode={bool(attack_fast_mode)}"
+                )
                 args_attack = build_ui_args(
                     family=str(attack_family),
                     kind=str(attack_kind),
@@ -1366,6 +1416,13 @@ def _run_research_workspace_plan(
 
                 def _attack_row_cb(row: dict, i: int, total_steps: int) -> None:
                     if attack_history_stream_path is None:
+                        _append_live_log(
+                            f"[{idx}/{total}] {entry.name} | attack:row "
+                            f"step={i}/{total_steps} "
+                            f"largest_cc={row.get('largest_cc_frac', row.get('lcc_frac', 'NA'))} "
+                            f"eff_global={row.get('eff_global', 'NA')} "
+                            f"k_removed={row.get('k_removed', row.get('removed_count', 'NA'))}"
+                        )
                         return
                     row_out = dict(row)
                     row_out.update({
@@ -1380,6 +1437,13 @@ def _run_research_workspace_plan(
                     _append_research_csv_rows(
                         attack_history_stream_path,
                         pd.DataFrame([row_out]),
+                    )
+                    _append_live_log(
+                        f"[{idx}/{total}] {entry.name} | attack:row "
+                        f"step={i}/{total_steps} "
+                        f"largest_cc={row.get('largest_cc_frac', row.get('lcc_frac', 'NA'))} "
+                        f"eff_global={row.get('eff_global', 'NA')} "
+                        f"k_removed={row.get('k_removed', row.get('removed_count', 'NA'))}"
                     )
 
                 attack_payload, history = _attack_payload_from_graph(
@@ -1405,6 +1469,10 @@ def _run_research_workspace_plan(
                 if keep_compact_results_in_memory:
                     results["research_attacks"].append(attack_row)
                 per_graph_frames["research_attacks"] = pd.DataFrame([attack_row])
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | attack:done "
+                    f"history_rows={len(history)} keys={len(attack_row)}"
+                )
                 if attack_history_stream_path is None:
                     per_graph_extras[
                         f"attack_histories/{entry.id}__{attack_family}__{attack_kind}.csv"
@@ -1418,6 +1486,11 @@ def _run_research_workspace_plan(
                 _check_timeout("after attack")
 
             if flags.get("energy", False):
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | energy:start "
+                    f"steps={int(energy_steps)} flow_mode={energy_flow_mode} "
+                    f"damping={float(energy_damping):.6g}"
+                )
                 node_frames, edge_frames = simulate_energy_flow(
                     graph,
                     steps=int(energy_steps),
@@ -1458,6 +1531,11 @@ def _run_research_workspace_plan(
                 workbook_frames_local["energy_edges_long"] = energy_edges_long
                 workbook_frames_local["energy_steps_summary"] = energy_steps_summary
                 workbook_frames_local["energy_run_summary"] = pd.DataFrame([energy_run_summary])
+                _append_live_log(
+                    f"[{idx}/{total}] {entry.name} | energy:done "
+                    f"node_rows={energy_run_summary.get('n_node_rows', 'NA')} "
+                    f"edge_rows={energy_run_summary.get('n_edge_rows', 'NA')}"
+                )
                 # Free heavy intermediate objects to reduce peak memory in long runs.
                 del node_frames, edge_frames, energy_nodes_long, energy_edges_long, energy_steps_summary
                 _set_graph_progress("energy", 1.0, "готово")
@@ -1473,6 +1551,10 @@ def _run_research_workspace_plan(
             logger.warning("TIMEOUT [%s/%s] %s: %.0fs > %ss",
                            idx, total, entry.name, _elapsed, graph_timeout_sec)
             err_text = f"TIMEOUT after {_elapsed:.0f}s: {_timeout_exc}"
+            _append_live_log(
+                f"[{idx}/{total}] TIMEOUT {entry.name} | {err_text}",
+                level="WARNING",
+            )
             graph_manifest["status"] = "timeout"
             graph_manifest["error"] = err_text
             msg.warning(f"⏱️ [{idx}/{total}] TIMEOUT: {entry.name} — пропускаю (>{graph_timeout_sec}s)")
@@ -1491,6 +1573,10 @@ def _run_research_workspace_plan(
         except Exception:
             logger.exception("Research run failed for graph %s (%s)", gid, entry.name)
             err_text = traceback.format_exc()
+            _append_live_log(
+                f"[{idx}/{total}] FAILED {entry.name}\n{err_text}",
+                level="ERROR",
+            )
             graph_manifest["status"] = "failed"
             graph_manifest["error"] = err_text[-4000:]
             msg.warning(f"⚠️ Ошибка при обработке {entry.name}: {err_text[-300:]}")
@@ -1534,6 +1620,11 @@ def _run_research_workspace_plan(
                 },
             )
 
+        _append_live_log(
+            f"[{idx}/{total}] END {entry.name} | status={graph_manifest.get('status', '?')} "
+            f"tables={graph_manifest.get('tables', '')} "
+            f"extras_count={graph_manifest.get('extras_count', 0)}"
+        )
         del per_graph_frames, workbook_frames_local, per_graph_extras
         try:
             del graph
@@ -1542,6 +1633,7 @@ def _run_research_workspace_plan(
         gc.collect()
         bar.progress(float(idx) / float(total))
 
+    _append_live_log("Research run complete")
     msg.caption("Research run complete")
     if run_dir is not None:
         frames = _load_research_aggregate_frames(run_dir)
@@ -1564,6 +1656,8 @@ def _run_research_workspace_plan(
             logger.exception("Failed to remove research run lock: %s", _research_lock_path(run_dir))
     else:
         frames = {name: pd.DataFrame(rows) for name, rows in results.items() if rows}
+    if run_dir is not None and live_log_path is not None:
+        _append_live_log(f"Final live log path: {live_log_path}")
     return frames, extras, run_dir
 
 
@@ -1923,9 +2017,51 @@ def _render_research_tab(
                     zip_payload = zip_path.read_bytes()
                 except Exception:
                     logger.exception("Failed to read research zip from disk: %s", zip_path)
-        d1, d2 = st.columns(2)
-        d1.download_button("Скачать research_summary.xlsx", data=summary_payload, file_name="research_summary.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-        d2.download_button("Скачать research_bundle.zip", data=zip_payload, file_name="research_bundle.zip", mime="application/zip", width="stretch")
+        d1, d2, d3 = st.columns(3)
+        live_log_payload = None
+        if run_dir_cached:
+            live_log_path = Path(run_dir_cached) / "live_log.txt"
+            if live_log_path.exists():
+                try:
+                    live_log_payload = live_log_path.read_bytes()
+                except Exception:
+                    logger.exception("Failed to read research live log: %s", live_log_path)
+
+        d1.download_button(
+            "Скачать research_summary.xlsx",
+            data=summary_payload,
+            file_name="research_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+        d2.download_button(
+            "Скачать research_bundle.zip",
+            data=zip_payload,
+            file_name="research_bundle.zip",
+            mime="application/zip",
+            width="stretch",
+        )
+        d3.download_button(
+            "Скачать live_log.txt",
+            data=live_log_payload or b"",
+            file_name="live_log.txt",
+            mime="text/plain",
+            width="stretch",
+            disabled=live_log_payload is None,
+        )
+
+        if live_log_payload is not None:
+            try:
+                live_log_text = live_log_payload.decode("utf-8", errors="replace")
+            except Exception:
+                live_log_text = "<decode error>"
+            st.text_area(
+                "Полный research live-log",
+                value=live_log_text,
+                height=420,
+                disabled=True,
+                key="__research_live_log_final_view",
+            )
         for name, df in cached.get("frames", {}).items():
             st.markdown(f"**{name}**")
             st.dataframe(df, width="stretch", height=min(420, 44 + 36 * min(len(df), 8)))
