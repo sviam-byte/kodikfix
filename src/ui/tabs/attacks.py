@@ -226,6 +226,14 @@ def _token_set(raw: str) -> set[str]:
     return {_norm_meta_token(x) for x in _split_tokens(raw) if _norm_meta_token(x)}
 
 
+def _parse_token_list(raw: str) -> set[str]:
+    """Parse comma/newline/space separated token list into unique values."""
+    if not str(raw or "").strip():
+        return set()
+    toks = re.split(r"[,;\n\r\t ]+", str(raw))
+    return {str(x).strip() for x in toks if str(x).strip()}
+
+
 def _metadata_match_candidates(entry: GraphEntry | None, gid: str) -> list[str]:
     """Build tolerant metadata keys for one workspace graph.
 
@@ -1099,14 +1107,9 @@ def _compute_metrics_df_for_graph_ids(
 ) -> pd.DataFrame:
     """Compute baseline metrics table for selected loaded graphs.
 
-    If *metric_names* is provided, unnecessary expensive computations are
-    skipped (e.g. diameter/assortativity/spectral block). Optionally reports
-    per-graph progress via *progress_cb(done, total, graph_id, stage)*.
-
-    With *timeout_seconds_per_graph* > 0, each graph is computed in a separate
-    process and tagged as timeout/error without stopping the whole run.
+    Дополнительно сохраняет audit-информацию по каждому графу:
+    graph_name/source/status/error/elapsed/N/E/density...
     """
-    # Compute only heavy blocks needed by selected optimization metrics.
     _mset = set(str(m) for m in (metric_names or []))
     _needs_spectral = not _mset or bool(
         _mset & {"mod", "l2_lcc", "lmax", "thresh", "tau_lcc", "tau_relax", "algebraic_connectivity"}
@@ -1117,12 +1120,24 @@ def _compute_metrics_df_for_graph_ids(
 
     rows = []
     total = len(graph_ids)
+
     for idx, gid in enumerate(graph_ids):
         entry = graphs[gid]
+        t0 = time.perf_counter()
+
+        base_row = {
+            "graph_id": str(gid),
+            "graph_name": str(getattr(entry, "name", "")),
+            "graph_source": str(getattr(entry, "source", "")),
+            "status": "unknown",
+            "error": "",
+            "elapsed_sec": np.nan,
+        }
+
         try:
             if callable(progress_cb):
                 try:
-                    progress_cb(idx, total, str(gid), "build+metrics")
+                    progress_cb(idx, total, str(gid), "build+metrics:start")
                 except Exception:
                     pass
 
@@ -1144,29 +1159,41 @@ def _compute_metrics_df_for_graph_ids(
                 graph_name=str(entry.name),
                 timeout_seconds=float(timeout_seconds_per_graph or 0.0),
             )
-            row["graph_id"] = str(gid)
-            row["graph_name"] = entry.name
-            row.setdefault("status", "ok")
+            row = dict(row)
+            row.update(base_row)
+            row["status"] = "ok"
+            row["elapsed_sec"] = float(time.perf_counter() - t0)
+
         except TimeoutError as exc:
-            row = {
-                "graph_id": str(gid),
-                "graph_name": entry.name,
-                "status": "timeout",
-                "error": str(exc),
-            }
+            row = dict(base_row)
+            row["status"] = "timeout"
+            row["error"] = str(exc)
+            row["elapsed_sec"] = float(time.perf_counter() - t0)
+
         except Exception as exc:
-            row = {
-                "graph_id": str(gid),
-                "graph_name": entry.name,
-                "status": "error",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            row = dict(base_row)
+            row["status"] = "error"
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            row["elapsed_sec"] = float(time.perf_counter() - t0)
+
         rows.append(row)
+
         if callable(progress_cb):
             try:
-                progress_cb(idx + 1, total, str(gid), str(row.get("status", "ok")))
+                extra = str(row.get("status", "ok"))
+                if row.get("status") == "ok":
+                    extra += (
+                        f" · N={row.get('N', 'na')} "
+                        f"E={row.get('E', 'na')} "
+                        f"density={row.get('density', np.nan):.4f} "
+                        f"t={row.get('elapsed_sec', np.nan):.1f}s"
+                    )
+                elif row.get("error"):
+                    extra += f" · {row.get('error', '')}"
+                progress_cb(idx + 1, total, str(gid), extra)
             except Exception:
                 pass
+
     return pd.DataFrame(rows)
 
 
@@ -1499,6 +1526,11 @@ def render_phenotype_matching_tab(
             step=10,
             key="pm_timeout_per_stage",
             help="Если один baseline/build этап длится слишком долго, он помечается как timeout и run идёт дальше.",
+        )
+        pm_exclude_ids_raw = st.text_area(
+            "Exclude graph/subject ids",
+            value="",
+            help="Список через запятую/новую строку. Эти graph_id или subject_id будут исключены из HC run.",
         )
 
         pm_attack_kinds = st.multiselect(
@@ -1864,13 +1896,10 @@ def render_phenotype_matching_tab(
                     )
 
                     def _sz_progress(done, total, gid, stage="metrics"):
-                        # Отдаем пользователю живой прогресс по графам, чтобы UI
-                        # не выглядел зависшим на длинной prepare-фазе.
                         frac = 0.07 + 0.05 * (float(done) / float(max(1, total)))
                         overall_bar.progress(frac, text=f"Общий прогресс: SZ baseline {done}/{total} ({int(frac*100)}%)")
                         status_box.caption(f"SZ baseline: граф {done}/{total} · {gid} · {stage}")
-                        if done == total or done % max(1, total // 5) == 0:
-                            _push_ui_event(f"SZ baseline: {done}/{total}")
+                        _push_ui_event(f"SZ baseline: {done}/{total} · {gid} · {stage}")
 
                     sz_group_metrics_df = _compute_metrics_df_for_graph_ids(
                         sz_gids_effective,
@@ -1924,12 +1953,10 @@ def render_phenotype_matching_tab(
                     hc_baseline_metrics_df = _read_uploaded_metrics_table(pm_hc_base_file)
                 else:
                     def _hc_progress(done, total, gid, stage="metrics"):
-                        # Аналогичный per-graph прогресс для HC baseline-фазы.
                         frac = 0.14 + 0.04 * (float(done) / float(max(1, total)))
                         overall_bar.progress(frac, text=f"Общий прогресс: HC baseline {done}/{total} ({int(frac*100)}%)")
                         status_box.caption(f"HC baseline: граф {done}/{total} · {gid} · {stage}")
-                        if done == total or done % max(1, total // 5) == 0:
-                            _push_ui_event(f"HC baseline: {done}/{total}")
+                        _push_ui_event(f"HC baseline: {done}/{total} · {gid} · {stage}")
 
                     hc_baseline_metrics_df = _compute_metrics_df_for_graph_ids(
                         hc_gids_effective,
@@ -1944,6 +1971,16 @@ def render_phenotype_matching_tab(
                         progress_cb=_hc_progress,
                         timeout_seconds_per_graph=float(pm_timeout_per_stage or 0),
                     )
+
+                try:
+                    sz_group_metrics_df.to_csv(run_dir / "aggregate" / "sz_baseline_graph_audit.csv", index=False)
+                except Exception:
+                    pass
+
+                try:
+                    hc_baseline_metrics_df.to_csv(run_dir / "aggregate" / "hc_baseline_graph_audit.csv", index=False)
+                except Exception:
+                    pass
 
                 phase_box.info("Prepare phase: target/scales")
                 status_box.caption("Собираю target vector, scales и metric families")
@@ -2052,6 +2089,16 @@ def render_phenotype_matching_tab(
 
                 start_idx = int(pm_start_index or 0)
                 selected_pairs = list(zip(hc_gids_effective, subject_ids))[start_idx:]
+
+                exclude_ids = _parse_token_list(pm_exclude_ids_raw)
+                if exclude_ids:
+                    selected_pairs = [
+                        (gid, sid)
+                        for gid, sid in selected_pairs
+                        if str(gid) not in exclude_ids and str(sid) not in exclude_ids
+                    ]
+                    _push_ui_event(f"Excluded ids: {sorted(exclude_ids)}")
+
                 total_subjects = max(1, len(selected_pairs))
                 manifest_path = run_dir / "manifest.csv"
 
@@ -2140,8 +2187,16 @@ def render_phenotype_matching_tab(
                         continue
 
                     t0 = time.perf_counter()
+                    stage_name = "build_graph"
+                    attack_name = ""
+                    graph_stats = {}
 
                     try:
+                        stage_name = "build_graph"
+                        _build_t0 = time.perf_counter()
+
+                        _push_ui_event(f"Build graph started: {subject_id} · gid={gid}")
+
                         G = _run_with_timeout(
                             build_graph_safe,
                             entry.edges,
@@ -2153,13 +2208,30 @@ def render_phenotype_matching_tab(
                             timeout_seconds=float(pm_timeout_per_stage or 0),
                         )
 
+                        graph_stats = {
+                            "N": int(G.number_of_nodes()),
+                            "E": int(G.number_of_edges()),
+                            "density": float(nx.density(G)) if G.number_of_nodes() > 1 else 0.0,
+                            "build_graph_sec": float(time.perf_counter() - _build_t0),
+                        }
+                        _push_ui_event(
+                            f"Graph built: {subject_id} · "
+                            f"N={graph_stats['N']} E={graph_stats['E']} "
+                            f"density={graph_stats['density']:.4f} "
+                            f"t={graph_stats['build_graph_sec']:.1f}s"
+                        )
+
                         status_box.caption(f"[{pos}/{total_subjects}] {subject_id} · trajectory")
-                        _push_ui_event(f"Graph built: {subject_id}")
+                        stage_name = "trajectory"
 
                         def _ui_progress(done_attacks: int, total_attacks: int, step_i: int, step_total: int, attack_kind: str, current_value=None) -> None:
+                            nonlocal attack_name
+                            attack_name = str(attack_kind)
+
                             attack_frac = 0.0 if total_attacks <= 0 else float(done_attacks) / float(total_attacks)
                             step_frac = 0.0 if step_total <= 0 else float(step_i) / float(step_total)
                             total_frac = min(1.0, attack_frac + step_frac / max(1, total_attacks))
+
                             subject_bar.progress(
                                 total_frac,
                                 text=(
@@ -2173,7 +2245,6 @@ def render_phenotype_matching_tab(
                                 f"[{pos}/{total_subjects}] {subject_id} · {attack_kind} · step {step_i}/{step_total}{suffix}"
                             )
 
-                            # Не спамим events.log на каждый шаг: пишем начало/конец и редкие heartbeat.
                             should_log = (
                                 int(step_i) <= 1
                                 or int(step_i) >= int(step_total)
@@ -2199,6 +2270,12 @@ def render_phenotype_matching_tab(
                                 },
                                 write_event=bool(should_log),
                             )
+
+                            if should_log:
+                                _push_ui_event(
+                                    f"Heartbeat {subject_id}: attack={attack_kind} step={step_i}/{step_total}"
+                                )
+
                             time.sleep(0.01)
 
                         _pm_stream_subject(
@@ -2240,9 +2317,17 @@ def render_phenotype_matching_tab(
                             {
                                 "subject_id": str(subject_id),
                                 "graph_id": str(gid),
+                                "graph_name": str(getattr(entry, "name", "")),
+                                "graph_source": str(getattr(entry, "source", "")),
                                 "status": "ok",
+                                "stage": "done",
+                                "last_attack_kind": str(attack_name),
                                 "elapsed_sec": elapsed,
                                 "saved_dir": str(saved_subject_dir),
+                                "N": graph_stats.get("N", np.nan),
+                                "E": graph_stats.get("E", np.nan),
+                                "density": graph_stats.get("density", np.nan),
+                                "build_graph_sec": graph_stats.get("build_graph_sec", np.nan),
                             },
                         )
 
@@ -2259,16 +2344,28 @@ def render_phenotype_matching_tab(
                             {
                                 "subject_id": str(subject_id),
                                 "graph_id": str(gid),
+                                "graph_name": str(getattr(entry, "name", "")),
+                                "graph_source": str(getattr(entry, "source", "")),
                                 "status": "timeout",
+                                "stage": str(stage_name),
+                                "last_attack_kind": str(attack_name),
                                 "elapsed_sec": elapsed,
                                 "error": str(exc),
+                                "N": graph_stats.get("N", np.nan),
+                                "E": graph_stats.get("E", np.nan),
+                                "density": graph_stats.get("density", np.nan),
+                                "build_graph_sec": graph_stats.get("build_graph_sec", np.nan),
                             },
                         )
                         _pm_subject_file(run_dir, subject_id, "traceback.txt", ensure_dir=True).write_text(
                             f"TimeoutError: {exc}\n",
                             encoding="utf-8",
                         )
-                        _push_ui_event(f"TIMEOUT subject {subject_id}: {exc}")
+                        _push_ui_event(
+                            f"TIMEOUT subject {subject_id}: stage={stage_name} attack={attack_name or '-'} "
+                            f"N={graph_stats.get('N', 'na')} E={graph_stats.get('E', 'na')} "
+                            f"density={graph_stats.get('density', np.nan):.4f} err={exc}"
+                        )
                         _pm_emit_progress(
                             run_dir,
                             {
@@ -2297,16 +2394,29 @@ def render_phenotype_matching_tab(
                             {
                                 "subject_id": str(subject_id),
                                 "graph_id": str(gid),
+                                "graph_name": str(getattr(entry, "name", "")),
+                                "graph_source": str(getattr(entry, "source", "")),
                                 "status": "error",
+                                "stage": str(stage_name),
+                                "last_attack_kind": str(attack_name),
                                 "elapsed_sec": elapsed,
                                 "error": f"{type(exc).__name__}: {exc}",
+                                "N": graph_stats.get("N", np.nan),
+                                "E": graph_stats.get("E", np.nan),
+                                "density": graph_stats.get("density", np.nan),
+                                "build_graph_sec": graph_stats.get("build_graph_sec", np.nan),
                             },
                         )
                         _pm_subject_file(run_dir, subject_id, "traceback.txt", ensure_dir=True).write_text(
                             tb,
                             encoding="utf-8",
                         )
-                        _push_ui_event(f"ERROR subject {subject_id}: {type(exc).__name__}: {exc}")
+                        _push_ui_event(
+                            f"ERROR subject {subject_id}: stage={stage_name} attack={attack_name or '-'} "
+                            f"N={graph_stats.get('N', 'na')} E={graph_stats.get('E', 'na')} "
+                            f"density={graph_stats.get('density', np.nan):.4f} "
+                            f"err={type(exc).__name__}: {exc}"
+                        )
                         _pm_emit_progress(
                             run_dir,
                             {
