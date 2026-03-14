@@ -178,6 +178,18 @@ DEGRADATION_METRIC_OPTIONS = [
     "kappa_frac_negative",
 ]
 
+SZ_ML_METRICS = [
+    "l2_lcc",
+    "H_rw",
+    "fragility_H",
+    "mod",
+    "frac_negative_weight",
+    "signed_balance_weight",
+    "signed_std_weight",
+    "frustration_index",
+    "signed_lambda_min",
+]
+
 DEGRADATION_KIND_OPTIONS = [
     "weight_noise",
     "inter_module_removal",
@@ -1310,6 +1322,18 @@ def _guess_hc_like_graph_ids(graphs: dict, active_graph_id: str | None) -> list[
         if any(tok in txt for tok in ("hc", "healthy", "control", "norm", "норма", "контроль")):
             hc_ids.append(gid)
     return hc_ids
+
+
+def _guess_sz_like_graph_ids(graphs: dict, active_graph_id: str | None) -> list[str]:
+    """Эвристика: предложить SZ/patient графы по имени и источнику."""
+    sz_ids: list[str] = []
+    for gid, entry in graphs.items():
+        if gid == active_graph_id:
+            continue
+        txt = f"{getattr(entry, 'name', '')} {getattr(entry, 'source', '')}".lower()
+        if any(tok in txt for tok in ("sz", "schiz", "schizo", "patient", "case", "пациент", "шиз")):
+            sz_ids.append(gid)
+    return sz_ids
 
 
 def _mixfrac_result_to_history(res: dict) -> pd.DataFrame:
@@ -2912,6 +2936,414 @@ def render_phenotype_matching_tab(
                     st.plotly_chart(fig_pm, width="stretch", key="plot_pm_distance")
         else:
             st.info("Запусти HC→SZ matching слева.")
+
+
+def render_sz_ml_ready_tab(
+    *,
+    active_entry: GraphEntry,
+    seed_val: int,
+    min_conf: float,
+    min_weight: float,
+    analysis_mode: str,
+) -> None:
+    """ML-ready export (SZ or НЕ-SZ) with per-graph streaming CSV append."""
+    st.header("🧬 SZ → ML")
+    st.caption(
+        "Считает фиксированный ML-набор метрик для выбранного класса (SZ или НЕ-SZ) и потоково пишет одну wide-таблицу CSV."
+    )
+
+    graphs = st.session_state["graphs"]
+    active_gid = st.session_state.get("active_graph_id")
+    metric_options = list(DEGRADATION_METRIC_OPTIONS)
+    metric_list = [m for m in SZ_ML_METRICS if m in metric_options]
+    if not metric_list:
+        metric_list = ["l2_lcc", "H_rw", "fragility_H", "mod"]
+
+    # Один переключатель меняет целевой класс: SZ (label=1) или НЕ-SZ/HC (label=0).
+    szml_use_non_sz = st.toggle(
+        "НЕ-SZ режим (label=0, control/healthy)",
+        value=bool(st.session_state.get("szml_use_non_sz", False)),
+        key="szml_use_non_sz",
+        help="Если включено — считаем таблицу для control/healthy (label=0). Если выключено — для SZ (label=1).",
+    )
+    target_label = 0 if szml_use_non_sz else 1
+    target_group_name = "HC/НЕ-SZ" if szml_use_non_sz else "SZ"
+    preview_ml_file_name = "non_sz_ml_ready.csv" if szml_use_non_sz else "sz_ml_ready.csv"
+    target_gids_guess = (
+        _guess_hc_like_graph_ids(graphs, active_gid)
+        if szml_use_non_sz
+        else _guess_sz_like_graph_ids(graphs, active_gid)
+    )
+
+    left_col, right_col = st.columns([1, 2])
+
+    with left_col:
+        szml_meta_file = st.file_uploader(
+            "Metadata file (CSV/XLSX, optional)",
+            type=["csv", "tsv", "xlsx", "xls"],
+            key="szml_meta_file",
+        )
+
+        szml_target_gids = st.multiselect(
+            f"{target_group_name} графы (ручной режим / fallback)",
+            options=list(graphs.keys()),
+            default=target_gids_guess,
+            format_func=lambda gid: f"{graphs[gid].name} ({graphs[gid].source})",
+            key="szml_target_gids",
+        )
+
+        with st.expander("Metadata matching"):
+            szml_meta_id_col = st.text_input(
+                "Metadata ID column (optional)",
+                value="",
+                key="szml_meta_id_col",
+            )
+            szml_meta_group_col = st.text_input(
+                "Metadata group column (optional)",
+                value="",
+                key="szml_meta_group_col",
+            )
+            szml_meta_sz_values = st.text_input(
+                "SZ values",
+                value="1,sz,schizophrenia,patient,case,true",
+                key="szml_meta_sz_values",
+            )
+
+        default_out_dir = "./phenotype_runs_non_sz" if szml_use_non_sz else "./phenotype_runs"
+        szml_out_dir = st.text_input(
+            "Папка вывода",
+            value=str(st.session_state.get("szml_out_dir", default_out_dir)),
+            key="szml_out_dir",
+        )
+        szml_run_label = st.text_input(
+            "Название run",
+            value=str(st.session_state.get("szml_run_label", f"{'non_sz' if szml_use_non_sz else 'sz'}_ml_{time.strftime('%Y%m%d_%H%M%S')}")),
+            key="szml_run_label",
+        )
+        szml_timeout_per_graph = st.number_input(
+            f"Скип по времени на {target_group_name}-граф (сек, 0=без лимита)",
+            min_value=0,
+            value=int(st.session_state.get("szml_timeout_per_graph", 600)),
+            step=10,
+            key="szml_timeout_per_graph",
+        )
+        szml_skip_existing = st.checkbox(
+            "Пропускать уже посчитанные graph_id в CSV",
+            value=True,
+            key="szml_skip_existing",
+        )
+        szml_compute_curv = st.checkbox(
+            "Считать curvature в baseline",
+            value=_needs_curvature_for_metrics(metric_list),
+            key="szml_compute_curv",
+        )
+        szml_effk = st.slider(
+            "Efficiency k",
+            8,
+            256,
+            32,
+            key="szml_effk",
+        )
+
+        st.markdown("#### ML-метрики")
+        st.code("\n".join(metric_list), language="text")
+
+        meta_df = None
+        meta_info = {}
+        match = None
+        if szml_meta_file is not None:
+            try:
+                meta_df, meta_info = _prepare_uploaded_metadata(
+                    szml_meta_file,
+                    id_col=str(szml_meta_id_col or ""),
+                    group_col=str(szml_meta_group_col or ""),
+                )
+                match = _match_workspace_graphs_to_metadata(
+                    graphs,
+                    meta_df,
+                    group_col=str(meta_info["group_col"]),
+                    healthy_values="0,healthy,control,hc,false",
+                    sz_values=str(szml_meta_sz_values or "1,sz,schizophrenia,patient,case,true"),
+                )
+                st.success(
+                    f"Matched={len(match['matched_df'])}, "
+                    f"HC={len(match['hc_gids'])}, "
+                    f"SZ={len(match['sz_gids'])}, "
+                    f"unmatched={len(match['unmatched_gids'])}"
+                )
+            except Exception as exc:
+                st.error(f"Metadata parse/match error: {type(exc).__name__}: {exc}")
+
+        target_meta_key = "hc_gids" if szml_use_non_sz else "sz_gids"
+        target_meta_df_key = "hc_meta_df" if szml_use_non_sz else "sz_meta_df"
+        use_metadata_mode = match is not None and len(match.get(target_meta_key, [])) > 0
+        preview_target_n = len(match.get(target_meta_key, [])) if use_metadata_mode else len(szml_target_gids)
+
+        if st.button("🚀 BUILD ML TABLE", type="primary", width="stretch", key="szml_run"):
+            if use_metadata_mode:
+                target_gids_effective = list(match[target_meta_key])
+                meta_map_df = match.get(target_meta_df_key, pd.DataFrame()).copy()
+            else:
+                target_gids_effective = list(szml_target_gids)
+                meta_map_df = pd.DataFrame()
+
+            if not target_gids_effective:
+                st.error(f"Не найдено {target_group_name}-графов: ни по metadata, ни вручную.")
+                st.stop()
+
+            out_root = _pm_resolve_out_dir(szml_out_dir)
+            out_root.mkdir(parents=True, exist_ok=True)
+            run_name = _pm_safe_stem(str(szml_run_label), f"sz_ml_{time.strftime('%Y%m%d_%H%M%S')}")
+            run_dir = out_root / run_name
+            agg_dir = run_dir / "aggregate"
+            agg_dir.mkdir(parents=True, exist_ok=True)
+            _pm_write_run_location_note(run_dir)
+            st.session_state["last_szml_run_dir"] = str(run_dir)
+
+            ml_file_name = "non_sz_ml_ready.csv" if szml_use_non_sz else "sz_ml_ready.csv"
+            ml_path = agg_dir / ml_file_name
+            log_file_name = "non_sz_ml_progress_log.csv" if szml_use_non_sz else "sz_ml_progress_log.csv"
+            log_path = agg_dir / log_file_name
+
+            _pm_save_run_inputs(
+                run_dir,
+                config={
+                    "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "run_dir": str(run_dir),
+                    "mode": "non_sz_ml_ready_streaming" if szml_use_non_sz else "sz_ml_ready_streaming",
+                    "metrics": metric_list,
+                    "compute_curvature": bool(szml_compute_curv),
+                    "timeout_per_graph": float(szml_timeout_per_graph or 0),
+                    "graph_regime": "full_weighted_signed_hybrid",
+                    "weight_policy": str(getattr(settings, "WEIGHT_POLICY", "signed_split")),
+                    "weight_shift": float(getattr(settings, "WEIGHT_SHIFT", 0.0)),
+                    "eff_k": int(szml_effk),
+                },
+                metadata_upload=szml_meta_file,
+                sz_upload=None,
+                hc_baseline_upload=None,
+            )
+
+            already_done: set[str] = set()
+            if bool(szml_skip_existing) and ml_path.exists() and ml_path.stat().st_size > 0:
+                try:
+                    prev_df = pd.read_csv(ml_path, usecols=["graph_id"])
+                    already_done = set(prev_df["graph_id"].astype(str).tolist())
+                except Exception:
+                    already_done = set()
+
+            progress_bar = st.progress(0.0, text="SZ→ML: старт")
+            event_box = st.empty()
+            preview_box = st.empty()
+            ui_events: list[str] = []
+            preview_rows: list[dict] = []
+
+            def _push_ui_event(msg: str) -> None:
+                stamp = time.strftime("%H:%M:%S")
+                ui_events.append(f"[{stamp}] {msg}")
+                event_box.code("\n".join(ui_events[-18:]))
+
+            total = len(target_gids_effective)
+            done = 0
+            ok_n = 0
+            err_n = 0
+            skip_n = 0
+
+            def _meta_row_for_gid(gid: str) -> dict:
+                if meta_map_df is None or meta_map_df.empty or "graph_id" not in meta_map_df.columns:
+                    return {}
+                hit = meta_map_df.loc[meta_map_df["graph_id"].astype(str) == str(gid)]
+                if hit.empty:
+                    return {}
+                row = hit.iloc[0].to_dict()
+                return {
+                    "subject_id": row.get("subject_id", gid),
+                    "group_value_raw": row.get("group_value_raw", "hc" if szml_use_non_sz else "sz"),
+                    "group_value_norm": row.get("group_value_norm", "hc" if szml_use_non_sz else "sz"),
+                }
+
+            _push_ui_event(f"Run dir: {run_dir}")
+            _push_ui_event(f"{target_group_name} graphs selected: {total}")
+            _push_ui_event(f"Output CSV: {ml_path.name}")
+
+            for pos, gid in enumerate(target_gids_effective, start=1):
+                gid = str(gid)
+                entry = graphs[gid]
+                progress_bar.progress(done / max(1, total), text=f"{target_group_name}→ML: {done}/{total} · {gid}")
+
+                if bool(szml_skip_existing) and gid in already_done:
+                    skip_n += 1
+                    done += 1
+                    _push_ui_event(f"{pos}/{total} SKIP existing · {gid}")
+                    _pm_append_csv(
+                        log_path,
+                        {
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "graph_id": gid,
+                            "subject_id": gid,
+                            "status": "skip_existing",
+                            "error": "",
+                            "elapsed_sec": np.nan,
+                        },
+                    )
+                    continue
+
+                t0 = time.perf_counter()
+                base_info = {
+                    "graph_id": gid,
+                    "graph_name": str(getattr(entry, "name", "")),
+                    "graph_source": str(getattr(entry, "source", "")),
+                    "label": int(target_label),
+                    "status": "unknown",
+                    "error": "",
+                    "elapsed_sec": np.nan,
+                    "N": np.nan,
+                    "E": np.nan,
+                    "density": np.nan,
+                }
+                base_info.update(_meta_row_for_gid(gid))
+                if "subject_id" not in base_info:
+                    base_info["subject_id"] = gid
+                if "group_value_raw" not in base_info:
+                    base_info["group_value_raw"] = "hc" if szml_use_non_sz else "sz"
+                if "group_value_norm" not in base_info:
+                    base_info["group_value_norm"] = "hc" if szml_use_non_sz else "sz"
+
+                try:
+                    row_df = _compute_metrics_df_for_graph_ids(
+                        [gid],
+                        graphs=graphs,
+                        min_conf=float(min_conf),
+                        min_weight=float(min_weight),
+                        analysis_mode=str(analysis_mode),
+                        eff_k=int(szml_effk),
+                        seed=int(seed_val),
+                        compute_curvature=bool(szml_compute_curv),
+                        metric_names=metric_list,
+                        progress_cb=None,
+                        timeout_seconds_per_graph=float(szml_timeout_per_graph or 0),
+                    )
+
+                    if row_df.empty:
+                        row = dict(base_info)
+                        row["status"] = "error"
+                        row["error"] = "empty metrics row"
+                    else:
+                        got = row_df.iloc[0].to_dict()
+                        row = dict(base_info)
+                        row.update(got)
+                        row["subject_id"] = base_info["subject_id"]
+                        row["group_value_raw"] = base_info["group_value_raw"]
+                        row["group_value_norm"] = base_info["group_value_norm"]
+                        row["label"] = int(target_label)
+
+                    row["elapsed_sec"] = float(row.get("elapsed_sec", np.nan))
+
+                except Exception as exc:
+                    row = dict(base_info)
+                    row["status"] = "error"
+                    row["error"] = f"{type(exc).__name__}: {exc}"
+                    row["elapsed_sec"] = float(time.perf_counter() - t0)
+                    for m in metric_list:
+                        row[m] = np.nan
+
+                for m in metric_list:
+                    if m not in row:
+                        row[m] = np.nan
+
+                preferred_cols = [
+                    "subject_id",
+                    "graph_id",
+                    "graph_name",
+                    "graph_source",
+                    "group_value_raw",
+                    "group_value_norm",
+                    "label",
+                    "status",
+                    "error",
+                    "elapsed_sec",
+                    "N",
+                    "E",
+                    "density",
+                ]
+                metric_cols = list(metric_list)
+                ordered = preferred_cols + [c for c in metric_cols if c not in preferred_cols]
+                other_cols = [c for c in row.keys() if c not in ordered]
+                row_df_out = pd.DataFrame([{k: row.get(k, np.nan) for k in ordered + other_cols}])
+
+                _pm_append_csv(ml_path, row_df_out)
+                _pm_append_csv(
+                    log_path,
+                    {
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "graph_id": row.get("graph_id", gid),
+                        "subject_id": row.get("subject_id", gid),
+                        "status": row.get("status", "unknown"),
+                        "error": row.get("error", ""),
+                        "elapsed_sec": row.get("elapsed_sec", np.nan),
+                    },
+                )
+
+                preview_rows.append(row_df_out.iloc[0].to_dict())
+                preview_rows = preview_rows[-20:]
+                preview_box.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
+
+                status_now = str(row.get("status", "unknown"))
+                if status_now == "ok":
+                    ok_n += 1
+                else:
+                    err_n += 1
+
+                done += 1
+                progress_bar.progress(
+                    done / max(1, total),
+                    text=f"{target_group_name}→ML: {done}/{total} · ok={ok_n} · err={err_n} · skip={skip_n}",
+                )
+                _push_ui_event(
+                    f"{pos}/{total} {status_now.upper()} · {gid} · "
+                    f"N={row.get('N', 'na')} E={row.get('E', 'na')} "
+                    f"t={float(pd.to_numeric(row.get('elapsed_sec', np.nan), errors='coerce')):.1f}s"
+                )
+
+            st.success(
+                f"Готово. CSV обновлён: {ml_path}. "
+                f"OK={ok_n}, error/timeout={err_n}, skipped={skip_n}."
+            )
+
+            if ml_path.exists() and ml_path.stat().st_size > 0:
+                try:
+                    final_df = pd.read_csv(ml_path)
+                    st.markdown("### Текущий CSV")
+                    st.dataframe(final_df.tail(50), use_container_width=True)
+                except Exception as exc:
+                    st.warning(f"CSV записан, но перечитать предпросмотр не удалось: {type(exc).__name__}: {exc}")
+
+    with right_col:
+        st.markdown("### Что делает вкладка")
+        st.markdown(
+            "\n".join([
+                f"- {target_group_name} графов к запуску: **{preview_target_n}**",
+                f"- Метрик: **{len(metric_list)}**",
+                f"- Режим: **{target_group_name}**",
+                "- Только ML-ready wide CSV",
+                "- Потоковая запись: по одному графу",
+                "- Resume через skip existing graph_id",
+                "- Без HC→SZ matching pipeline",
+                "- Без trajectory / winner / distance",
+            ])
+        )
+
+        st.markdown("### Основной файл")
+        st.code(f"aggregate/{preview_ml_file_name}", language="text")
+
+        st.markdown("### Структура строки")
+        st.code(
+            "subject_id, graph_id, graph_name, graph_source, "
+            "group_value_raw, group_value_norm, label, status, error, elapsed_sec, "
+            "N, E, density, "
+            + ", ".join(metric_list),
+            language="text",
+        )
 
 
 def render_attack_lab(G_view: nx.Graph | None, active_entry: GraphEntry, seed_val: int, src_col: str, dst_col: str, min_conf: float, min_weight: float, analysis_mode: str, save_experiment_callback) -> None:
