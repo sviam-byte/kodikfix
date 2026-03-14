@@ -3232,6 +3232,7 @@ TAB_OPTIONS = [
     "🧪 Null",
     "💥 Attack",
     "🧬 HC→SZ",
+    "🧬 SZ→ML",
     "🆚 Compare",
 ]
 default_tab_index = TAB_OPTIONS.index(DEFAULT_ACTIVE_TAB) if DEFAULT_ACTIVE_TAB in TAB_OPTIONS else 0
@@ -3306,6 +3307,15 @@ elif active_tab == "💥 Attack":
 
 elif active_tab == "🧬 HC→SZ":
     tab_attacks.render_phenotype_matching_tab(
+        active_entry=active_entry,
+        seed_val=seed_val,
+        min_conf=min_conf,
+        min_weight=min_weight,
+        analysis_mode=analysis_mode,
+    )
+
+elif active_tab == "🧬 SZ→ML":
+    tab_attacks.render_sz_ml_ready_tab(
         active_entry=active_entry,
         seed_val=seed_val,
         min_conf=min_conf,
