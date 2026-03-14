@@ -2946,20 +2946,34 @@ def render_sz_ml_ready_tab(
     min_weight: float,
     analysis_mode: str,
 ) -> None:
-    """SZ-only ML-ready export with streaming CSV append."""
+    """ML-ready export (SZ or НЕ-SZ) with per-graph streaming CSV append."""
     st.header("🧬 SZ → ML")
     st.caption(
-        "Считает только фиксированный ML-набор метрик для SZ-графов и потоково пишет одну wide-таблицу CSV."
+        "Считает фиксированный ML-набор метрик для выбранного класса (SZ или НЕ-SZ) и потоково пишет одну wide-таблицу CSV."
     )
 
     graphs = st.session_state["graphs"]
     active_gid = st.session_state.get("active_graph_id")
-    sz_guess = _guess_sz_like_graph_ids(graphs, active_gid)
-
     metric_options = list(DEGRADATION_METRIC_OPTIONS)
     metric_list = [m for m in SZ_ML_METRICS if m in metric_options]
     if not metric_list:
         metric_list = ["l2_lcc", "H_rw", "fragility_H", "mod"]
+
+    # Один переключатель меняет целевой класс: SZ (label=1) или НЕ-SZ/HC (label=0).
+    szml_use_non_sz = st.toggle(
+        "НЕ-SZ режим (label=0, control/healthy)",
+        value=bool(st.session_state.get("szml_use_non_sz", False)),
+        key="szml_use_non_sz",
+        help="Если включено — считаем таблицу для control/healthy (label=0). Если выключено — для SZ (label=1).",
+    )
+    target_label = 0 if szml_use_non_sz else 1
+    target_group_name = "HC/НЕ-SZ" if szml_use_non_sz else "SZ"
+    preview_ml_file_name = "non_sz_ml_ready.csv" if szml_use_non_sz else "sz_ml_ready.csv"
+    target_gids_guess = (
+        _guess_hc_like_graph_ids(graphs, active_gid)
+        if szml_use_non_sz
+        else _guess_sz_like_graph_ids(graphs, active_gid)
+    )
 
     left_col, right_col = st.columns([1, 2])
 
@@ -2970,12 +2984,12 @@ def render_sz_ml_ready_tab(
             key="szml_meta_file",
         )
 
-        szml_sz_gids = st.multiselect(
-            "SZ графы (ручной режим / fallback)",
+        szml_target_gids = st.multiselect(
+            f"{target_group_name} графы (ручной режим / fallback)",
             options=list(graphs.keys()),
-            default=sz_guess,
+            default=target_gids_guess,
             format_func=lambda gid: f"{graphs[gid].name} ({graphs[gid].source})",
-            key="szml_sz_gids",
+            key="szml_target_gids",
         )
 
         with st.expander("Metadata matching"):
@@ -2995,18 +3009,19 @@ def render_sz_ml_ready_tab(
                 key="szml_meta_sz_values",
             )
 
+        default_out_dir = "./phenotype_runs_non_sz" if szml_use_non_sz else "./phenotype_runs"
         szml_out_dir = st.text_input(
             "Папка вывода",
-            value=str(st.session_state.get("szml_out_dir", "./phenotype_runs")),
+            value=str(st.session_state.get("szml_out_dir", default_out_dir)),
             key="szml_out_dir",
         )
         szml_run_label = st.text_input(
             "Название run",
-            value=str(st.session_state.get("szml_run_label", f"sz_ml_{time.strftime('%Y%m%d_%H%M%S')}")),
+            value=str(st.session_state.get("szml_run_label", f"{'non_sz' if szml_use_non_sz else 'sz'}_ml_{time.strftime('%Y%m%d_%H%M%S')}")),
             key="szml_run_label",
         )
         szml_timeout_per_graph = st.number_input(
-            "Скип по времени на SZ-граф (сек, 0=без лимита)",
+            f"Скип по времени на {target_group_name}-граф (сек, 0=без лимита)",
             min_value=0,
             value=int(st.session_state.get("szml_timeout_per_graph", 600)),
             step=10,
@@ -3052,25 +3067,28 @@ def render_sz_ml_ready_tab(
                 )
                 st.success(
                     f"Matched={len(match['matched_df'])}, "
+                    f"HC={len(match['hc_gids'])}, "
                     f"SZ={len(match['sz_gids'])}, "
                     f"unmatched={len(match['unmatched_gids'])}"
                 )
             except Exception as exc:
                 st.error(f"Metadata parse/match error: {type(exc).__name__}: {exc}")
 
-        use_metadata_mode = match is not None and len(match.get("sz_gids", [])) > 0
-        preview_sz_n = len(match.get("sz_gids", [])) if use_metadata_mode else len(szml_sz_gids)
+        target_meta_key = "hc_gids" if szml_use_non_sz else "sz_gids"
+        target_meta_df_key = "hc_meta_df" if szml_use_non_sz else "sz_meta_df"
+        use_metadata_mode = match is not None and len(match.get(target_meta_key, [])) > 0
+        preview_target_n = len(match.get(target_meta_key, [])) if use_metadata_mode else len(szml_target_gids)
 
-        if st.button("🚀 BUILD SZ ML TABLE", type="primary", width="stretch", key="szml_run"):
+        if st.button("🚀 BUILD ML TABLE", type="primary", width="stretch", key="szml_run"):
             if use_metadata_mode:
-                sz_gids_effective = list(match["sz_gids"])
-                meta_map_df = match.get("sz_meta_df", pd.DataFrame()).copy()
+                target_gids_effective = list(match[target_meta_key])
+                meta_map_df = match.get(target_meta_df_key, pd.DataFrame()).copy()
             else:
-                sz_gids_effective = list(szml_sz_gids)
+                target_gids_effective = list(szml_target_gids)
                 meta_map_df = pd.DataFrame()
 
-            if not sz_gids_effective:
-                st.error("Не найдено SZ-графов: ни по metadata, ни вручную.")
+            if not target_gids_effective:
+                st.error(f"Не найдено {target_group_name}-графов: ни по metadata, ни вручную.")
                 st.stop()
 
             out_root = _pm_resolve_out_dir(szml_out_dir)
@@ -3082,15 +3100,17 @@ def render_sz_ml_ready_tab(
             _pm_write_run_location_note(run_dir)
             st.session_state["last_szml_run_dir"] = str(run_dir)
 
-            ml_path = agg_dir / "sz_ml_ready.csv"
-            log_path = agg_dir / "sz_ml_progress_log.csv"
+            ml_file_name = "non_sz_ml_ready.csv" if szml_use_non_sz else "sz_ml_ready.csv"
+            ml_path = agg_dir / ml_file_name
+            log_file_name = "non_sz_ml_progress_log.csv" if szml_use_non_sz else "sz_ml_progress_log.csv"
+            log_path = agg_dir / log_file_name
 
             _pm_save_run_inputs(
                 run_dir,
                 config={
                     "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "run_dir": str(run_dir),
-                    "mode": "sz_ml_ready_streaming",
+                    "mode": "non_sz_ml_ready_streaming" if szml_use_non_sz else "sz_ml_ready_streaming",
                     "metrics": metric_list,
                     "compute_curvature": bool(szml_compute_curv),
                     "timeout_per_graph": float(szml_timeout_per_graph or 0),
@@ -3123,7 +3143,7 @@ def render_sz_ml_ready_tab(
                 ui_events.append(f"[{stamp}] {msg}")
                 event_box.code("\n".join(ui_events[-18:]))
 
-            total = len(sz_gids_effective)
+            total = len(target_gids_effective)
             done = 0
             ok_n = 0
             err_n = 0
@@ -3138,18 +3158,18 @@ def render_sz_ml_ready_tab(
                 row = hit.iloc[0].to_dict()
                 return {
                     "subject_id": row.get("subject_id", gid),
-                    "group_value_raw": row.get("group_value_raw", "sz"),
-                    "group_value_norm": row.get("group_value_norm", "sz"),
+                    "group_value_raw": row.get("group_value_raw", "hc" if szml_use_non_sz else "sz"),
+                    "group_value_norm": row.get("group_value_norm", "hc" if szml_use_non_sz else "sz"),
                 }
 
             _push_ui_event(f"Run dir: {run_dir}")
-            _push_ui_event(f"SZ graphs selected: {total}")
+            _push_ui_event(f"{target_group_name} graphs selected: {total}")
             _push_ui_event(f"Output CSV: {ml_path.name}")
 
-            for pos, gid in enumerate(sz_gids_effective, start=1):
+            for pos, gid in enumerate(target_gids_effective, start=1):
                 gid = str(gid)
                 entry = graphs[gid]
-                progress_bar.progress(done / max(1, total), text=f"SZ→ML: {done}/{total} · {gid}")
+                progress_bar.progress(done / max(1, total), text=f"{target_group_name}→ML: {done}/{total} · {gid}")
 
                 if bool(szml_skip_existing) and gid in already_done:
                     skip_n += 1
@@ -3173,7 +3193,7 @@ def render_sz_ml_ready_tab(
                     "graph_id": gid,
                     "graph_name": str(getattr(entry, "name", "")),
                     "graph_source": str(getattr(entry, "source", "")),
-                    "label": 1,
+                    "label": int(target_label),
                     "status": "unknown",
                     "error": "",
                     "elapsed_sec": np.nan,
@@ -3185,9 +3205,9 @@ def render_sz_ml_ready_tab(
                 if "subject_id" not in base_info:
                     base_info["subject_id"] = gid
                 if "group_value_raw" not in base_info:
-                    base_info["group_value_raw"] = "sz"
+                    base_info["group_value_raw"] = "hc" if szml_use_non_sz else "sz"
                 if "group_value_norm" not in base_info:
-                    base_info["group_value_norm"] = "sz"
+                    base_info["group_value_norm"] = "hc" if szml_use_non_sz else "sz"
 
                 try:
                     row_df = _compute_metrics_df_for_graph_ids(
@@ -3215,7 +3235,7 @@ def render_sz_ml_ready_tab(
                         row["subject_id"] = base_info["subject_id"]
                         row["group_value_raw"] = base_info["group_value_raw"]
                         row["group_value_norm"] = base_info["group_value_norm"]
-                        row["label"] = 1
+                        row["label"] = int(target_label)
 
                     row["elapsed_sec"] = float(row.get("elapsed_sec", np.nan))
 
@@ -3277,7 +3297,7 @@ def render_sz_ml_ready_tab(
                 done += 1
                 progress_bar.progress(
                     done / max(1, total),
-                    text=f"SZ→ML: {done}/{total} · ok={ok_n} · err={err_n} · skip={skip_n}",
+                    text=f"{target_group_name}→ML: {done}/{total} · ok={ok_n} · err={err_n} · skip={skip_n}",
                 )
                 _push_ui_event(
                     f"{pos}/{total} {status_now.upper()} · {gid} · "
@@ -3302,9 +3322,9 @@ def render_sz_ml_ready_tab(
         st.markdown("### Что делает вкладка")
         st.markdown(
             "\n".join([
-                f"- SZ графов к запуску: **{preview_sz_n}**",
+                f"- {target_group_name} графов к запуску: **{preview_target_n}**",
                 f"- Метрик: **{len(metric_list)}**",
-                "- Только SZ",
+                f"- Режим: **{target_group_name}**",
                 "- Только ML-ready wide CSV",
                 "- Потоковая запись: по одному графу",
                 "- Resume через skip existing graph_id",
@@ -3314,7 +3334,7 @@ def render_sz_ml_ready_tab(
         )
 
         st.markdown("### Основной файл")
-        st.code("aggregate/sz_ml_ready.csv", language="text")
+        st.code(f"aggregate/{preview_ml_file_name}", language="text")
 
         st.markdown("### Структура строки")
         st.code(
